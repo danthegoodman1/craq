@@ -9,10 +9,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/coordinator"
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
-	"github.com/danthegoodman1/chainrep/ops"
-	"github.com/danthegoodman1/chainrep/storage"
+	"github.com/danthegoodman1/craq/coordinator"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/ops"
+	"github.com/danthegoodman1/craq/storage"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 )
@@ -72,6 +72,12 @@ type PendingWork struct {
 	CommandID   string
 }
 
+type ReadReplicaRoute struct {
+	NodeID   string
+	Endpoint string
+	Role     storage.ReplicaRole
+}
+
 type SlotRoute struct {
 	Slot         int
 	ChainVersion uint64
@@ -79,6 +85,7 @@ type SlotRoute struct {
 	HeadEndpoint string
 	TailNodeID   string
 	TailEndpoint string
+	ReadReplicas []ReadReplicaRoute
 	Writable     bool
 	Readable     bool
 }
@@ -124,6 +131,7 @@ type Server struct {
 	pending                map[int]PendingWork
 	completed              map[int][]coordruntime.CompletedProgressRecord
 	routingSnapshot        RoutingSnapshot
+	routingSnapshotMu      sync.RWMutex
 	lastPolicy             coordinator.ReconfigurationPolicy
 	unavailableReplicas    map[string]map[int]bool
 	lastRecoveryReports    map[string]storage.NodeRecoveryReport
@@ -268,6 +276,8 @@ func (s *Server) RoutingSnapshot(ctx context.Context) (RoutingSnapshot, error) {
 			return RoutingSnapshot{}, err
 		}
 	}
+	s.routingSnapshotMu.RLock()
+	defer s.routingSnapshotMu.RUnlock()
 	return cloneRoutingSnapshot(s.routingSnapshot), nil
 }
 
@@ -965,171 +975,6 @@ func (s *Server) shouldDispatchActivePeerRefresh(slot int) bool {
 	return !runtimeOutboxHasSlot(s.rt.Current().Outbox, slot)
 }
 
-func (s *Server) dispatchPlan(ctx context.Context, chainVersion uint64, plan coordinator.ReconfigurationPlan) error {
-	slotPlans := append([]coordinator.SlotPlan(nil), plan.ChangedSlots...)
-	sort.Slice(slotPlans, func(i, j int) bool {
-		return slotPlans[i].Slot < slotPlans[j].Slot
-	})
-
-	for _, slotPlan := range slotPlans {
-		stepKinds := distinctStepKinds(slotPlan.Steps)
-		switch {
-		case len(stepKinds) == 1 && stepKinds[0] == coordinator.StepKindAppendTail:
-			if err := s.dispatchAppendTail(ctx, chainVersion, slotPlan); err != nil {
-				return err
-			}
-		case len(stepKinds) == 1 && stepKinds[0] == coordinator.StepKindMarkLeaving:
-			if err := s.dispatchMarkLeaving(ctx, chainVersion, slotPlan); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf(
-				"%w: unsupported slot plan for slot %d",
-				ErrDispatchFailed,
-				slotPlan.Slot,
-			)
-		}
-	}
-	return nil
-}
-
-func (s *Server) dispatchAppendTail(ctx context.Context, chainVersion uint64, slotPlan coordinator.SlotPlan) error {
-	start := time.Now()
-	state := s.rt.Current()
-	addedNodeID := ""
-	replacedNodeID := ""
-	for _, step := range slotPlan.Steps {
-		if step.Kind == coordinator.StepKindAppendTail {
-			addedNodeID = step.NodeID
-			replacedNodeID = step.ReplacedNodeID
-			break
-		}
-	}
-	if addedNodeID == "" {
-		return fmt.Errorf("%w: slot %d missing append target", ErrDispatchFailed, slotPlan.Slot)
-	}
-	client, err := s.clientForNodeID(addedNodeID)
-	if err != nil {
-		return fmt.Errorf("%w: %w", ErrDispatchFailed, err)
-	}
-	if existing, ok := s.pending[slotPlan.Slot]; ok && existing.NodeID != addedNodeID {
-		return fmt.Errorf("%w: slot %d already has pending work for node %q", ErrConflictingPending, slotPlan.Slot, existing.NodeID)
-	}
-	addAssignment, err := assignmentForNode(slotPlan.After, state.Cluster.NodesByID, addedNodeID, chainVersion)
-	if err != nil {
-		return fmt.Errorf("err in assignmentForNode(add): %w", err)
-	}
-	dispatchCtx, cancel := deriveDeadlineContext(ctx, s.dispatchTimeout)
-	defer cancel()
-	if err := client.AddReplicaAsTail(dispatchCtx, storage.AddReplicaAsTailCommand{Assignment: addAssignment}); err != nil {
-		s.observeDispatchResult("add_replica_as_tail", start, err)
-		if isContextTimeoutOrCancel(err) {
-			return fmt.Errorf("%w: err in node[%q].AddReplicaAsTail: %w", ErrDispatchTimeout, addedNodeID, err)
-		}
-		return fmt.Errorf("%w: err in node[%q].AddReplicaAsTail: %v", ErrDispatchFailed, addedNodeID, err)
-	}
-	s.pending[slotPlan.Slot] = PendingWork{
-		Slot:        slotPlan.Slot,
-		NodeID:      addedNodeID,
-		Kind:        pendingKindReady,
-		SlotVersion: chainVersion,
-		Epoch:       0,
-	}
-
-	skipped := map[string]bool{addedNodeID: true}
-	servingChain := activeServingChain(slotPlan.After)
-	updateNodes := activeAfterNodeIDs(servingChain, skipped)
-	for _, nodeID := range updateNodes {
-		client, err := s.clientForNodeID(nodeID)
-		if err != nil {
-			return fmt.Errorf("%w: %w", ErrDispatchFailed, err)
-		}
-		assignment, err := assignmentForNode(servingChain, state.Cluster.NodesByID, nodeID, chainVersion)
-		if err != nil {
-			return fmt.Errorf("err in assignmentForNode(update append): %w", err)
-		}
-		updateCtx, updateCancel := deriveDeadlineContext(ctx, s.dispatchTimeout)
-		err = client.UpdateChainPeers(updateCtx, storage.UpdateChainPeersCommand{Assignment: assignment})
-		updateCancel()
-		if err != nil {
-			s.observeDispatchResult("update_chain_peers", start, err)
-			if isContextTimeoutOrCancel(err) {
-				return fmt.Errorf("%w: err in node[%q].UpdateChainPeers: %w", ErrDispatchTimeout, nodeID, err)
-			}
-			return fmt.Errorf("%w: err in node[%q].UpdateChainPeers: %v", ErrDispatchFailed, nodeID, err)
-		}
-	}
-	s.observeDispatchResult("add_replica_as_tail", start, nil)
-	s.observeRepair("append_tail_started", "success", addedNodeID, ops.IntPtr(slotPlan.Slot), nil)
-	_ = replacedNodeID
-	return nil
-}
-
-func (s *Server) dispatchMarkLeaving(ctx context.Context, chainVersion uint64, slotPlan coordinator.SlotPlan) error {
-	start := time.Now()
-	state := s.rt.Current()
-	leavingNodeID := ""
-	for _, step := range slotPlan.Steps {
-		if step.Kind == coordinator.StepKindMarkLeaving {
-			leavingNodeID = step.NodeID
-			break
-		}
-	}
-	if leavingNodeID == "" {
-		return fmt.Errorf("%w: slot %d missing leaving target", ErrDispatchFailed, slotPlan.Slot)
-	}
-	if existing, ok := s.pending[slotPlan.Slot]; ok && existing.NodeID != leavingNodeID {
-		return fmt.Errorf("%w: slot %d already has pending work for node %q", ErrConflictingPending, slotPlan.Slot, existing.NodeID)
-	}
-	skipped := map[string]bool{leavingNodeID: true}
-	servingChain := activeServingChain(slotPlan.After)
-	updateNodes := activeAfterNodeIDs(servingChain, skipped)
-	for _, nodeID := range updateNodes {
-		client, err := s.clientForNodeID(nodeID)
-		if err != nil {
-			return fmt.Errorf("%w: %w", ErrDispatchFailed, err)
-		}
-		assignment, err := assignmentForNode(servingChain, state.Cluster.NodesByID, nodeID, chainVersion)
-		if err != nil {
-			return fmt.Errorf("err in assignmentForNode(update leaving): %w", err)
-		}
-		updateCtx, updateCancel := deriveDeadlineContext(ctx, s.dispatchTimeout)
-		err = client.UpdateChainPeers(updateCtx, storage.UpdateChainPeersCommand{Assignment: assignment})
-		updateCancel()
-		if err != nil {
-			s.observeDispatchResult("update_chain_peers", start, err)
-			if isContextTimeoutOrCancel(err) {
-				return fmt.Errorf("%w: err in node[%q].UpdateChainPeers: %w", ErrDispatchTimeout, nodeID, err)
-			}
-			return fmt.Errorf("%w: err in node[%q].UpdateChainPeers: %v", ErrDispatchFailed, nodeID, err)
-		}
-	}
-
-	client, err := s.clientForNodeID(leavingNodeID)
-	if err != nil {
-		return fmt.Errorf("%w: %w", ErrDispatchFailed, err)
-	}
-	dispatchCtx, cancel := deriveDeadlineContext(ctx, s.dispatchTimeout)
-	defer cancel()
-	if err := client.MarkReplicaLeaving(dispatchCtx, storage.MarkReplicaLeavingCommand{Slot: slotPlan.Slot}); err != nil {
-		s.observeDispatchResult("mark_replica_leaving", start, err)
-		if isContextTimeoutOrCancel(err) {
-			return fmt.Errorf("%w: err in node[%q].MarkReplicaLeaving: %w", ErrDispatchTimeout, leavingNodeID, err)
-		}
-		return fmt.Errorf("%w: err in node[%q].MarkReplicaLeaving: %v", ErrDispatchFailed, leavingNodeID, err)
-	}
-	s.pending[slotPlan.Slot] = PendingWork{
-		Slot:        slotPlan.Slot,
-		NodeID:      leavingNodeID,
-		Kind:        pendingKindRemoved,
-		SlotVersion: chainVersion,
-		Epoch:       0,
-	}
-	s.observeDispatchResult("mark_replica_leaving", start, nil)
-	s.observeRepair("mark_leaving_started", "success", leavingNodeID, ops.IntPtr(slotPlan.Slot), nil)
-	return nil
-}
-
 func (s *Server) resumeRecoveredReplica(
 	ctx context.Context,
 	nodeID string,
@@ -1294,6 +1139,21 @@ func assignmentForNode(
 		assignment.Peers.SuccessorNodeID = chain.Replicas[position+1].NodeID
 		assignment.Peers.SuccessorTarget = nodesByID[assignment.Peers.SuccessorNodeID].RPCAddress
 	}
+	tailNodeID := ""
+	for i := len(chain.Replicas) - 1; i >= 0; i-- {
+		if chain.Replicas[i].State != coordinator.ReplicaStateActive {
+			continue
+		}
+		tailNodeID = chain.Replicas[i].NodeID
+		break
+	}
+	if tailNodeID == "" && len(chain.Replicas) > 0 {
+		tailNodeID = chain.Replicas[len(chain.Replicas)-1].NodeID
+	}
+	if tailNodeID != "" {
+		assignment.Peers.TailNodeID = tailNodeID
+		assignment.Peers.TailTarget = nodesByID[tailNodeID].RPCAddress
+	}
 	return assignment, nil
 }
 
@@ -1334,29 +1194,54 @@ func (s *Server) rebuildRoutingSnapshot() {
 			if s.replicaUnavailable(replica.NodeID, chain.Slot) {
 				continue
 			}
+			role := storage.ReplicaRoleMiddle
 			if route.HeadNodeID == "" {
 				route.HeadNodeID = replica.NodeID
 				route.HeadEndpoint = state.Cluster.NodesByID[replica.NodeID].RPCAddress
+				role = storage.ReplicaRoleHead
 			}
 			route.TailNodeID = replica.NodeID
 			route.TailEndpoint = state.Cluster.NodesByID[replica.NodeID].RPCAddress
+			route.ReadReplicas = append(route.ReadReplicas, ReadReplicaRoute{
+				NodeID:   replica.NodeID,
+				Endpoint: state.Cluster.NodesByID[replica.NodeID].RPCAddress,
+				Role:     role,
+			})
+		}
+		switch len(route.ReadReplicas) {
+		case 1:
+			route.ReadReplicas[0].Role = storage.ReplicaRoleSingle
+		case 2:
+			route.ReadReplicas[1].Role = storage.ReplicaRoleTail
+		default:
+			if len(route.ReadReplicas) > 1 {
+				route.ReadReplicas[len(route.ReadReplicas)-1].Role = storage.ReplicaRoleTail
+			}
 		}
 		if route.HeadNodeID != "" {
 			route.Writable = !chainHasReplicaState(chain, coordinator.ReplicaStateJoining)
 		}
-		if route.TailNodeID != "" {
+		if len(route.ReadReplicas) > 0 {
 			route.Readable = true
 		}
 		snapshot.Slots = append(snapshot.Slots, route)
 	}
+	s.routingSnapshotMu.Lock()
 	s.routingSnapshot = snapshot
+	s.routingSnapshotMu.Unlock()
 }
 
 func cloneRoutingSnapshot(snapshot RoutingSnapshot) RoutingSnapshot {
+	clonedSlots := make([]SlotRoute, 0, len(snapshot.Slots))
+	for _, slot := range snapshot.Slots {
+		cloned := slot
+		cloned.ReadReplicas = append([]ReadReplicaRoute(nil), slot.ReadReplicas...)
+		clonedSlots = append(clonedSlots, cloned)
+	}
 	return RoutingSnapshot{
 		Version:   snapshot.Version,
 		SlotCount: snapshot.SlotCount,
-		Slots:     append([]SlotRoute(nil), snapshot.Slots...),
+		Slots:     clonedSlots,
 	}
 }
 
@@ -1413,72 +1298,6 @@ func chainHasReplicaState(chain coordinator.Chain, want coordinator.ReplicaState
 	return false
 }
 
-func affectedPeerUpdateNodes(
-	before coordinator.Chain,
-	after coordinator.Chain,
-	nodesByID map[string]coordinator.Node,
-	skipped map[string]bool,
-) []string {
-	beforeAssignments := buildAssignmentMap(before, nodesByID)
-	afterAssignments := buildAssignmentMap(after, nodesByID)
-
-	var nodeIDs []string
-	for nodeID, afterAssignment := range afterAssignments {
-		if skipped[nodeID] {
-			continue
-		}
-		beforeAssignment, ok := beforeAssignments[nodeID]
-		if !ok || !reflect.DeepEqual(beforeAssignment, afterAssignment) {
-			nodeIDs = append(nodeIDs, nodeID)
-		}
-	}
-
-	sort.Slice(nodeIDs, func(i, j int) bool {
-		return afterAssignments[nodeIDs[i]].position < afterAssignments[nodeIDs[j]].position
-	})
-	return nodeIDs
-}
-
-type chainAssignment struct {
-	role     storage.ReplicaRole
-	peers    storage.ChainPeers
-	position int
-}
-
-func buildAssignmentMap(chain coordinator.Chain, nodesByID map[string]coordinator.Node) map[string]chainAssignment {
-	assignments := make(map[string]chainAssignment, len(chain.Replicas))
-	for i, replica := range chain.Replicas {
-		role := storage.ReplicaRoleMiddle
-		switch len(chain.Replicas) {
-		case 1:
-			role = storage.ReplicaRoleSingle
-		default:
-			switch i {
-			case 0:
-				role = storage.ReplicaRoleHead
-			case len(chain.Replicas) - 1:
-				role = storage.ReplicaRoleTail
-			default:
-				role = storage.ReplicaRoleMiddle
-			}
-		}
-		assignment := chainAssignment{
-			role:     role,
-			position: i,
-		}
-		if i > 0 {
-			assignment.peers.PredecessorNodeID = chain.Replicas[i-1].NodeID
-			assignment.peers.PredecessorTarget = nodesByID[assignment.peers.PredecessorNodeID].RPCAddress
-		}
-		if i+1 < len(chain.Replicas) {
-			assignment.peers.SuccessorNodeID = chain.Replicas[i+1].NodeID
-			assignment.peers.SuccessorTarget = nodesByID[assignment.peers.SuccessorNodeID].RPCAddress
-		}
-		assignments[replica.NodeID] = assignment
-	}
-	return assignments
-}
-
 func slotContainsReplicaInState(
 	state coordinator.ClusterState,
 	slot int,
@@ -1494,22 +1313,6 @@ func slotContainsReplicaInState(
 		}
 	}
 	return false
-}
-
-func distinctStepKinds(steps []coordinator.ReconfigurationStep) []coordinator.StepKind {
-	seen := make(map[coordinator.StepKind]struct{}, len(steps))
-	kinds := make([]coordinator.StepKind, 0, len(steps))
-	for _, step := range steps {
-		if _, ok := seen[step.Kind]; ok {
-			continue
-		}
-		seen[step.Kind] = struct{}{}
-		kinds = append(kinds, step.Kind)
-	}
-	sort.Slice(kinds, func(i, j int) bool {
-		return kinds[i] < kinds[j]
-	})
-	return kinds
 }
 
 func (s *Server) markUnavailableReplicas(report storage.NodeRecoveryReport) {
@@ -1583,27 +1386,29 @@ func currentAssignmentForNode(
 	return storage.ReplicaAssignment{}, false
 }
 
-func assignedReplicasForNode(state coordruntime.State, nodeID string) map[int]storage.ReplicaAssignment {
-	assignments := map[int]storage.ReplicaAssignment{}
-	for _, chain := range state.Cluster.Chains {
-		for _, replica := range chain.Replicas {
-			if replica.NodeID != nodeID {
-				continue
-			}
-			assignment, err := assignmentForNode(chain, state.Cluster.NodesByID, nodeID, state.SlotVersions[chain.Slot])
-			if err != nil {
-				continue
-			}
-			assignments[chain.Slot] = assignment
-		}
-	}
-	return assignments
+func canResumeRecoveredReplica(recovered storage.RecoveredReplica, current storage.ReplicaAssignment) bool {
+	return replicaRoleCanResumeRecovered(current.Role) &&
+		recovered.HasCommittedData &&
+		recovered.LastKnownState == storage.ReplicaStateActive &&
+		assignmentsEquivalentForRecovery(recovered.Assignment, current)
 }
 
-func canResumeRecoveredReplica(recovered storage.RecoveredReplica, current storage.ReplicaAssignment) bool {
-	return recovered.HasCommittedData &&
-		recovered.LastKnownState == storage.ReplicaStateActive &&
-		reflect.DeepEqual(recovered.Assignment, current)
+func replicaRoleCanResumeRecovered(role storage.ReplicaRole) bool {
+	switch role {
+	case storage.ReplicaRoleSingle, storage.ReplicaRoleTail:
+		return true
+	default:
+		return false
+	}
+}
+
+func assignmentsEquivalentForRecovery(left storage.ReplicaAssignment, right storage.ReplicaAssignment) bool {
+	return left.Slot == right.Slot &&
+		left.ChainVersion == right.ChainVersion &&
+		left.Role == right.Role &&
+		left.Peers.PredecessorNodeID == right.Peers.PredecessorNodeID &&
+		left.Peers.SuccessorNodeID == right.Peers.SuccessorNodeID &&
+		(left.Peers.TailNodeID == right.Peers.TailNodeID || left.Peers.TailNodeID == "" || right.Peers.TailNodeID == "")
 }
 
 func recoverySourceNodeID(chain coordinator.Chain, recoveringNodeID string) (string, bool) {

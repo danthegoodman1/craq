@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/coordinator"
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
-	"github.com/danthegoodman1/chainrep/coordserver"
-	"github.com/danthegoodman1/chainrep/storage"
-	"github.com/danthegoodman1/chainrep/transport/grpcx"
+	"github.com/danthegoodman1/craq/coordinator"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/coordserver"
+	"github.com/danthegoodman1/craq/storage"
+	"github.com/danthegoodman1/craq/transport/grpcx"
 )
 
 func TestCoordinatorFailoverClientsOverGRPC(t *testing.T) {

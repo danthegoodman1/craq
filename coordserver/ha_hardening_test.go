@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/coordinator"
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
-	"github.com/danthegoodman1/chainrep/storage"
+	"github.com/danthegoodman1/craq/coordinator"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/storage"
 )
 
 func TestHAFailoverRepairHistoryIsDeterministic(t *testing.T) {
@@ -1112,7 +1112,7 @@ func TestHADynamicAutoJoinRepairsAfterFailover(t *testing.T) {
 func TestPostgresHAStoreConcurrentAcquireAndStaleSave(t *testing.T) {
 	dsn := postgresTestDSN(t)
 	if dsn == "" {
-		t.Skip("CHAINREP_TEST_POSTGRES_DSN is not set")
+		t.Skip("CRAQ_TEST_POSTGRES_DSN is not set")
 	}
 
 	ctx := context.Background()
@@ -1425,5 +1425,5 @@ func noBudgetPolicy() coordinator.ReconfigurationPolicy {
 
 func postgresTestDSN(t *testing.T) string {
 	t.Helper()
-	return os.Getenv("CHAINREP_TEST_POSTGRES_DSN")
+	return os.Getenv("CRAQ_TEST_POSTGRES_DSN")
 }

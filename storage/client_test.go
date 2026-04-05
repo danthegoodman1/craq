@@ -104,10 +104,8 @@ func TestClientHandlersRejectStaleOrIllegalTargets(t *testing.T) {
 		Slot:                 5,
 		Key:                  "k",
 		ExpectedChainVersion: 1,
-	}); err == nil {
-		t.Fatal("HandleClientGet on head unexpectedly succeeded")
-	} else {
-		assertRoutingMismatch(t, err, RoutingMismatchReasonWrongRole)
+	}); err != nil {
+		t.Fatalf("HandleClientGet on head returned error: %v", err)
 	}
 
 	if _, err := nodes["tail"].HandleClientPut(ctx, ClientPutRequest{

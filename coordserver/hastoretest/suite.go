@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/coordinator"
-	"github.com/danthegoodman1/chainrep/coordserver"
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
-	"github.com/danthegoodman1/chainrep/storage"
+	"github.com/danthegoodman1/craq/coordinator"
+	"github.com/danthegoodman1/craq/coordserver"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/storage"
 )
 
 type Factory func(t *testing.T) coordserver.HAStore

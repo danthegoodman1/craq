@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
 )
 
 func BenchmarkServerRoutingSnapshot_StableState(b *testing.B) {

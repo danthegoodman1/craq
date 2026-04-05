@@ -6,11 +6,11 @@ import (
 	"net"
 	"sync"
 
-	"github.com/danthegoodman1/chainrep/coordinator"
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
-	"github.com/danthegoodman1/chainrep/coordserver"
-	grpcproto "github.com/danthegoodman1/chainrep/proto/chainrep/v1"
-	"github.com/danthegoodman1/chainrep/storage"
+	"github.com/danthegoodman1/craq/coordinator"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/coordserver"
+	grpcproto "github.com/danthegoodman1/craq/proto/craq/v1"
+	"github.com/danthegoodman1/craq/storage"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
 )
@@ -333,6 +333,7 @@ func (s *StorageGRPCServer) Get(ctx context.Context, req *grpcproto.ClientGetReq
 		Slot:                 int(req.Slot),
 		Key:                  req.Key,
 		ExpectedChainVersion: req.ExpectedChainVersion,
+		Consistency:          fromProtoReadConsistency(req.Consistency),
 	})
 	if err != nil {
 		return nil, encodeError(err)

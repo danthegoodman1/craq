@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
-	"github.com/danthegoodman1/chainrep/storage"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/storage"
 )
 
 type HAConfig struct {

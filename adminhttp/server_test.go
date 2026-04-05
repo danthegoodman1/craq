@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/adminhttp"
-	"github.com/danthegoodman1/chainrep/coordinator"
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
-	"github.com/danthegoodman1/chainrep/coordserver"
-	"github.com/danthegoodman1/chainrep/storage"
+	"github.com/danthegoodman1/craq/adminhttp"
+	"github.com/danthegoodman1/craq/coordinator"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/coordserver"
+	"github.com/danthegoodman1/craq/storage"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -44,7 +44,7 @@ func TestStorageAdminHTTPExposesHealthMetricsAndState(t *testing.T) {
 	assertStatus(t, baseURL+"/readyz", http.StatusOK)
 
 	body := mustGET(t, baseURL+"/metrics")
-	if !strings.Contains(body, "chainrep_storage_client_writes_total") {
+	if !strings.Contains(body, "craq_storage_client_writes_total") {
 		t.Fatalf("/metrics body missing storage metrics: %s", body)
 	}
 
@@ -89,7 +89,7 @@ func TestCoordinatorAdminHTTPExposesHealthMetricsAndState(t *testing.T) {
 	assertStatus(t, baseURL+"/readyz", http.StatusOK)
 
 	body := mustGET(t, baseURL+"/metrics")
-	if !strings.Contains(body, "chainrep_coordserver_commands_total") {
+	if !strings.Contains(body, "craq_coordserver_commands_total") {
 		t.Fatalf("/metrics body missing coordserver metrics: %s", body)
 	}
 

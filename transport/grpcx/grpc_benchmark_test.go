@@ -8,13 +8,13 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/danthegoodman1/chainrep/client"
-	"github.com/danthegoodman1/chainrep/coordinator"
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
-	"github.com/danthegoodman1/chainrep/coordserver"
-	"github.com/danthegoodman1/chainrep/storage"
-	badgerstore "github.com/danthegoodman1/chainrep/storage/badger"
-	"github.com/danthegoodman1/chainrep/transport/grpcx"
+	"github.com/danthegoodman1/craq/client"
+	"github.com/danthegoodman1/craq/coordinator"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/coordserver"
+	"github.com/danthegoodman1/craq/storage"
+	badgerstore "github.com/danthegoodman1/craq/storage/badger"
+	"github.com/danthegoodman1/craq/transport/grpcx"
 )
 
 func BenchmarkClientLatencyGRPC_Localhost(b *testing.B) {

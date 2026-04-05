@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/danthegoodman1/chainrep/storage"
+	"github.com/danthegoodman1/craq/storage"
 )
 
 func TestBadgerNodeReopenAfterAddReplicaAsTailBeforeActivationRecoversViaPeer(t *testing.T) {
@@ -115,6 +115,155 @@ func TestBadgerNodeReopenAfterAddReplicaAsTailBeforeActivationRecoversViaPeer(t 
 		t.Fatalf("HandleClientGet after recovery returned error: %v", err)
 	} else if !read.Found || read.Value != "v1" {
 		t.Fatalf("HandleClientGet after recovery = %#v, want value v1", read)
+	}
+}
+
+func TestBadgerNodeReopenAfterDirtyCRAQStateRecoversFromServingPeer(t *testing.T) {
+	ctx := context.Background()
+	repl := storage.NewQueuedInMemoryReplicationTransport()
+
+	headPath := filepath.Join(t.TempDir(), "head.db")
+	headStore := mustOpenStore(t, headPath)
+	headCoord := storage.NewInMemoryCoordinatorClient()
+	head, err := storage.OpenNode(ctx, storage.Config{NodeID: "head"}, headStore.Backend(), headStore.LocalStateStore(), headCoord, repl)
+	if err != nil {
+		t.Fatalf("OpenNode(head) returned error: %v", err)
+	}
+	repl.Register("head", headStore.Backend())
+	repl.RegisterNode("head", head)
+
+	tailBackend := storage.NewInMemoryBackend()
+	tailLocal := storage.NewInMemoryLocalStateStore()
+	tailCoord := storage.NewInMemoryCoordinatorClient()
+	tail, err := storage.OpenNode(ctx, storage.Config{NodeID: "tail"}, tailBackend, tailLocal, tailCoord, repl)
+	if err != nil {
+		t.Fatalf("OpenNode(tail) returned error: %v", err)
+	}
+	repl.Register("tail", tailBackend)
+	repl.RegisterNode("tail", tail)
+
+	headAssignment := storage.ReplicaAssignment{
+		Slot:         3,
+		ChainVersion: 1,
+		Role:         storage.ReplicaRoleHead,
+		Peers: storage.ChainPeers{
+			SuccessorNodeID: "tail",
+			SuccessorTarget: "tail",
+			TailNodeID:      "tail",
+			TailTarget:      "tail",
+		},
+	}
+	tailAssignment := storage.ReplicaAssignment{
+		Slot:         3,
+		ChainVersion: 1,
+		Role:         storage.ReplicaRoleTail,
+		Peers: storage.ChainPeers{
+			PredecessorNodeID: "head",
+			PredecessorTarget: "head",
+			TailNodeID:        "tail",
+			TailTarget:        "tail",
+		},
+	}
+	for node, assignment := range map[*storage.Node]storage.ReplicaAssignment{
+		head: headAssignment,
+		tail: tailAssignment,
+	} {
+		if err := node.AddReplicaAsTail(ctx, storage.AddReplicaAsTailCommand{Assignment: assignment, Epoch: 5}); err != nil {
+			t.Fatalf("AddReplicaAsTail returned error: %v", err)
+		}
+		if err := node.ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: 3, Epoch: 5}); err != nil {
+			t.Fatalf("ActivateReplica returned error: %v", err)
+		}
+		if err := node.UpdateChainPeers(ctx, storage.UpdateChainPeersCommand{Assignment: assignment, Epoch: 5}); err != nil {
+			t.Fatalf("UpdateChainPeers returned error: %v", err)
+		}
+	}
+
+	if _, err := head.SubmitPut(ctx, 3, "alpha", "v1"); err != nil {
+		t.Fatalf("head SubmitPut(v1) returned error: %v", err)
+	}
+
+	var dropped bool
+	repl.SetBeforeDeliver(func(msg storage.QueuedReplicationMessage) {
+		if dropped || msg.Forward == nil || msg.ToNodeID != "tail" {
+			return
+		}
+		dropped = true
+		repl.DropNext()
+	})
+	if _, err := head.SubmitPut(ctx, 3, "alpha", "v2"); err == nil {
+		t.Fatal("head SubmitPut(v2) unexpectedly succeeded")
+	} else if !errors.Is(err, storage.ErrStateMismatch) {
+		t.Fatalf("head SubmitPut(v2) error = %v, want ErrStateMismatch", err)
+	}
+
+	if read, err := tail.HandleClientGet(ctx, storage.ClientGetRequest{
+		Slot:                 3,
+		Key:                  "alpha",
+		ExpectedChainVersion: 1,
+	}); err != nil {
+		t.Fatalf("tail HandleClientGet returned error: %v", err)
+	} else if !read.Found || read.Value != "v2" {
+		t.Fatalf("tail HandleClientGet = %#v, want value v2", read)
+	}
+
+	if err := head.Close(); err != nil {
+		t.Fatalf("head.Close returned error: %v", err)
+	}
+	if err := headStore.Close(); err != nil {
+		t.Fatalf("headStore.Close returned error: %v", err)
+	}
+
+	reopenedStore := mustOpenStore(t, headPath)
+	recoveredCoord := storage.NewInMemoryCoordinatorClient()
+	reopened, err := storage.OpenNode(ctx, storage.Config{NodeID: "head"}, reopenedStore.Backend(), reopenedStore.LocalStateStore(), recoveredCoord, repl)
+	if err != nil {
+		t.Fatalf("reopen OpenNode(head) returned error: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	repl.Register("head", reopenedStore.Backend())
+	repl.RegisterNode("head", reopened)
+
+	replica := reopened.State().Replicas[3]
+	if got, want := replica.State, storage.ReplicaStateRecovered; got != want {
+		t.Fatalf("reopened head state = %q, want %q", got, want)
+	}
+	if _, err := reopened.HandleClientGet(ctx, storage.ClientGetRequest{
+		Slot:                 3,
+		Key:                  "alpha",
+		ExpectedChainVersion: 1,
+	}); err == nil {
+		t.Fatal("HandleClientGet unexpectedly succeeded on recovered replica")
+	}
+	if err := reopened.ReportRecoveredState(ctx); err != nil {
+		t.Fatalf("ReportRecoveredState returned error: %v", err)
+	}
+	report := recoveredCoord.RecoveryReports[0].Replicas[0]
+	if got, want := report.HighestCommittedSequence, uint64(1); got != want {
+		t.Fatalf("reported highest committed sequence = %d, want %d", got, want)
+	}
+	if got, want := report.LastKnownState, storage.ReplicaStateActive; got != want {
+		t.Fatalf("reported last-known state = %q, want %q", got, want)
+	}
+	if !report.HasCommittedData {
+		t.Fatal("reported committed data presence = false, want true")
+	}
+
+	if err := reopened.RecoverReplica(ctx, storage.RecoverReplicaCommand{
+		Assignment:   headAssignment,
+		SourceNodeID: "tail",
+		Epoch:        6,
+	}); err != nil {
+		t.Fatalf("RecoverReplica returned error: %v", err)
+	}
+	if read, err := reopened.HandleClientGet(ctx, storage.ClientGetRequest{
+		Slot:                 3,
+		Key:                  "alpha",
+		ExpectedChainVersion: 1,
+	}); err != nil {
+		t.Fatalf("HandleClientGet after recovery returned error: %v", err)
+	} else if !read.Found || read.Value != "v2" {
+		t.Fatalf("HandleClientGet after recovery = %#v, want value v2", read)
 	}
 }
 

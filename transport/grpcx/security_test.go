@@ -17,12 +17,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/client"
-	"github.com/danthegoodman1/chainrep/coordinator"
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
-	"github.com/danthegoodman1/chainrep/coordserver"
-	"github.com/danthegoodman1/chainrep/storage"
-	"github.com/danthegoodman1/chainrep/transport/grpcx"
+	"github.com/danthegoodman1/craq/client"
+	"github.com/danthegoodman1/craq/coordinator"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/coordserver"
+	"github.com/danthegoodman1/craq/storage"
+	"github.com/danthegoodman1/craq/transport/grpcx"
 )
 
 func TestClientTransportTLSModesOverGRPC(t *testing.T) {
@@ -465,7 +465,7 @@ func mustIssueLeafCertificate(t *testing.T, ca *testCA, role string, identity st
 		SerialNumber: big.NewInt(time.Now().UnixNano()),
 		Subject:      pkix.Name{CommonName: role},
 		DNSNames:     certificateDNSNames(role, identity),
-		URIs:         []*url.URL{{Scheme: "spiffe", Host: "chainrep", Path: "/" + identity}},
+		URIs:         []*url.URL{{Scheme: "spiffe", Host: "craq", Path: "/" + identity}},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,

@@ -1,4 +1,4 @@
-module github.com/danthegoodman1/chainrep
+module github.com/danthegoodman1/craq
 
 go 1.26.0
 

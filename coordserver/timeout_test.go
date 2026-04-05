@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/coordinator"
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
-	"github.com/danthegoodman1/chainrep/storage"
+	"github.com/danthegoodman1/craq/coordinator"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/storage"
 )
 
 func TestAddNodeDispatchTimeoutReturnsBoundedErrorAndNoPendingWork(t *testing.T) {
@@ -102,7 +102,11 @@ func TestRecoveryCommandTimeoutLeavesReplicaUnavailable(t *testing.T) {
 		t.Fatal("failed to find current assignment for recovered timeout test")
 	}
 	recoveringNodeID := current.Cluster.Chains[0].Replicas[0].NodeID
-	nodes[recoveringNodeID].blockResume = true
+	if replicaRoleCanResumeRecovered(assignment.Role) {
+		nodes[recoveringNodeID].blockResume = true
+	} else {
+		nodes[recoveringNodeID].blockRecover = true
+	}
 
 	err := server.ReportNodeRecovered(ctx, storage.NodeRecoveryReport{
 		NodeID: recoveringNodeID,

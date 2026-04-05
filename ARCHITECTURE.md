@@ -194,7 +194,7 @@ Methods:
 
 - read-only snapshot of current slot routes for clients
 - exposes per-slot chain version plus the current active head and tail
-- includes concrete head/tail RPC endpoints so clients can talk directly to storage nodes without a separate directory lookup
+- includes concrete head/tail RPC endpoints plus the ordered active CRAQ read candidates for that slot
 - marks a slot non-writable while a `joining` replica exists, because the current implementation does not stream live writes into catching-up replicas
 
 ### In `client`
@@ -203,7 +203,8 @@ Methods:
 
 - caches a coordinator routing snapshot
 - hashes keys into dense logical slots
-- routes writes to the active head and reads to the active tail
+- routes writes to the active head and load-balances reads across the active CRAQ read replicas
+- defaults `Get` to a linearizable CRAQ read and also exposes a local-committed relaxed read mode
 - refreshes once on a typed stale-routing error from storage and retries once
 
 ## Current Storage Node Model
@@ -301,13 +302,18 @@ To prevent a boot-looping or repeatedly unstable node from keeping a chain degra
 
 1. a client fetches a `RoutingSnapshot` from `coordserver`
 2. the client hashes the key to a logical slot
-3. writes go to the active head for that slot and reads go to the active tail
+3. writes go to the active head for that slot and reads can go to any active CRAQ read replica
 4. storage nodes reject stale slot ownership, stale chain versions, wrong roles, and inactive replicas with a typed routing-mismatch error
 5. the client refreshes the routing snapshot once and retries once
 
-Writes are intentionally blocked while a slot contains a `joining` replica. Reads continue from the active tail during that phase.
+CRAQ read modes are:
 
-If a client write times out or is canceled after entering the storage write path, the storage node returns a typed ambiguous-write error instead of claiming success or rollback. The client does not retry automatically in that case; it must reconcile by reading from the tail. Retrying the same logical write is treated as a new write, not a replay-safe retry.
+- `linearizable`: any active replica may serve the read; non-tail replicas consult the tail's committed sequence only when the key is locally dirty
+- `local_committed`: any active replica returns only its locally committed clean state and never consults the tail
+
+Writes are intentionally blocked while a slot contains a `joining` replica. Reads continue from the active read replicas during that phase.
+
+If a client write times out or is canceled after entering the storage write path, the storage node returns a typed ambiguous-write error instead of claiming success or rollback. The client does not retry automatically in that case; it must reconcile by reading the slot again with a linearizable CRAQ read. Retrying the same logical write is treated as a new write, not a replay-safe retry.
 
 ## Current Network Transport
 

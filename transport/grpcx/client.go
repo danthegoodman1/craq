@@ -8,11 +8,11 @@ import (
 	"net"
 	"sync"
 
-	"github.com/danthegoodman1/chainrep/coordinator"
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
-	"github.com/danthegoodman1/chainrep/coordserver"
-	"github.com/danthegoodman1/chainrep/storage"
-	grpcproto "github.com/danthegoodman1/chainrep/proto/chainrep/v1"
+	"github.com/danthegoodman1/craq/coordinator"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/coordserver"
+	grpcproto "github.com/danthegoodman1/craq/proto/craq/v1"
+	"github.com/danthegoodman1/craq/storage"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -124,9 +124,9 @@ func (c *CoordinatorAdminClient) Bootstrap(
 ) (coordruntime.State, error) {
 	var state coordruntime.State
 	req := &grpcproto.BootstrapRequest{
-		CommandId:       cmd.ID,
-		ExpectedVersion: cmd.ExpectedVersion,
-		SlotCount:       int32(cmd.Bootstrap.Config.SlotCount),
+		CommandId:         cmd.ID,
+		ExpectedVersion:   cmd.ExpectedVersion,
+		SlotCount:         int32(cmd.Bootstrap.Config.SlotCount),
 		ReplicationFactor: int32(cmd.Bootstrap.Config.ReplicationFactor),
 	}
 	for _, node := range cmd.Bootstrap.Nodes {
@@ -183,8 +183,8 @@ func (c *CoordinatorAdminClient) mutateMembership(
 	cmd coordruntime.Command,
 ) (coordruntime.State, error) {
 	req := &grpcproto.MembershipMutationRequest{
-		CommandId:       cmd.ID,
-		ExpectedVersion: cmd.ExpectedVersion,
+		CommandId:        cmd.ID,
+		ExpectedVersion:  cmd.ExpectedVersion,
 		MaxChangedChains: int32(cmd.Reconfigure.Policy.MaxChangedChains),
 	}
 	if len(cmd.Reconfigure.Events) > 0 {
@@ -605,6 +605,7 @@ func (t *ClientTransport) Get(ctx context.Context, target string, req storage.Cl
 		Slot:                 int32(req.Slot),
 		Key:                  req.Key,
 		ExpectedChainVersion: req.ExpectedChainVersion,
+		Consistency:          protoReadConsistency(req.Consistency),
 	})
 	if err != nil {
 		return storage.ReadResult{}, decodeError(err)

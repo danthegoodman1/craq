@@ -6,10 +6,10 @@ import (
 	"sort"
 	"time"
 
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
-	"github.com/danthegoodman1/chainrep/gologger"
-	"github.com/danthegoodman1/chainrep/ops"
-	"github.com/danthegoodman1/chainrep/storage"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/gologger"
+	"github.com/danthegoodman1/craq/ops"
+	"github.com/danthegoodman1/craq/storage"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 )
@@ -122,40 +122,40 @@ func newServerMetrics(registry *prometheus.Registry) *serverMetrics {
 	m := &serverMetrics{
 		registry: registry,
 		commands: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "chainrep_coordserver_commands_total",
+			Name: "craq_coordserver_commands_total",
 			Help: "Coordinator commands handled by kind and result.",
 		}, []string{"kind", "result"}),
 		dispatches: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "chainrep_coordserver_dispatches_total",
+			Name: "craq_coordserver_dispatches_total",
 			Help: "Coordinator dispatch attempts by rpc kind and result.",
 		}, []string{"kind", "result"}),
 		dispatchDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name:    "chainrep_coordserver_dispatch_duration_seconds",
+			Name:    "craq_coordserver_dispatch_duration_seconds",
 			Help:    "Coordinator dispatch duration.",
 			Buckets: prometheus.DefBuckets,
 		}),
 		livenessEvaluations: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "chainrep_coordserver_liveness_evaluations_total",
+			Name: "craq_coordserver_liveness_evaluations_total",
 			Help: "Liveness evaluations run by the coordinator.",
 		}),
 		deadDetections: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "chainrep_coordserver_dead_detections_total",
+			Name: "craq_coordserver_dead_detections_total",
 			Help: "Nodes transitioned to dead by coordinator liveness policy.",
 		}),
 		flapDetections: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "chainrep_coordserver_flap_detections_total",
+			Name: "craq_coordserver_flap_detections_total",
 			Help: "Nodes evicted by coordinator flapping detection.",
 		}),
 		repairs: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "chainrep_coordserver_repairs_total",
+			Name: "craq_coordserver_repairs_total",
 			Help: "Repair operations by kind and result.",
 		}, []string{"kind", "result"}),
 		pendingGauge: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "chainrep_coordserver_pending_work",
+			Name: "craq_coordserver_pending_work",
 			Help: "Current pending coordinator work items.",
 		}),
 		unavailableGauge: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "chainrep_coordserver_unavailable_replicas",
+			Name: "craq_coordserver_unavailable_replicas",
 			Help: "Current unavailable replica slots tracked by coordinator.",
 		}),
 	}

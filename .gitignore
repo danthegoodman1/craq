@@ -1,3 +1,8 @@
 .gocache
 .tmpbench
 .env*
+bin/craq-quickstart
+infra/**/.terraform/
+infra/**/.terraform.lock.hcl
+infra/**/*.tfstate
+infra/**/*.tfstate.*

@@ -4,8 +4,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/gologger"
-	"github.com/danthegoodman1/chainrep/ops"
+	"github.com/danthegoodman1/craq/gologger"
+	"github.com/danthegoodman1/craq/ops"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 )
@@ -15,6 +15,7 @@ type ResourceUsage struct {
 	InFlightClientWritesPerSlot    map[int]int `json:"in_flight_client_writes_per_slot"`
 	BufferedReplicaMessagesPerNode int         `json:"buffered_replica_messages_per_node"`
 	BufferedReplicaMessagesPerSlot map[int]int `json:"buffered_replica_messages_per_slot"`
+	DirtyKeysPerSlot               map[int]int `json:"dirty_keys_per_slot"`
 	ActiveCatchups                 int         `json:"active_catchups"`
 }
 
@@ -37,6 +38,9 @@ type nodeMetrics struct {
 	ambiguousWrites        prometheus.Counter
 	conditionFailures      prometheus.Counter
 	writeWaitDuration      prometheus.Histogram
+	tailResolutions        *prometheus.CounterVec
+	tailResolutionDuration prometheus.Histogram
+	readDependencyFailures prometheus.Counter
 	replicationForwards    *prometheus.CounterVec
 	replicationCommits     *prometheus.CounterVec
 	catchupOps             *prometheus.CounterVec
@@ -136,57 +140,70 @@ func newNodeMetrics(registry *prometheus.Registry) *nodeMetrics {
 	m := &nodeMetrics{
 		registry: registry,
 		clientReads: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "chainrep_storage_client_reads_total",
+			Name: "craq_storage_client_reads_total",
 			Help: "Client read requests handled by storage nodes.",
-		}, []string{"result"}),
+		}, []string{"consistency", "result"}),
 		clientWrites: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "chainrep_storage_client_writes_total",
+			Name: "craq_storage_client_writes_total",
 			Help: "Client write and delete requests handled by storage nodes.",
 		}, []string{"kind", "result"}),
 		ambiguousWrites: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "chainrep_storage_ambiguous_writes_total",
+			Name: "craq_storage_ambiguous_writes_total",
 			Help: "Ambiguous writes returned by storage nodes.",
 		}),
 		conditionFailures: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "chainrep_storage_condition_failures_total",
+			Name: "craq_storage_condition_failures_total",
 			Help: "Conditional write failures returned by storage nodes.",
 		}),
 		writeWaitDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name:    "chainrep_storage_write_wait_seconds",
+			Name:    "craq_storage_write_wait_seconds",
 			Help:    "Client write latency observed at storage nodes.",
 			Buckets: prometheus.DefBuckets,
 		}),
+		tailResolutions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "craq_storage_tail_resolutions_total",
+			Help: "Tail committed-sequence queries performed for CRAQ linearizable reads.",
+		}, []string{"result"}),
+		tailResolutionDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "craq_storage_tail_resolution_seconds",
+			Help:    "Latency of CRAQ tail committed-sequence queries.",
+			Buckets: prometheus.DefBuckets,
+		}),
+		readDependencyFailures: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "craq_storage_read_dependency_failures_total",
+			Help: "Linearizable CRAQ reads that failed to resolve through the tail.",
+		}),
 		replicationForwards: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "chainrep_storage_replication_forwards_total",
+			Name: "craq_storage_replication_forwards_total",
 			Help: "Forward write RPCs handled by storage nodes.",
 		}, []string{"result"}),
 		replicationCommits: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "chainrep_storage_replication_commits_total",
+			Name: "craq_storage_replication_commits_total",
 			Help: "Commit write RPCs handled by storage nodes.",
 		}, []string{"result"}),
 		catchupOps: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "chainrep_storage_catchup_operations_total",
+			Name: "craq_storage_catchup_operations_total",
 			Help: "Catch-up and recovery operations handled by storage nodes.",
 		}, []string{"kind", "result"}),
 		catchupDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name:    "chainrep_storage_catchup_duration_seconds",
+			Name:    "craq_storage_catchup_duration_seconds",
 			Help:    "Catch-up and recovery operation durations.",
 			Buckets: prometheus.DefBuckets,
 		}),
 		backpressureRejections: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "chainrep_storage_backpressure_rejections_total",
+			Name: "craq_storage_backpressure_rejections_total",
 			Help: "Backpressure rejections by resource.",
 		}, []string{"resource"}),
 		inFlightWrites: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "chainrep_storage_in_flight_client_writes",
+			Name: "craq_storage_in_flight_client_writes",
 			Help: "Current admitted in-flight client writes.",
 		}),
 		bufferedReplicaMsgs: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "chainrep_storage_buffered_replica_messages",
+			Name: "craq_storage_buffered_replica_messages",
 			Help: "Current buffered replica messages across slots.",
 		}),
 		catchups: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "chainrep_storage_active_catchups",
+			Name: "craq_storage_active_catchups",
 			Help: "Current active catch-up operations.",
 		}),
 	}
@@ -196,6 +213,9 @@ func newNodeMetrics(registry *prometheus.Registry) *nodeMetrics {
 		m.ambiguousWrites,
 		m.conditionFailures,
 		m.writeWaitDuration,
+		m.tailResolutions,
+		m.tailResolutionDuration,
+		m.readDependencyFailures,
 		m.replicationForwards,
 		m.replicationCommits,
 		m.catchupOps,
@@ -224,16 +244,20 @@ func (n *Node) RecentEvents() []ops.Event {
 }
 
 func (n *Node) ResourceUsage() ResourceUsage {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	usage := ResourceUsage{
 		InFlightClientWritesPerNode:    n.inFlightClientWrites,
 		InFlightClientWritesPerSlot:    make(map[int]int, len(n.replicas)),
-		BufferedReplicaMessagesPerNode: n.bufferedReplicaMessagesForNode(),
+		BufferedReplicaMessagesPerNode: n.bufferedReplicaMessagesForNodeLocked(),
 		BufferedReplicaMessagesPerSlot: make(map[int]int, len(n.replicas)),
+		DirtyKeysPerSlot:               make(map[int]int, len(n.replicas)),
 		ActiveCatchups:                 n.inFlightCatchups,
 	}
 	for slot, record := range n.replicas {
 		usage.InFlightClientWritesPerSlot[slot] = record.inFlightClientWrites
 		usage.BufferedReplicaMessagesPerSlot[slot] = len(record.bufferedForwards) + len(record.bufferedCommits)
+		usage.DirtyKeysPerSlot[slot] = dirtyKeyCount(record)
 	}
 	return usage
 }
@@ -251,9 +275,21 @@ func (n *Node) refreshMetricGauges() {
 	if n.metrics == nil {
 		return
 	}
-	n.metrics.inFlightWrites.Set(float64(n.inFlightClientWrites))
-	n.metrics.bufferedReplicaMsgs.Set(float64(n.bufferedReplicaMessagesForNode()))
-	n.metrics.catchups.Set(float64(n.inFlightCatchups))
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	n.refreshMetricGaugesLocked()
+}
+
+func (n *Node) refreshMetricGaugesLocked() {
+	if n.metrics == nil {
+		return
+	}
+	inFlightWrites := n.inFlightClientWrites
+	bufferedReplicaMessages := n.bufferedReplicaMessagesForNodeLocked()
+	catchups := n.inFlightCatchups
+	n.metrics.inFlightWrites.Set(float64(inFlightWrites))
+	n.metrics.bufferedReplicaMsgs.Set(float64(bufferedReplicaMessages))
+	n.metrics.catchups.Set(float64(catchups))
 }
 
 func (n *Node) observeBackpressure(err error) {
