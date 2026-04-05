@@ -7,9 +7,9 @@ import (
 	"net/http"
 	"sync/atomic"
 
-	"github.com/danthegoodman1/chainrep/coordserver"
-	"github.com/danthegoodman1/chainrep/gologger"
-	"github.com/danthegoodman1/chainrep/storage"
+	"github.com/danthegoodman1/craq/coordserver"
+	"github.com/danthegoodman1/craq/gologger"
+	"github.com/danthegoodman1/craq/storage"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"

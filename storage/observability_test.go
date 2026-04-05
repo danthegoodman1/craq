@@ -108,13 +108,13 @@ func TestNodeObservabilityRecordsAmbiguousWriteAndBackpressure(t *testing.T) {
 		t.Fatalf("second future HandleForwardWrite error = %v, want replica backpressure", err)
 	}
 
-	if got := metricCounterValue(t, headRegistry, "chainrep_storage_ambiguous_writes_total"); got != 1 {
+	if got := metricCounterValue(t, headRegistry, "craq_storage_ambiguous_writes_total"); got != 1 {
 		t.Fatalf("ambiguous writes total = %v, want 1", got)
 	}
-	if got := metricCounterValueWithLabels(t, tailRegistry, "chainrep_storage_backpressure_rejections_total", map[string]string{"resource": "replica_buffer"}); got != 1 {
+	if got := metricCounterValueWithLabels(t, tailRegistry, "craq_storage_backpressure_rejections_total", map[string]string{"resource": "replica_buffer"}); got != 1 {
 		t.Fatalf("replica backpressure total = %v, want 1", got)
 	}
-	if got := metricCounterValueWithLabels(t, headRegistry, "chainrep_storage_client_writes_total", map[string]string{"kind": "put", "result": "ambiguous"}); got != 1 {
+	if got := metricCounterValueWithLabels(t, headRegistry, "craq_storage_client_writes_total", map[string]string{"kind": "put", "result": "ambiguous"}); got != 1 {
 		t.Fatalf("ambiguous put counter = %v, want 1", got)
 	}
 	if !strings.Contains(logBuf.String(), "ambiguous_write") {

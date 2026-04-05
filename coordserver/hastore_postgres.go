@@ -36,14 +36,14 @@ func (s *PostgresHAStore) initSchema(ctx context.Context) error {
 		return fmt.Errorf("postgres ha store requires db")
 	}
 	const schema = `
-CREATE TABLE IF NOT EXISTS chainrep_coord_ha_lease (
+CREATE TABLE IF NOT EXISTS craq_coord_ha_lease (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   holder_id TEXT NOT NULL,
   holder_endpoint TEXT NOT NULL,
   epoch BIGINT NOT NULL,
   expires_at_unix_nano BIGINT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS chainrep_coord_ha_snapshot (
+CREATE TABLE IF NOT EXISTS craq_coord_ha_snapshot (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   snapshot_version BIGINT NOT NULL,
   payload JSONB NOT NULL
@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS chainrep_coord_ha_snapshot (
 func (s *PostgresHAStore) CurrentLease(ctx context.Context) (LeaderLease, bool, error) {
 	row := s.db.QueryRowContext(ctx, `
 SELECT holder_id, holder_endpoint, epoch, expires_at_unix_nano
-FROM chainrep_coord_ha_lease
+FROM craq_coord_ha_lease
 WHERE id = 1`)
 	var lease LeaderLease
 	switch err := row.Scan(&lease.HolderID, &lease.HolderEndpoint, &lease.Epoch, &lease.ExpiresAtUnixNano); err {
@@ -92,7 +92,7 @@ func (s *PostgresHAStore) AcquireOrRenew(ctx context.Context, holderID string, h
 			ExpiresAtUnixNano: expiresAt,
 		}
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO chainrep_coord_ha_lease (id, holder_id, holder_endpoint, epoch, expires_at_unix_nano)
+INSERT INTO craq_coord_ha_lease (id, holder_id, holder_endpoint, epoch, expires_at_unix_nano)
 VALUES (1, $1, $2, $3, $4)`,
 			lease.HolderID, lease.HolderEndpoint, lease.Epoch, lease.ExpiresAtUnixNano,
 		); err != nil {
@@ -124,7 +124,7 @@ VALUES (1, $1, $2, $3, $4)`,
 	}
 
 	if _, err := tx.ExecContext(ctx, `
-UPDATE chainrep_coord_ha_lease
+UPDATE craq_coord_ha_lease
 SET holder_id = $1, holder_endpoint = $2, epoch = $3, expires_at_unix_nano = $4
 WHERE id = 1`,
 		current.HolderID, current.HolderEndpoint, current.Epoch, current.ExpiresAtUnixNano,
@@ -140,7 +140,7 @@ WHERE id = 1`,
 func (s *PostgresHAStore) LoadSnapshot(ctx context.Context) (HASnapshot, error) {
 	row := s.db.QueryRowContext(ctx, `
 SELECT snapshot_version, payload
-FROM chainrep_coord_ha_snapshot
+FROM craq_coord_ha_snapshot
 WHERE id = 1`)
 	var (
 		version uint64
@@ -203,7 +203,7 @@ func (s *PostgresHAStore) SaveSnapshot(ctx context.Context, lease LeaderLease, n
 
 	if hasSnapshot {
 		if _, err := tx.ExecContext(ctx, `
-UPDATE chainrep_coord_ha_snapshot
+UPDATE craq_coord_ha_snapshot
 SET snapshot_version = $1, payload = $2
 WHERE id = 1`,
 			nextVersion, payload,
@@ -212,7 +212,7 @@ WHERE id = 1`,
 		}
 	} else {
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO chainrep_coord_ha_snapshot (id, snapshot_version, payload)
+INSERT INTO craq_coord_ha_snapshot (id, snapshot_version, payload)
 VALUES (1, $1, $2)`,
 			nextVersion, payload,
 		); err != nil {
@@ -238,8 +238,8 @@ func (s *PostgresHAStore) Reset(ctx context.Context) error {
 		return nil
 	}
 	if _, err := s.db.ExecContext(ctx, `
-DELETE FROM chainrep_coord_ha_snapshot;
-DELETE FROM chainrep_coord_ha_lease;`,
+DELETE FROM craq_coord_ha_snapshot;
+DELETE FROM craq_coord_ha_lease;`,
 	); err != nil {
 		return fmt.Errorf("reset postgres ha store: %w", err)
 	}
@@ -249,7 +249,7 @@ DELETE FROM chainrep_coord_ha_lease;`,
 func selectLeaseForUpdate(ctx context.Context, tx *sql.Tx) (LeaderLease, bool, error) {
 	row := tx.QueryRowContext(ctx, `
 SELECT holder_id, holder_endpoint, epoch, expires_at_unix_nano
-FROM chainrep_coord_ha_lease
+FROM craq_coord_ha_lease
 WHERE id = 1
 FOR UPDATE`)
 	var lease LeaderLease
@@ -266,7 +266,7 @@ FOR UPDATE`)
 func selectSnapshotVersionForUpdate(ctx context.Context, tx *sql.Tx) (uint64, bool, error) {
 	row := tx.QueryRowContext(ctx, `
 SELECT snapshot_version
-FROM chainrep_coord_ha_snapshot
+FROM craq_coord_ha_snapshot
 WHERE id = 1
 FOR UPDATE`)
 	var version uint64

@@ -1,6 +1,6 @@
 # Observability
 
-`chainrep` now includes an operability surface around the coordinator,
+`craq` now includes an operability surface around the coordinator,
 storage nodes, and gRPC transport:
 
 - structured event logs with `zerolog`
@@ -58,38 +58,42 @@ through the admin HTTP listener.
 Storage metrics are registered from
 [storage/observability.go](./storage/observability.go):
 
-- `chainrep_storage_client_reads_total`
-- `chainrep_storage_client_writes_total`
-- `chainrep_storage_ambiguous_writes_total`
-- `chainrep_storage_condition_failures_total`
-- `chainrep_storage_write_wait_seconds`
-- `chainrep_storage_replication_forwards_total`
-- `chainrep_storage_replication_commits_total`
-- `chainrep_storage_catchup_operations_total`
-- `chainrep_storage_catchup_duration_seconds`
-- `chainrep_storage_backpressure_rejections_total`
-- `chainrep_storage_in_flight_client_writes`
-- `chainrep_storage_buffered_replica_messages`
-- `chainrep_storage_active_catchups`
+- `craq_storage_client_reads_total`
+- `craq_storage_client_writes_total`
+- `craq_storage_ambiguous_writes_total`
+- `craq_storage_condition_failures_total`
+- `craq_storage_write_wait_seconds`
+- `craq_storage_tail_resolutions_total`
+- `craq_storage_tail_resolution_seconds`
+- `craq_storage_read_dependency_failures_total`
+- `craq_storage_replication_forwards_total`
+- `craq_storage_replication_commits_total`
+- `craq_storage_catchup_operations_total`
+- `craq_storage_catchup_duration_seconds`
+- `craq_storage_backpressure_rejections_total`
+- `craq_storage_in_flight_client_writes`
+- `craq_storage_buffered_replica_messages`
+- `craq_storage_active_catchups`
 
-These cover client request outcomes, ambiguous writes, conditional failures,
-replication protocol activity, catch-up and recovery duration, backpressure, and
-current runtime resource usage.
+These cover CRAQ read outcomes by consistency mode, ambiguous writes,
+conditional failures, tail-resolution activity for linearizable reads,
+replication protocol activity, catch-up and recovery duration, backpressure,
+and current runtime resource usage.
 
 ### Coordinator Metrics
 
 Coordinator metrics are registered from
 [coordserver/observability.go](./coordserver/observability.go):
 
-- `chainrep_coordserver_commands_total`
-- `chainrep_coordserver_dispatches_total`
-- `chainrep_coordserver_dispatch_duration_seconds`
-- `chainrep_coordserver_liveness_evaluations_total`
-- `chainrep_coordserver_dead_detections_total`
-- `chainrep_coordserver_flap_detections_total`
-- `chainrep_coordserver_repairs_total`
-- `chainrep_coordserver_pending_work`
-- `chainrep_coordserver_unavailable_replicas`
+- `craq_coordserver_commands_total`
+- `craq_coordserver_dispatches_total`
+- `craq_coordserver_dispatch_duration_seconds`
+- `craq_coordserver_liveness_evaluations_total`
+- `craq_coordserver_dead_detections_total`
+- `craq_coordserver_flap_detections_total`
+- `craq_coordserver_repairs_total`
+- `craq_coordserver_pending_work`
+- `craq_coordserver_unavailable_replicas`
 
 These cover command execution, coordinator-to-storage dispatch behavior, liveness
 evaluation, flap-triggered eviction, repair activity, and current pending or
@@ -100,9 +104,9 @@ unavailable work.
 gRPC transport metrics are registered from
 [transport/grpcx/observability.go](./transport/grpcx/observability.go):
 
-- `chainrep_grpc_requests_total`
-- `chainrep_grpc_request_duration_seconds`
-- `chainrep_grpc_auth_failures_total`
+- `craq_grpc_requests_total`
+- `craq_grpc_request_duration_seconds`
+- `craq_grpc_auth_failures_total`
 
 These are labeled by component and gRPC method, and auth failures are split out
 for `PermissionDenied` and `Unauthenticated` cases.
@@ -162,6 +166,7 @@ Storage state currently includes:
 - current resource usage:
   - in-flight client writes per node and per slot
   - buffered replica messages per node and per slot
+  - dirty CRAQ keys per slot
   - active catch-ups
 - recent storage events
 

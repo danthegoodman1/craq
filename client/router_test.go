@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"hash/crc32"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
-	"github.com/danthegoodman1/chainrep/coordinator"
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
-	"github.com/danthegoodman1/chainrep/coordserver"
-	"github.com/danthegoodman1/chainrep/storage"
+	"github.com/danthegoodman1/craq/coordinator"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/coordserver"
+	"github.com/danthegoodman1/craq/storage"
 )
 
 func TestRouterHashesKeysDeterministicallyAndRoutesToExpectedEndpoints(t *testing.T) {
@@ -120,6 +122,214 @@ func TestRouterRefreshesOnceOnRoutingMismatchAndNotOnGenericFailure(t *testing.T
 	}
 	if got, want := source.calls, 1; got != want {
 		t.Fatalf("snapshot source calls after generic failure = %d, want %d", got, want)
+	}
+}
+
+func TestRouterRoundRobinsReadsAcrossReadReplicas(t *testing.T) {
+	ctx := context.Background()
+	key := keyForSlot(t, 1, 4, "round-robin")
+	snapshot := coordserver.RoutingSnapshot{
+		Version:   1,
+		SlotCount: 4,
+		Slots: []coordserver.SlotRoute{
+			{Slot: 0, ChainVersion: 1, HeadNodeID: "h0", TailNodeID: "t0", Writable: true, Readable: true},
+			{
+				Slot:         1,
+				ChainVersion: 3,
+				HeadNodeID:   "head-1",
+				TailNodeID:   "tail-1",
+				Readable:     true,
+				ReadReplicas: []coordserver.ReadReplicaRoute{
+					{NodeID: "head-1", Role: storage.ReplicaRoleHead},
+					{NodeID: "mid-1", Role: storage.ReplicaRoleMiddle},
+					{NodeID: "tail-1", Role: storage.ReplicaRoleTail},
+				},
+			},
+			{Slot: 2, ChainVersion: 1, HeadNodeID: "h2", TailNodeID: "t2", Writable: true, Readable: true},
+			{Slot: 3, ChainVersion: 1, HeadNodeID: "h3", TailNodeID: "t3", Writable: true, Readable: true},
+		},
+	}
+	source := &scriptedSnapshotSource{snapshots: []coordserver.RoutingSnapshot{snapshot}}
+	transport := &recordingTransport{}
+	router := mustNewRouter(t, source, transport)
+	if err := router.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh returned error: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := router.Get(ctx, key); err != nil {
+			t.Fatalf("Get #%d returned error: %v", i+1, err)
+		}
+	}
+	if got, want := transport.getNodes, []string{"head-1", "mid-1", "tail-1"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("get nodes = %v, want %v", got, want)
+	}
+}
+
+func TestRouterConcurrentGetsShareSingleRouterSafely(t *testing.T) {
+	ctx := context.Background()
+	repl := storage.NewInMemoryReplicationTransport()
+	backend := storage.NewInMemoryBackend()
+	node := mustNewStorageNodeForRouter(t, ctx, "node-a", backend, repl)
+	mustActivateStorageAssignment(t, node, storage.ReplicaAssignment{
+		Slot:         0,
+		ChainVersion: 1,
+		Role:         storage.ReplicaRoleSingle,
+		Peers: storage.ChainPeers{
+			TailNodeID: "node-a",
+			TailTarget: "node-a",
+		},
+	})
+
+	transport := NewInMemoryTransport()
+	transport.RegisterNode("node-a", node)
+	router := mustNewRouter(t, &scriptedSnapshotSource{snapshots: []coordserver.RoutingSnapshot{{
+		Version:   1,
+		SlotCount: 1,
+		Slots: []coordserver.SlotRoute{{
+			Slot:         0,
+			ChainVersion: 1,
+			HeadNodeID:   "node-a",
+			TailNodeID:   "node-a",
+			Writable:     true,
+			Readable:     true,
+			ReadReplicas: []coordserver.ReadReplicaRoute{{
+				NodeID: "node-a",
+				Role:   storage.ReplicaRoleSingle,
+			}},
+		}},
+	}}}, transport)
+	if err := router.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh returned error: %v", err)
+	}
+	if _, err := router.Put(ctx, "alpha", "one"); err != nil {
+		t.Fatalf("Put returned error: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 32)
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result, err := router.Get(ctx, "alpha")
+			if err != nil {
+				errCh <- fmt.Errorf("Get returned error: %w", err)
+				return
+			}
+			if !result.Found || result.Value != "one" {
+				errCh <- fmt.Errorf("Get result = %#v, want found value one", result)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func TestRouterReadFallbacksForTransportUnavailableAndReadDependency(t *testing.T) {
+	ctx := context.Background()
+	key := keyForSlot(t, 1, 4, "fallbacks")
+	snapshot := coordserver.RoutingSnapshot{
+		Version:   1,
+		SlotCount: 4,
+		Slots: []coordserver.SlotRoute{
+			{Slot: 0, ChainVersion: 1, HeadNodeID: "h0", TailNodeID: "t0", Writable: true, Readable: true},
+			{
+				Slot:         1,
+				ChainVersion: 2,
+				HeadNodeID:   "head-1",
+				TailNodeID:   "tail-1",
+				Readable:     true,
+				ReadReplicas: []coordserver.ReadReplicaRoute{
+					{NodeID: "head-1", Role: storage.ReplicaRoleHead},
+					{NodeID: "mid-1", Role: storage.ReplicaRoleMiddle},
+					{NodeID: "tail-1", Role: storage.ReplicaRoleTail},
+				},
+			},
+			{Slot: 2, ChainVersion: 1, HeadNodeID: "h2", TailNodeID: "t2", Writable: true, Readable: true},
+			{Slot: 3, ChainVersion: 1, HeadNodeID: "h3", TailNodeID: "t3", Writable: true, Readable: true},
+		},
+	}
+
+	t.Run("transport unavailable retries another replica before refresh", func(t *testing.T) {
+		source := &scriptedSnapshotSource{snapshots: []coordserver.RoutingSnapshot{snapshot}}
+		transport := &recordingTransport{
+			getErrs: []error{ErrNoRoute, nil},
+		}
+		router := mustNewRouter(t, source, transport)
+		if err := router.Refresh(ctx); err != nil {
+			t.Fatalf("Refresh returned error: %v", err)
+		}
+		if _, err := router.Get(ctx, key); err != nil {
+			t.Fatalf("Get returned error: %v", err)
+		}
+		if got, want := transport.getNodes, []string{"head-1", "mid-1"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("get nodes = %v, want %v", got, want)
+		}
+		if got, want := source.calls, 1; got != want {
+			t.Fatalf("snapshot source calls = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("read dependency falls back directly to tail", func(t *testing.T) {
+		source := &scriptedSnapshotSource{snapshots: []coordserver.RoutingSnapshot{snapshot}}
+		transport := &recordingTransport{
+			getErrs: []error{
+				&storage.ReadDependencyError{
+					Slot:                 1,
+					ExpectedChainVersion: 2,
+					TailNodeID:           "tail-1",
+					Cause:                errors.New("tail lookup unavailable"),
+				},
+				nil,
+			},
+		}
+		router := mustNewRouter(t, source, transport)
+		if err := router.Refresh(ctx); err != nil {
+			t.Fatalf("Refresh returned error: %v", err)
+		}
+		if _, err := router.Get(ctx, key); err != nil {
+			t.Fatalf("Get returned error: %v", err)
+		}
+		if got, want := transport.getNodes, []string{"head-1", "tail-1"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("get nodes = %v, want %v", got, want)
+		}
+	})
+}
+
+func TestRouterGetWithConsistencyPassesRequestedMode(t *testing.T) {
+	ctx := context.Background()
+	key := keyForSlot(t, 1, 2, "consistency")
+	snapshot := coordserver.RoutingSnapshot{
+		Version:   1,
+		SlotCount: 2,
+		Slots: []coordserver.SlotRoute{
+			{Slot: 0, ChainVersion: 1, HeadNodeID: "h0", TailNodeID: "t0", Writable: true, Readable: true},
+			{
+				Slot:         1,
+				ChainVersion: 1,
+				HeadNodeID:   "head-1",
+				TailNodeID:   "tail-1",
+				Readable:     true,
+				ReadReplicas: []coordserver.ReadReplicaRoute{{NodeID: "head-1", Role: storage.ReplicaRoleHead}},
+			},
+		},
+	}
+	source := &scriptedSnapshotSource{snapshots: []coordserver.RoutingSnapshot{snapshot}}
+	transport := &recordingTransport{}
+	router := mustNewRouter(t, source, transport)
+	if err := router.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh returned error: %v", err)
+	}
+
+	if _, err := router.GetWithConsistency(ctx, key, storage.ReadConsistencyLocalCommitted); err != nil {
+		t.Fatalf("GetWithConsistency returned error: %v", err)
+	}
+	if got, want := transport.getModes, []storage.ReadConsistency{storage.ReadConsistencyLocalCommitted}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("get modes = %v, want %v", got, want)
 	}
 }
 
@@ -549,6 +759,155 @@ func TestEndToEndRouterPutGetDeleteWithQueuedReplicationTransport(t *testing.T) 
 	}
 }
 
+func TestRouterCRAQRoundRobinUsesActiveReadReplicasWithRealHarness(t *testing.T) {
+	ctx := context.Background()
+	h := newRouterHarness(t, []string{"a", "b", "c"})
+	bootstrapDynamicCluster(t, ctx, h, 1, 3, []string{"a", "b", "c"})
+
+	tracing := &observingTransport{base: h.transport}
+	router := mustNewRouter(t, h.server, tracing)
+	if err := router.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh returned error: %v", err)
+	}
+
+	key := keyForSlot(t, 0, 1, "craq-round-robin-real")
+	if _, err := router.Put(ctx, key, "v1"); err != nil {
+		t.Fatalf("Put returned error: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		read, err := router.Get(ctx, key)
+		if err != nil {
+			t.Fatalf("Get #%d returned error: %v", i+1, err)
+		}
+		if !read.Found || read.Value != "v1" {
+			t.Fatalf("Get #%d result = %#v, want value v1", i+1, read)
+		}
+	}
+	if got, want := tracing.getNodes, []string{"a", "b", "c"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("get nodes = %v, want %v", got, want)
+	}
+}
+
+func TestRouterCRAQLocalCommittedAndLinearizableReadsUseRealHarness(t *testing.T) {
+	ctx := context.Background()
+	h := newQueuedRouterHarness(t, []string{"a", "b", "c"})
+	if _, err := h.server.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 1, 3, "a", "b", "c")); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	h.seedBootstrap(t, 1, 3, []string{"a", "b", "c"})
+
+	tracing := &observingTransport{base: h.transport}
+	router := mustNewRouter(t, h.server, tracing)
+	if err := router.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh returned error: %v", err)
+	}
+
+	key := keyForSlot(t, 0, 1, "craq-local-real")
+	if _, err := router.Put(ctx, key, "v1"); err != nil {
+		t.Fatalf("Put returned error: %v", err)
+	}
+	enqueueDirtyCommittedMiddleWrite(t, ctx, h, 0, key, "v2", 2)
+
+	setNextReadReplicaForSlot(router, 0, 1)
+	local, err := router.GetWithConsistency(ctx, key, storage.ReadConsistencyLocalCommitted)
+	if err != nil {
+		t.Fatalf("GetWithConsistency returned error: %v", err)
+	}
+	if !local.Found || local.Value != "v1" {
+		t.Fatalf("local committed read = %#v, want value v1", local)
+	}
+	if got, want := tracing.getNodes, []string{"b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("local committed nodes = %v, want %v", got, want)
+	}
+	if got, want := tracing.getModes, []storage.ReadConsistency{storage.ReadConsistencyLocalCommitted}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("local committed modes = %v, want %v", got, want)
+	}
+
+	tracing.reset()
+	setNextReadReplicaForSlot(router, 0, 1)
+	linearizable, err := router.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if !linearizable.Found || linearizable.Value != "v2" {
+		t.Fatalf("linearizable read = %#v, want value v2", linearizable)
+	}
+	if got, want := tracing.getNodes, []string{"b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("linearizable nodes = %v, want %v", got, want)
+	}
+}
+
+func TestRouterCRAQFallsBackDirectlyToTailWithRealHarness(t *testing.T) {
+	ctx := context.Background()
+	h := newQueuedRouterHarness(t, []string{"a", "b", "c"})
+	if _, err := h.server.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 1, 3, "a", "b", "c")); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	h.seedBootstrap(t, 1, 3, []string{"a", "b", "c"})
+
+	tracing := &observingTransport{base: h.transport}
+	router := mustNewRouter(t, h.server, tracing)
+	if err := router.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh returned error: %v", err)
+	}
+
+	key := keyForSlot(t, 0, 1, "craq-tail-fallback-real")
+	if _, err := router.Put(ctx, key, "v1"); err != nil {
+		t.Fatalf("Put returned error: %v", err)
+	}
+	enqueueDirtyCommittedMiddleWrite(t, ctx, h, 0, key, "v2", 2)
+	misconfigureReadDependency(t, h.adapters["b"].Node(), 0, "missing-tail")
+	setNextReadReplicaForSlot(router, 0, 1)
+
+	read, err := router.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if !read.Found || read.Value != "v2" {
+		t.Fatalf("Get result = %#v, want value v2", read)
+	}
+	if got, want := tracing.getNodes, []string{"b", "c"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("get nodes = %v, want %v", got, want)
+	}
+}
+
+func TestRouterCRAQRetriesAnotherReplicaOnTransportUnavailableWithRealHarness(t *testing.T) {
+	ctx := context.Background()
+	h := newRouterHarness(t, []string{"a", "b", "c"})
+	bootstrapDynamicCluster(t, ctx, h, 1, 3, []string{"a", "b", "c"})
+
+	attempts := map[string]int{}
+	tracing := &observingTransport{
+		base: h.transport,
+		getHook: func(nodeID string, _ storage.ClientGetRequest) error {
+			attempts[nodeID]++
+			if nodeID == "a" && attempts[nodeID] == 1 {
+				return ErrNoRoute
+			}
+			return nil
+		},
+	}
+	router := mustNewRouter(t, h.server, tracing)
+	if err := router.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh returned error: %v", err)
+	}
+
+	key := keyForSlot(t, 0, 1, "craq-unavailable-real")
+	if _, err := router.Put(ctx, key, "v1"); err != nil {
+		t.Fatalf("Put returned error: %v", err)
+	}
+	read, err := router.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if !read.Found || read.Value != "v1" {
+		t.Fatalf("Get result = %#v, want value v1", read)
+	}
+	if got, want := tracing.getNodes, []string{"a", "b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("get nodes = %v, want %v", got, want)
+	}
+}
+
 type scriptedSnapshotSource struct {
 	snapshots []coordserver.RoutingSnapshot
 	calls     int
@@ -565,6 +924,9 @@ func (s *scriptedSnapshotSource) RoutingSnapshot(_ context.Context) (coordserver
 
 type recordingTransport struct {
 	getNodes    []string
+	getErrs     []error
+	getResults  []storage.ReadResult
+	getModes    []storage.ReadConsistency
 	putNodes    []string
 	deleteNodes []string
 	putErrs     []error
@@ -574,6 +936,19 @@ type recordingTransport struct {
 
 func (t *recordingTransport) Get(_ context.Context, nodeID string, req storage.ClientGetRequest) (storage.ReadResult, error) {
 	t.getNodes = append(t.getNodes, nodeID)
+	t.getModes = append(t.getModes, req.Consistency)
+	if len(t.getErrs) > 0 {
+		err := t.getErrs[0]
+		t.getErrs = t.getErrs[1:]
+		if err != nil {
+			return storage.ReadResult{}, err
+		}
+	}
+	if len(t.getResults) > 0 {
+		result := t.getResults[0]
+		t.getResults = t.getResults[1:]
+		return result, nil
+	}
 	return storage.ReadResult{
 		Slot:         req.Slot,
 		ChainVersion: req.ExpectedChainVersion,
@@ -789,6 +1164,10 @@ func assignmentForChainNode(chain coordinator.Chain, nodeID string, chainVersion
 	if position+1 < len(chain.Replicas) {
 		assignment.Peers.SuccessorNodeID = chain.Replicas[position+1].NodeID
 	}
+	if len(chain.Replicas) > 0 {
+		assignment.Peers.TailNodeID = chain.Replicas[len(chain.Replicas)-1].NodeID
+		assignment.Peers.TailTarget = chain.Replicas[len(chain.Replicas)-1].NodeID
+	}
 	return assignment
 }
 
@@ -944,4 +1323,124 @@ func mustNewRouter(t *testing.T, source SnapshotSource, transport Transport) *Ro
 		t.Fatalf("NewRouter returned error: %v", err)
 	}
 	return router
+}
+
+type observingTransport struct {
+	base     Transport
+	getNodes []string
+	getModes []storage.ReadConsistency
+	getHook  func(nodeID string, req storage.ClientGetRequest) error
+}
+
+func (t *observingTransport) Get(ctx context.Context, nodeID string, req storage.ClientGetRequest) (storage.ReadResult, error) {
+	t.getNodes = append(t.getNodes, nodeID)
+	t.getModes = append(t.getModes, req.Consistency)
+	if t.getHook != nil {
+		if err := t.getHook(nodeID, req); err != nil {
+			return storage.ReadResult{}, err
+		}
+	}
+	return t.base.Get(ctx, nodeID, req)
+}
+
+func (t *observingTransport) Put(ctx context.Context, nodeID string, req storage.ClientPutRequest) (storage.CommitResult, error) {
+	return t.base.Put(ctx, nodeID, req)
+}
+
+func (t *observingTransport) Delete(ctx context.Context, nodeID string, req storage.ClientDeleteRequest) (storage.CommitResult, error) {
+	return t.base.Delete(ctx, nodeID, req)
+}
+
+func (t *observingTransport) reset() {
+	t.getNodes = nil
+	t.getModes = nil
+}
+
+func mustNewStorageNodeForRouter(
+	t *testing.T,
+	ctx context.Context,
+	nodeID string,
+	backend storage.Backend,
+	repl *storage.InMemoryReplicationTransport,
+) *storage.Node {
+	t.Helper()
+	node, err := storage.OpenNode(
+		ctx,
+		storage.Config{NodeID: nodeID},
+		backend,
+		storage.NewInMemoryLocalStateStore(),
+		storage.NewInMemoryCoordinatorClient(),
+		repl,
+	)
+	if err != nil {
+		t.Fatalf("OpenNode(%q) returned error: %v", nodeID, err)
+	}
+	repl.Register(nodeID, backend)
+	repl.RegisterNode(nodeID, node)
+	return node
+}
+
+func mustActivateStorageAssignment(t *testing.T, node *storage.Node, assignment storage.ReplicaAssignment) {
+	t.Helper()
+	ctx := context.Background()
+	if err := node.AddReplicaAsTail(ctx, storage.AddReplicaAsTailCommand{Assignment: assignment}); err != nil {
+		t.Fatalf("AddReplicaAsTail returned error: %v", err)
+	}
+	if err := node.ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: assignment.Slot}); err != nil {
+		t.Fatalf("ActivateReplica returned error: %v", err)
+	}
+}
+
+func enqueueDirtyCommittedMiddleWrite(
+	t *testing.T,
+	ctx context.Context,
+	h *queuedRouterHarness,
+	slot int,
+	key string,
+	value string,
+	sequence uint64,
+) {
+	t.Helper()
+	ts := time.Unix(int64(sequence), 0).UTC()
+	if err := h.adapters["b"].Node().HandleForwardWrite(ctx, storage.ForwardWriteRequest{
+		Operation: storage.WriteOperation{
+			Slot:     slot,
+			Sequence: sequence,
+			Kind:     storage.OperationKindPut,
+			Key:      key,
+			Value:    value,
+			Metadata: storage.ObjectMetadata{
+				Version:   sequence,
+				CreatedAt: ts,
+				UpdatedAt: ts,
+			},
+		},
+		FromNodeID: "a",
+	}); err != nil {
+		t.Fatalf("HandleForwardWrite returned error: %v", err)
+	}
+	if err := h.repl.DeliverNext(ctx); err != nil {
+		t.Fatalf("DeliverNext returned error: %v", err)
+	}
+}
+
+func misconfigureReadDependency(t *testing.T, node *storage.Node, slot int, tailNodeID string) {
+	t.Helper()
+	state := node.State()
+	replica, ok := state.Replicas[slot]
+	if !ok {
+		t.Fatalf("slot %d missing from node %q", slot, state.NodeID)
+	}
+	assignment := replica.Assignment
+	assignment.Peers.TailNodeID = tailNodeID
+	assignment.Peers.TailTarget = tailNodeID
+	if err := node.UpdateChainPeers(context.Background(), storage.UpdateChainPeersCommand{Assignment: assignment}); err != nil {
+		t.Fatalf("UpdateChainPeers returned error: %v", err)
+	}
+}
+
+func setNextReadReplicaForSlot(router *Router, slot int, next int) {
+	router.mu.Lock()
+	defer router.mu.Unlock()
+	router.nextReadReplica[slot] = next
 }

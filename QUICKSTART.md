@@ -1,6 +1,6 @@
 # Quickstart
 
-This quickstart demonstrates chainrep on localhost with:
+This quickstart demonstrates craq on localhost with:
 
 - one non-HA coordinator
 - three initial storage nodes
@@ -13,7 +13,7 @@ to demonstrate behavior, routing, and repair flow, not persistence.
 ## Build
 
 ```bash
-go build -o ./bin/chainrep-quickstart ./cmd/chainrep-quickstart
+go build -o ./bin/craq-quickstart ./cmd/craq-quickstart
 ```
 
 The examples below assume the checked-in manifest:
@@ -25,7 +25,7 @@ examples/quickstart/cluster.json
 ## Terminal 1: Coordinator
 
 ```bash
-./bin/chainrep-quickstart coordinator --manifest examples/quickstart/cluster.json
+./bin/craq-quickstart coordinator --manifest examples/quickstart/cluster.json
 ```
 
 The coordinator listens on:
@@ -38,19 +38,19 @@ The coordinator listens on:
 Terminal 2:
 
 ```bash
-./bin/chainrep-quickstart storage --manifest examples/quickstart/cluster.json --node a
+./bin/craq-quickstart storage --manifest examples/quickstart/cluster.json --node a
 ```
 
 Terminal 3:
 
 ```bash
-./bin/chainrep-quickstart storage --manifest examples/quickstart/cluster.json --node b
+./bin/craq-quickstart storage --manifest examples/quickstart/cluster.json --node b
 ```
 
 Terminal 4:
 
 ```bash
-./bin/chainrep-quickstart storage --manifest examples/quickstart/cluster.json --node c
+./bin/craq-quickstart storage --manifest examples/quickstart/cluster.json --node c
 ```
 
 The nodes auto-register with the coordinator and start heartbeating. The
@@ -70,19 +70,19 @@ Once slot `0` is readable and writable, the cluster is ready.
 Set a key:
 
 ```bash
-./bin/chainrep-quickstart set --manifest examples/quickstart/cluster.json alpha one
+./bin/craq-quickstart set --manifest examples/quickstart/cluster.json alpha one
 ```
 
 Read it back:
 
 ```bash
-./bin/chainrep-quickstart get --manifest examples/quickstart/cluster.json alpha
+./bin/craq-quickstart get --manifest examples/quickstart/cluster.json alpha
 ```
 
 Delete it:
 
 ```bash
-./bin/chainrep-quickstart del --manifest examples/quickstart/cluster.json alpha
+./bin/craq-quickstart del --manifest examples/quickstart/cluster.json alpha
 ```
 
 The CLI prints:
@@ -91,19 +91,18 @@ The CLI prints:
 - the key
 - the slot
 - the chain version used
-- the contacted node ID
-- the contacted endpoint
 - the read value or commit metadata
 
-For reads, the contacted node should be the active tail. For writes and deletes,
-the contacted node should be the active head.
+Writes and deletes still target the active head. Reads go through the normal
+CRAQ client router, so a linearizable read can use any active replica and the
+CLI no longer prints a specific contacted read node.
 
 ## Failure and Replacement Walkthrough
 
 1. In terminal 5, write a value:
 
 ```bash
-./bin/chainrep-quickstart set --manifest examples/quickstart/cluster.json alpha one
+./bin/craq-quickstart set --manifest examples/quickstart/cluster.json alpha one
 ```
 
 2. Stop node `c` in terminal 4 with `Ctrl-C`.
@@ -123,15 +122,15 @@ You should see:
 4. Read the key again from terminal 5:
 
 ```bash
-./bin/chainrep-quickstart get --manifest examples/quickstart/cluster.json alpha
+./bin/craq-quickstart get --manifest examples/quickstart/cluster.json alpha
 ```
 
-At this point the CLI should show `contacted_node=b`.
+At this point the CLI should still return `value=one`.
 
 5. Reuse terminal 4 to start a replacement node with a **new node ID**:
 
 ```bash
-./bin/chainrep-quickstart storage --manifest examples/quickstart/cluster.json --node d
+./bin/craq-quickstart storage --manifest examples/quickstart/cluster.json --node d
 ```
 
 The replacement must be a new node ID. The current coordinator model tombstones
@@ -157,15 +156,15 @@ You should see:
 7. Read the key again:
 
 ```bash
-./bin/chainrep-quickstart get --manifest examples/quickstart/cluster.json alpha
+./bin/craq-quickstart get --manifest examples/quickstart/cluster.json alpha
 ```
 
-Now the CLI should show `contacted_node=d`.
+The CLI should still return `value=one`.
 
 8. Write again:
 
 ```bash
-./bin/chainrep-quickstart set --manifest examples/quickstart/cluster.json alpha two
+./bin/craq-quickstart set --manifest examples/quickstart/cluster.json alpha two
 ```
 
 The write should succeed once `d` is active.

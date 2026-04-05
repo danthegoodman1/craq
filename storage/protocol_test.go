@@ -736,6 +736,8 @@ func setupActiveChain(
 		if i+1 < len(nodeIDs) {
 			assignment.Peers.SuccessorNodeID = nodeIDs[i+1]
 		}
+		assignment.Peers.TailNodeID = nodeIDs[len(nodeIDs)-1]
+		assignment.Peers.TailTarget = nodeIDs[len(nodeIDs)-1]
 		if err := nodes[nodeID].UpdateChainPeers(ctx, UpdateChainPeersCommand{Assignment: assignment}); err != nil {
 			t.Fatalf("UpdateChainPeers(%q) returned error: %v", nodeID, err)
 		}
@@ -803,6 +805,8 @@ func setupActiveChainWithQueuedTransport(
 		if i+1 < len(nodeIDs) {
 			assignment.Peers.SuccessorNodeID = nodeIDs[i+1]
 		}
+		assignment.Peers.TailNodeID = nodeIDs[len(nodeIDs)-1]
+		assignment.Peers.TailTarget = nodeIDs[len(nodeIDs)-1]
 		if err := nodes[nodeID].UpdateChainPeers(ctx, UpdateChainPeersCommand{Assignment: assignment}); err != nil {
 			t.Fatalf("UpdateChainPeers(%q) returned error: %v", nodeID, err)
 		}
@@ -854,6 +858,8 @@ func setupChainOnExistingNodes(t *testing.T, nodes map[string]*Node, slot int, n
 		if i+1 < len(nodeIDs) {
 			assignment.Peers.SuccessorNodeID = nodeIDs[i+1]
 		}
+		assignment.Peers.TailNodeID = nodeIDs[len(nodeIDs)-1]
+		assignment.Peers.TailTarget = nodeIDs[len(nodeIDs)-1]
 		if err := nodes[nodeID].UpdateChainPeers(ctx, UpdateChainPeersCommand{Assignment: assignment}); err != nil {
 			t.Fatalf("UpdateChainPeers(%q) returned error: %v", nodeID, err)
 		}

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/danthegoodman1/chainrep/storage"
-	"github.com/danthegoodman1/chainrep/transport/grpcx"
+	"github.com/danthegoodman1/craq/storage"
+	"github.com/danthegoodman1/craq/transport/grpcx"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/rs/zerolog"
@@ -48,9 +48,9 @@ func TestGRPCObservabilityRecordsAuthFailures(t *testing.T) {
 		t.Fatalf("AddReplicaAsTail error = %v, want permission denied", err)
 	}
 
-	if got := metricCounterValueWithLabels(t, registry, "chainrep_grpc_auth_failures_total", map[string]string{
+	if got := metricCounterValueWithLabels(t, registry, "craq_grpc_auth_failures_total", map[string]string{
 		"component": "storage",
-		"method":    "/chainrep.v1.StorageService/AddReplicaAsTail",
+		"method":    "/craq.v1.StorageService/AddReplicaAsTail",
 		"code":      "PermissionDenied",
 	}); got != 1 {
 		t.Fatalf("grpc auth failures total = %v, want 1", got)

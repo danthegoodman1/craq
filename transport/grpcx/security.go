@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/danthegoodman1/chainrep/gologger"
+	"github.com/danthegoodman1/craq/gologger"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
@@ -283,10 +283,10 @@ func (p peerIdentity) String() string {
 
 func coordinatorRPCPlane(fullMethod string) rpcPlane {
 	switch fullMethod {
-	case "/chainrep.v1.CoordinatorService/ReportReplicaReady",
-		"/chainrep.v1.CoordinatorService/ReportReplicaRemoved",
-		"/chainrep.v1.CoordinatorService/ReportNodeHeartbeat",
-		"/chainrep.v1.CoordinatorService/ReportNodeRecovered":
+	case "/craq.v1.CoordinatorService/ReportReplicaReady",
+		"/craq.v1.CoordinatorService/ReportReplicaRemoved",
+		"/craq.v1.CoordinatorService/ReportNodeHeartbeat",
+		"/craq.v1.CoordinatorService/ReportNodeRecovered":
 		return rpcPlaneCoordinatorReport
 	default:
 		return rpcPlaneCoordinatorAdmin
@@ -295,19 +295,19 @@ func coordinatorRPCPlane(fullMethod string) rpcPlane {
 
 func storageRPCPlane(fullMethod string) rpcPlane {
 	switch fullMethod {
-	case "/chainrep.v1.StorageService/AddReplicaAsTail",
-		"/chainrep.v1.StorageService/ActivateReplica",
-		"/chainrep.v1.StorageService/MarkReplicaLeaving",
-		"/chainrep.v1.StorageService/RemoveReplica",
-		"/chainrep.v1.StorageService/UpdateChainPeers",
-		"/chainrep.v1.StorageService/ResumeRecoveredReplica",
-		"/chainrep.v1.StorageService/RecoverReplica",
-		"/chainrep.v1.StorageService/DropRecoveredReplica":
+	case "/craq.v1.StorageService/AddReplicaAsTail",
+		"/craq.v1.StorageService/ActivateReplica",
+		"/craq.v1.StorageService/MarkReplicaLeaving",
+		"/craq.v1.StorageService/RemoveReplica",
+		"/craq.v1.StorageService/UpdateChainPeers",
+		"/craq.v1.StorageService/ResumeRecoveredReplica",
+		"/craq.v1.StorageService/RecoverReplica",
+		"/craq.v1.StorageService/DropRecoveredReplica":
 		return rpcPlaneStorageControl
-	case "/chainrep.v1.StorageService/ForwardWrite",
-		"/chainrep.v1.StorageService/CommitWrite",
-		"/chainrep.v1.StorageService/FetchSnapshot",
-		"/chainrep.v1.StorageService/FetchCommittedSequence":
+	case "/craq.v1.StorageService/ForwardWrite",
+		"/craq.v1.StorageService/CommitWrite",
+		"/craq.v1.StorageService/FetchSnapshot",
+		"/craq.v1.StorageService/FetchCommittedSequence":
 		return rpcPlaneStorageReplica
 	default:
 		return rpcPlaneClientData

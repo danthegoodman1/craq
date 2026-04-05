@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/danthegoodman1/chainrep/coordserver"
-	"github.com/danthegoodman1/chainrep/storage"
-	grpcproto "github.com/danthegoodman1/chainrep/proto/chainrep/v1"
+	"github.com/danthegoodman1/craq/coordserver"
+	grpcproto "github.com/danthegoodman1/craq/proto/craq/v1"
+	"github.com/danthegoodman1/craq/storage"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -100,6 +100,17 @@ func encodeError(err error) error {
 		return st.Err()
 	}
 
+	var dependency *storage.ReadDependencyError
+	if errors.As(err, &dependency) {
+		st, _ := status.New(codes.Unavailable, err.Error()).WithDetails(&grpcproto.ReadDependencyDetail{
+			Slot:                 int32(dependency.Slot),
+			ExpectedChainVersion: dependency.ExpectedChainVersion,
+			TailNodeId:           dependency.TailNodeID,
+			Cause:                dependency.Cause.Error(),
+		})
+		return st.Err()
+	}
+
 	var notLeader *coordserver.NotLeaderError
 	if errors.As(err, &notLeader) {
 		st, _ := status.New(codes.FailedPrecondition, err.Error()).WithDetails(&grpcproto.NotLeaderDetail{
@@ -158,6 +169,13 @@ func decodeError(err error) error {
 				Limit:    int(typed.Limit),
 				Resource: storage.BackpressureResource(typed.Resource),
 				Cause:    backpressureCause(storage.BackpressureResource(typed.Resource)),
+			}
+		case *grpcproto.ReadDependencyDetail:
+			return &storage.ReadDependencyError{
+				Slot:                 int(typed.Slot),
+				ExpectedChainVersion: typed.ExpectedChainVersion,
+				TailNodeID:           typed.TailNodeId,
+				Cause:                status.Error(codes.Unavailable, typed.Cause),
 			}
 		case *grpcproto.ConditionFailedDetail:
 			return &storage.ConditionFailedError{

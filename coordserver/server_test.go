@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/coordinator"
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
-	"github.com/danthegoodman1/chainrep/storage"
+	"github.com/danthegoodman1/craq/coordinator"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/storage"
 )
 
 func TestBootstrapCreatesCoordinatorStateAndDispatchesNothing(t *testing.T) {
@@ -838,6 +838,13 @@ func TestRoutingSnapshotExcludesJoiningAndLeavingReplicas(t *testing.T) {
 	if !route.Readable {
 		t.Fatalf("route during join = %#v, want readable", route)
 	}
+	if got, want := route.ReadReplicas, []ReadReplicaRoute{
+		{NodeID: "b", Role: storage.ReplicaRoleHead},
+		{NodeID: "a", Role: storage.ReplicaRoleMiddle},
+		{NodeID: "c", Role: storage.ReplicaRoleTail},
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("read replicas during join = %#v, want %#v", got, want)
+	}
 	if got, want := route.ChainVersion, uint64(2); got != want {
 		t.Fatalf("chain version during join = %d, want %d", got, want)
 	}
@@ -858,6 +865,13 @@ func TestRoutingSnapshotExcludesJoiningAndLeavingReplicas(t *testing.T) {
 	}
 	if !route.Writable || !route.Readable {
 		t.Fatalf("route after ready = %#v, want readable and writable", route)
+	}
+	if got, want := route.ReadReplicas, []ReadReplicaRoute{
+		{NodeID: "d", Role: storage.ReplicaRoleHead},
+		{NodeID: "b", Role: storage.ReplicaRoleMiddle},
+		{NodeID: "a", Role: storage.ReplicaRoleTail},
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("read replicas after ready = %#v, want %#v", got, want)
 	}
 	if got, want := route.ChainVersion, server.Current().SlotVersions[1]; got != want {
 		t.Fatalf("chain version after ready = %d, want %d", got, want)

@@ -6,8 +6,8 @@ import (
 	"hash/crc32"
 	"testing"
 
-	"github.com/danthegoodman1/chainrep/coordserver"
-	"github.com/danthegoodman1/chainrep/storage"
+	"github.com/danthegoodman1/craq/coordserver"
+	"github.com/danthegoodman1/craq/storage"
 )
 
 func BenchmarkRouterGet_PreloadedSnapshot(b *testing.B) {

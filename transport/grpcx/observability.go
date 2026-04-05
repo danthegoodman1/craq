@@ -28,16 +28,16 @@ func newGRPCObserver(logger *zerolog.Logger, registry *prometheus.Registry) *grp
 	obs := &grpcObserver{
 		logger: transportLoggerFromConfig(logger),
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "chainrep_grpc_requests_total",
+			Name: "craq_grpc_requests_total",
 			Help: "gRPC requests handled by plane and result code.",
 		}, []string{"component", "method", "code"}),
 		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "chainrep_grpc_request_duration_seconds",
+			Name:    "craq_grpc_request_duration_seconds",
 			Help:    "gRPC request duration by component and method.",
 			Buckets: prometheus.DefBuckets,
 		}, []string{"component", "method"}),
 		authFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "chainrep_grpc_auth_failures_total",
+			Name: "craq_grpc_auth_failures_total",
 			Help: "gRPC permission denied or unauthenticated failures.",
 		}, []string{"component", "method", "code"}),
 	}

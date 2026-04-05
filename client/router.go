@@ -5,9 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"net"
+	"sync"
 
-	"github.com/danthegoodman1/chainrep/coordserver"
-	"github.com/danthegoodman1/chainrep/storage"
+	"github.com/danthegoodman1/craq/coordserver"
+	"github.com/danthegoodman1/craq/storage"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -27,9 +31,11 @@ type Transport interface {
 }
 
 type Router struct {
-	source    SnapshotSource
-	transport Transport
-	snapshot  *coordserver.RoutingSnapshot
+	mu              sync.RWMutex
+	source          SnapshotSource
+	transport       Transport
+	snapshot        *coordserver.RoutingSnapshot
+	nextReadReplica map[int]int
 }
 
 func NewRouter(source SnapshotSource, transport Transport) (*Router, error) {
@@ -40,8 +46,9 @@ func NewRouter(source SnapshotSource, transport Transport) (*Router, error) {
 		return nil, fmt.Errorf("%w: transport must not be nil", ErrInvalidConfig)
 	}
 	return &Router{
-		source:    source,
-		transport: transport,
+		source:          source,
+		transport:       transport,
+		nextReadReplica: map[int]int{},
 	}, nil
 }
 
@@ -51,11 +58,15 @@ func (r *Router) Refresh(ctx context.Context) error {
 		return fmt.Errorf("err in r.source.RoutingSnapshot: %w", err)
 	}
 	cloned := cloneSnapshot(snapshot)
+	r.mu.Lock()
 	r.snapshot = &cloned
+	r.mu.Unlock()
 	return nil
 }
 
 func (r *Router) Snapshot() (coordserver.RoutingSnapshot, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if r.snapshot == nil {
 		return coordserver.RoutingSnapshot{}, false
 	}
@@ -67,11 +78,15 @@ func RouteForKey(snapshot coordserver.RoutingSnapshot, key string) (coordserver.
 }
 
 func (r *Router) Get(ctx context.Context, key string) (storage.ReadResult, error) {
+	return r.GetWithConsistency(ctx, key, storage.ReadConsistencyLinearizable)
+}
+
+func (r *Router) GetWithConsistency(ctx context.Context, key string, consistency storage.ReadConsistency) (storage.ReadResult, error) {
 	snapshot, err := r.loadedSnapshot()
 	if err != nil {
 		return storage.ReadResult{}, err
 	}
-	return r.getWithSnapshot(ctx, key, snapshot, true)
+	return r.getWithSnapshot(ctx, key, consistency, snapshot, true)
 }
 
 func (r *Router) Put(ctx context.Context, key string, value string) (storage.CommitResult, error) {
@@ -107,15 +122,19 @@ func (r *Router) DeleteIf(ctx context.Context, key string, conditions storage.Wr
 }
 
 func (r *Router) loadedSnapshot() (*coordserver.RoutingSnapshot, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if r.snapshot == nil {
 		return nil, ErrSnapshotNotLoaded
 	}
-	return r.snapshot, nil
+	cloned := cloneSnapshot(*r.snapshot)
+	return &cloned, nil
 }
 
 func (r *Router) getWithSnapshot(
 	ctx context.Context,
 	key string,
+	consistency storage.ReadConsistency,
 	snapshot *coordserver.RoutingSnapshot,
 	allowRefresh bool,
 ) (storage.ReadResult, error) {
@@ -123,24 +142,86 @@ func (r *Router) getWithSnapshot(
 	if err != nil {
 		return storage.ReadResult{}, err
 	}
-	if !route.Readable || route.TailNodeID == "" {
+	readReplicas := routeReadReplicas(route)
+	if !route.Readable || len(readReplicas) == 0 {
 		return storage.ReadResult{}, fmt.Errorf("%w: slot %d is not readable", ErrNoRoute, route.Slot)
 	}
-	result, err := r.transport.Get(ctx, routeTarget(route.TailEndpoint, route.TailNodeID), storage.ClientGetRequest{
-		Slot:                 route.Slot,
-		Key:                  key,
-		ExpectedChainVersion: route.ChainVersion,
-	})
-	if err != nil {
-		if allowRefresh && isRoutingMismatch(err) {
-			if refreshErr := r.Refresh(ctx); refreshErr != nil {
-				return storage.ReadResult{}, refreshErr
+	start := r.nextReadStart(route.Slot, len(readReplicas))
+	ordered := orderedReadReplicas(readReplicas, start)
+	var lastErr error
+	for _, replica := range ordered {
+		req := storage.ClientGetRequest{
+			Slot:                 route.Slot,
+			Key:                  key,
+			ExpectedChainVersion: route.ChainVersion,
+			Consistency:          consistency,
+		}
+		result, err := r.transport.Get(ctx, routeTarget(replica.Endpoint, replica.NodeID), req)
+		if err == nil {
+			return result, nil
+		}
+		if isRoutingMismatch(err) {
+			if allowRefresh {
+				if refreshErr := r.Refresh(ctx); refreshErr != nil {
+					return storage.ReadResult{}, refreshErr
+				}
+				refreshed, loadErr := r.loadedSnapshot()
+				if loadErr != nil {
+					return storage.ReadResult{}, loadErr
+				}
+				return r.getWithSnapshot(ctx, key, consistency, refreshed, false)
 			}
-			return r.getWithSnapshot(ctx, key, r.snapshot, false)
+			return storage.ReadResult{}, err
+		}
+		if isReadDependencyUnavailable(err) {
+			tail := tailReadReplica(route)
+			if tail != nil && tail.NodeID != replica.NodeID {
+				tailResult, tailErr := r.transport.Get(ctx, routeTarget(tail.Endpoint, tail.NodeID), req)
+				if tailErr == nil {
+					return tailResult, nil
+				}
+				if isRoutingMismatch(tailErr) {
+					if allowRefresh {
+						if refreshErr := r.Refresh(ctx); refreshErr != nil {
+							return storage.ReadResult{}, refreshErr
+						}
+						refreshed, loadErr := r.loadedSnapshot()
+						if loadErr != nil {
+							return storage.ReadResult{}, loadErr
+						}
+						return r.getWithSnapshot(ctx, key, consistency, refreshed, false)
+					}
+					return storage.ReadResult{}, tailErr
+				}
+				lastErr = tailErr
+				if !isTransportUnavailable(tailErr) {
+					return storage.ReadResult{}, tailErr
+				}
+				continue
+			}
+			lastErr = err
+			continue
+		}
+		if isTransportUnavailable(err) {
+			lastErr = err
+			continue
 		}
 		return storage.ReadResult{}, err
 	}
-	return result, nil
+	if allowRefresh && isTransportUnavailable(lastErr) {
+		if refreshErr := r.Refresh(ctx); refreshErr != nil {
+			return storage.ReadResult{}, refreshErr
+		}
+		refreshed, loadErr := r.loadedSnapshot()
+		if loadErr != nil {
+			return storage.ReadResult{}, loadErr
+		}
+		return r.getWithSnapshot(ctx, key, consistency, refreshed, false)
+	}
+	if lastErr != nil {
+		return storage.ReadResult{}, lastErr
+	}
+	return storage.ReadResult{}, fmt.Errorf("%w: slot %d is not readable", ErrNoRoute, route.Slot)
 }
 
 func (r *Router) putWithSnapshot(
@@ -170,7 +251,11 @@ func (r *Router) putWithSnapshot(
 			if refreshErr := r.Refresh(ctx); refreshErr != nil {
 				return storage.CommitResult{}, refreshErr
 			}
-			return r.putWithSnapshot(ctx, key, value, conditions, r.snapshot, false)
+			refreshed, loadErr := r.loadedSnapshot()
+			if loadErr != nil {
+				return storage.CommitResult{}, loadErr
+			}
+			return r.putWithSnapshot(ctx, key, value, conditions, refreshed, false)
 		}
 		return storage.CommitResult{}, err
 	}
@@ -202,7 +287,11 @@ func (r *Router) deleteWithSnapshot(
 			if refreshErr := r.Refresh(ctx); refreshErr != nil {
 				return storage.CommitResult{}, refreshErr
 			}
-			return r.deleteWithSnapshot(ctx, key, conditions, r.snapshot, false)
+			refreshed, loadErr := r.loadedSnapshot()
+			if loadErr != nil {
+				return storage.CommitResult{}, loadErr
+			}
+			return r.deleteWithSnapshot(ctx, key, conditions, refreshed, false)
 		}
 		return storage.CommitResult{}, err
 	}
@@ -225,6 +314,26 @@ func isRoutingMismatch(err error) bool {
 	return errors.As(err, &mismatch)
 }
 
+func isReadDependencyUnavailable(err error) bool {
+	var dependency *storage.ReadDependencyError
+	return errors.As(err, &dependency)
+}
+
+func isTransportUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrNoRoute) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	st, ok := status.FromError(err)
+	return ok && st.Code() == codes.Unavailable
+}
+
 func routeTarget(endpoint string, fallbackNodeID string) string {
 	if endpoint != "" {
 		return endpoint
@@ -232,11 +341,66 @@ func routeTarget(endpoint string, fallbackNodeID string) string {
 	return fallbackNodeID
 }
 
+func routeReadReplicas(route coordserver.SlotRoute) []coordserver.ReadReplicaRoute {
+	if len(route.ReadReplicas) > 0 {
+		return append([]coordserver.ReadReplicaRoute(nil), route.ReadReplicas...)
+	}
+	if route.TailNodeID == "" {
+		return nil
+	}
+	role := storage.ReplicaRoleTail
+	if route.HeadNodeID == route.TailNodeID {
+		role = storage.ReplicaRoleSingle
+	}
+	return []coordserver.ReadReplicaRoute{{
+		NodeID:   route.TailNodeID,
+		Endpoint: route.TailEndpoint,
+		Role:     role,
+	}}
+}
+
+func tailReadReplica(route coordserver.SlotRoute) *coordserver.ReadReplicaRoute {
+	readReplicas := routeReadReplicas(route)
+	if len(readReplicas) == 0 {
+		return nil
+	}
+	tail := readReplicas[len(readReplicas)-1]
+	return &tail
+}
+
+func orderedReadReplicas(readReplicas []coordserver.ReadReplicaRoute, start int) []coordserver.ReadReplicaRoute {
+	if len(readReplicas) == 0 {
+		return nil
+	}
+	ordered := make([]coordserver.ReadReplicaRoute, 0, len(readReplicas))
+	for i := 0; i < len(readReplicas); i++ {
+		ordered = append(ordered, readReplicas[(start+i)%len(readReplicas)])
+	}
+	return ordered
+}
+
+func (r *Router) nextReadStart(slot int, count int) int {
+	if count <= 0 {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	start := r.nextReadReplica[slot] % count
+	r.nextReadReplica[slot] = (start + 1) % count
+	return start
+}
+
 func cloneSnapshot(snapshot coordserver.RoutingSnapshot) coordserver.RoutingSnapshot {
+	clonedSlots := make([]coordserver.SlotRoute, 0, len(snapshot.Slots))
+	for _, slot := range snapshot.Slots {
+		cloned := slot
+		cloned.ReadReplicas = append([]coordserver.ReadReplicaRoute(nil), slot.ReadReplicas...)
+		clonedSlots = append(clonedSlots, cloned)
+	}
 	cloned := coordserver.RoutingSnapshot{
 		Version:   snapshot.Version,
 		SlotCount: snapshot.SlotCount,
-		Slots:     append([]coordserver.SlotRoute(nil), snapshot.Slots...),
+		Slots:     clonedSlots,
 	}
 	return cloned
 }

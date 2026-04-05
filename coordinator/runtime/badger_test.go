@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/coordinator"
+	"github.com/danthegoodman1/craq/coordinator"
 )
 
 func TestBadgerStoreRecoversPendingAndOutboxState(t *testing.T) {

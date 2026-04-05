@@ -5,9 +5,9 @@ import (
 	"errors"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/coordinator"
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
-	"github.com/danthegoodman1/chainrep/storage"
+	"github.com/danthegoodman1/craq/coordinator"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/storage"
 )
 
 var (
@@ -36,14 +36,14 @@ const (
 )
 
 type OutboxEntry struct {
-	ID          string
-	Epoch       uint64
-	NodeID      string
-	Slot        int
-	SlotVersion uint64
-	CommandID   string
-	Kind        OutboxCommandKind
-	Assignment  *storage.ReplicaAssignment
+	ID           string
+	Epoch        uint64
+	NodeID       string
+	Slot         int
+	SlotVersion  uint64
+	CommandID    string
+	Kind         OutboxCommandKind
+	Assignment   *storage.ReplicaAssignment
 	SourceNodeID string
 }
 
@@ -127,10 +127,10 @@ func cloneHASnapshot(snapshot HASnapshot) HASnapshot {
 		snapshot = normalizeHASnapshot(snapshot)
 	}
 	cloned := HASnapshot{
-		SnapshotVersion: snapshot.SnapshotVersion,
-		State:           snapshot.State,
-		Pending:         make(map[int]PendingWork, len(snapshot.Pending)),
-		LastPolicy:      snapshot.LastPolicy,
+		SnapshotVersion:     snapshot.SnapshotVersion,
+		State:               snapshot.State,
+		Pending:             make(map[int]PendingWork, len(snapshot.Pending)),
+		LastPolicy:          snapshot.LastPolicy,
 		UnavailableReplicas: make(map[string]map[int]bool, len(snapshot.UnavailableReplicas)),
 		LastRecoveryReports: make(map[string]storage.NodeRecoveryReport, len(snapshot.LastRecoveryReports)),
 		Outbox:              make([]OutboxEntry, 0, len(snapshot.Outbox)),
@@ -183,6 +183,8 @@ func cloneReplicaAssignment(assignment storage.ReplicaAssignment) storage.Replic
 			PredecessorTarget: assignment.Peers.PredecessorTarget,
 			SuccessorNodeID:   assignment.Peers.SuccessorNodeID,
 			SuccessorTarget:   assignment.Peers.SuccessorTarget,
+			TailNodeID:        assignment.Peers.TailNodeID,
+			TailTarget:        assignment.Peers.TailTarget,
 		},
 	}
 }

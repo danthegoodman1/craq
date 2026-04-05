@@ -1,6 +1,6 @@
 # Security
 
-`chainrep` now supports optional gRPC transport security.
+`craq` now supports optional gRPC transport security.
 
 The default transport remains insecure so local development and existing tests keep
 working without extra setup. For any non-trivial deployment, enable TLS.
@@ -119,7 +119,7 @@ Current behavior:
 - rotating certs therefore requires restarting the affected coordinator, storage node, or client process
 
 This is an intentional v1 tradeoff to keep the security implementation small and predictable.
-`chainrep` is already designed to tolerate node restarts, so rolling restarts are the expected
+`craq` is already designed to tolerate node restarts, so rolling restarts are the expected
 rotation mechanism.
 
 ## Minimal Setup
@@ -131,7 +131,7 @@ openssl req -x509 -newkey rsa:4096 -sha256 -nodes \
   -keyout ca.key \
   -out ca.crt \
   -days 365 \
-  -subj "/CN=chainrep-cluster-ca"
+  -subj "/CN=craq-cluster-ca"
 ```
 
 Create a coordinator certificate config, for example `coordinator.cnf`:

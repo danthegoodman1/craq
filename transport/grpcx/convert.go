@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/coordinator"
-	"github.com/danthegoodman1/chainrep/coordserver"
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
-	"github.com/danthegoodman1/chainrep/storage"
-	grpcproto "github.com/danthegoodman1/chainrep/proto/chainrep/v1"
+	"github.com/danthegoodman1/craq/coordinator"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/coordserver"
+	grpcproto "github.com/danthegoodman1/craq/proto/craq/v1"
+	"github.com/danthegoodman1/craq/storage"
 )
 
 func protoNode(node coordinator.Node) *grpcproto.Node {
@@ -41,6 +41,14 @@ func fromProtoNode(node *grpcproto.Node) coordinator.Node {
 func protoRoutingSnapshot(snapshot coordserver.RoutingSnapshot) *grpcproto.RoutingSnapshotResponse {
 	slots := make([]*grpcproto.SlotRoute, 0, len(snapshot.Slots))
 	for _, slot := range snapshot.Slots {
+		readReplicas := make([]*grpcproto.ReadReplicaRoute, 0, len(slot.ReadReplicas))
+		for _, replica := range slot.ReadReplicas {
+			readReplicas = append(readReplicas, &grpcproto.ReadReplicaRoute{
+				NodeId:   replica.NodeID,
+				Endpoint: replica.Endpoint,
+				Role:     string(replica.Role),
+			})
+		}
 		slots = append(slots, &grpcproto.SlotRoute{
 			Slot:         int32(slot.Slot),
 			ChainVersion: slot.ChainVersion,
@@ -50,6 +58,7 @@ func protoRoutingSnapshot(snapshot coordserver.RoutingSnapshot) *grpcproto.Routi
 			TailEndpoint: slot.TailEndpoint,
 			Writable:     slot.Writable,
 			Readable:     slot.Readable,
+			ReadReplicas: readReplicas,
 		})
 	}
 	return &grpcproto.RoutingSnapshotResponse{
@@ -65,6 +74,14 @@ func fromProtoRoutingSnapshot(snapshot *grpcproto.RoutingSnapshotResponse) coord
 	}
 	slots := make([]coordserver.SlotRoute, 0, len(snapshot.Slots))
 	for _, slot := range snapshot.Slots {
+		readReplicas := make([]coordserver.ReadReplicaRoute, 0, len(slot.ReadReplicas))
+		for _, replica := range slot.ReadReplicas {
+			readReplicas = append(readReplicas, coordserver.ReadReplicaRoute{
+				NodeID:   replica.NodeId,
+				Endpoint: replica.Endpoint,
+				Role:     storage.ReplicaRole(replica.Role),
+			})
+		}
 		slots = append(slots, coordserver.SlotRoute{
 			Slot:         int(slot.Slot),
 			ChainVersion: slot.ChainVersion,
@@ -74,6 +91,7 @@ func fromProtoRoutingSnapshot(snapshot *grpcproto.RoutingSnapshotResponse) coord
 			TailEndpoint: slot.TailEndpoint,
 			Writable:     slot.Writable,
 			Readable:     slot.Readable,
+			ReadReplicas: readReplicas,
 		})
 	}
 	return coordserver.RoutingSnapshot{
@@ -110,6 +128,8 @@ func protoChainPeers(peers storage.ChainPeers) *grpcproto.ChainPeers {
 		PredecessorTarget: peers.PredecessorTarget,
 		SuccessorNodeId:   peers.SuccessorNodeID,
 		SuccessorTarget:   peers.SuccessorTarget,
+		TailNodeId:        peers.TailNodeID,
+		TailTarget:        peers.TailTarget,
 	}
 }
 
@@ -122,6 +142,8 @@ func fromProtoChainPeers(peers *grpcproto.ChainPeers) storage.ChainPeers {
 		PredecessorTarget: peers.PredecessorTarget,
 		SuccessorNodeID:   peers.SuccessorNodeId,
 		SuccessorTarget:   peers.SuccessorTarget,
+		TailNodeID:        peers.TailNodeId,
+		TailTarget:        peers.TailTarget,
 	}
 }
 
@@ -335,6 +357,24 @@ func fromProtoWriteConditions(conditions *grpcproto.WriteConditions) storage.Wri
 		}
 	}
 	return result
+}
+
+func protoReadConsistency(consistency storage.ReadConsistency) grpcproto.ReadConsistency {
+	switch storage.ReadConsistency(consistency) {
+	case storage.ReadConsistencyLocalCommitted:
+		return grpcproto.ReadConsistency_READ_CONSISTENCY_LOCAL_COMMITTED
+	default:
+		return grpcproto.ReadConsistency_READ_CONSISTENCY_LINEARIZABLE
+	}
+}
+
+func fromProtoReadConsistency(consistency grpcproto.ReadConsistency) storage.ReadConsistency {
+	switch consistency {
+	case grpcproto.ReadConsistency_READ_CONSISTENCY_LOCAL_COMMITTED:
+		return storage.ReadConsistencyLocalCommitted
+	default:
+		return storage.ReadConsistencyLinearizable
+	}
 }
 
 func protoComparisonOperator(operator storage.ComparisonOperator) grpcproto.ComparisonOperator {

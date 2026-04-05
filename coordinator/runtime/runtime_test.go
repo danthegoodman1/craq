@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/coordinator"
-	"github.com/danthegoodman1/chainrep/storage"
+	"github.com/danthegoodman1/craq/coordinator"
+	"github.com/danthegoodman1/craq/storage"
 )
 
 func TestOpenEmptyStore(t *testing.T) {

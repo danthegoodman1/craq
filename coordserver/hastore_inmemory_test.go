@@ -3,8 +3,8 @@ package coordserver_test
 import (
 	"testing"
 
-	"github.com/danthegoodman1/chainrep/coordserver"
-	"github.com/danthegoodman1/chainrep/coordserver/hastoretest"
+	"github.com/danthegoodman1/craq/coordserver"
+	"github.com/danthegoodman1/craq/coordserver/hastoretest"
 )
 
 func TestInMemoryHAStoreConformance(t *testing.T) {
