@@ -5,9 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 
-	"github.com/danthegoodman1/chainrep/coordinator"
-	"github.com/danthegoodman1/chainrep/storage"
+	"github.com/danthegoodman1/craq/coordinator"
+	"github.com/danthegoodman1/craq/storage"
 )
 
 var (
@@ -181,6 +182,7 @@ type Store interface {
 
 type Runtime struct {
 	store Store
+	mu    sync.RWMutex
 	state State
 }
 
@@ -257,10 +259,14 @@ func EvaluateCommand(state State, cmd Command) (EvaluatedCommand, error) {
 }
 
 func (r *Runtime) Current() State {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return cloneState(r.state)
 }
 
 func (r *Runtime) Bootstrap(ctx context.Context, cmd Command) (State, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	cluster, _, duplicate, err := r.executeBootstrap(cmd)
 	if err != nil {
 		return State{}, fmt.Errorf("err in r.executeBootstrap: %w", err)
@@ -282,6 +288,8 @@ func (r *Runtime) Reconfigure(
 	ctx context.Context,
 	cmd Command,
 ) (coordinator.ReconfigurationPlan, State, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	cluster, plan, duplicate, err := r.executeReconfigure(cmd)
 	if err != nil {
 		return coordinator.ReconfigurationPlan{}, State{}, fmt.Errorf("err in r.executeReconfigure: %w", err)
@@ -304,6 +312,8 @@ func (r *Runtime) Reconfigure(
 }
 
 func (r *Runtime) ApplyProgress(ctx context.Context, cmd Command) (State, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	cluster, _, duplicate, err := r.executeProgress(cmd)
 	if err != nil {
 		return State{}, fmt.Errorf("err in r.executeProgress: %w", err)
@@ -322,6 +332,8 @@ func (r *Runtime) ApplyProgress(ctx context.Context, cmd Command) (State, error)
 }
 
 func (r *Runtime) Heartbeat(ctx context.Context, cmd Command) (State, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	_, _, duplicate, err := r.executeHeartbeat(cmd)
 	if err != nil {
 		return State{}, fmt.Errorf("err in r.executeHeartbeat: %w", err)
@@ -339,6 +351,8 @@ func (r *Runtime) Heartbeat(ctx context.Context, cmd Command) (State, error) {
 }
 
 func (r *Runtime) ApplyLiveness(ctx context.Context, cmd Command) (State, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	_, _, duplicate, err := r.executeLiveness(cmd)
 	if err != nil {
 		return State{}, fmt.Errorf("err in r.executeLiveness: %w", err)
@@ -356,6 +370,8 @@ func (r *Runtime) ApplyLiveness(ctx context.Context, cmd Command) (State, error)
 }
 
 func (r *Runtime) AcknowledgeOutbox(ctx context.Context, cmd Command) (State, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	_, _, duplicate, err := r.executeAcknowledgeOutbox(cmd)
 	if err != nil {
 		return State{}, fmt.Errorf("err in r.executeAcknowledgeOutbox: %w", err)
@@ -373,6 +389,8 @@ func (r *Runtime) AcknowledgeOutbox(ctx context.Context, cmd Command) (State, er
 }
 
 func (r *Runtime) Checkpoint(ctx context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	checkpointState := cloneState(r.state)
 	checkpointState.AppliedCommands = map[string]AppliedCommand{}
 

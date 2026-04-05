@@ -1,5 +1,8 @@
 .gocache
 .tmpbench
-.env.local
 artifacts/
 *.terraform*
+.env*
+bin/craq-quickstart
+infra/**/*.tfstate
+infra/**/*.tfstate.*

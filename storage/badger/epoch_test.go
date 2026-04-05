@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/danthegoodman1/chainrep/storage"
+	"github.com/danthegoodman1/craq/storage"
 )
 
 func TestBadgerNodePersistsHighestAcceptedCoordinatorEpoch(t *testing.T) {

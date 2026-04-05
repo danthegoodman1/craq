@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/storage"
+	"github.com/danthegoodman1/craq/storage"
 )
 
 type BackendFactory func(t *testing.T) storage.Backend

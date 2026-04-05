@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/coordserver"
-	"github.com/danthegoodman1/chainrep/storage"
+	"github.com/danthegoodman1/craq/coordserver"
+	"github.com/danthegoodman1/craq/storage"
 )
 
 func TestEndToEndAmbiguousWriteMayCommitLater(t *testing.T) {

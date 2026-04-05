@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/storage"
-	"github.com/danthegoodman1/chainrep/storage/storagetest"
+	"github.com/danthegoodman1/craq/storage"
+	"github.com/danthegoodman1/craq/storage/storagetest"
 )
 
 var errInjectedDurableWrite = errors.New("injected durable write failure")

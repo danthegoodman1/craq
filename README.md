@@ -1,8 +1,8 @@
-# chainrep - Chain Replication in Go
+# craq - CRAQ in Go
 
-`chainrep` is a Go implementation of chain replication with a coordinator
-control plane, multi-replica storage nodes, gRPC transport, and both non-HA and
-HA coordinator modes.
+`craq` is a Go implementation of CRAQ, with a coordinator control plane,
+multi-replica storage nodes, gRPC transport, and both non-HA and HA
+coordinator modes.
 
 Highlights:
 
@@ -13,6 +13,7 @@ Highlights:
 - durable non-HA coordinator dispatch retry and restart recovery
 - flapping-node eviction through coordinator liveness policy
 - conditional writes with per-object metadata
+- CRAQ-style reads from any active replica with linearizable and local-committed modes
 - optional TLS/mTLS for gRPC transports
 - read-only HTTP admin/health endpoints plus Prometheus metrics
 
@@ -67,10 +68,10 @@ go test ./transport/grpcx -run '^$' -bench BenchmarkClientLatencyGRPC_Localhost 
 
 Average results from 5 localhost benchmark runs on an Apple M3 Max, using the command above:
 
-- `single_replica_get`: `0.044 ms/op`, `10,656 B/op`, `186 allocs/op`
-- `single_replica_put`: `0.100 ms/op`, `13,976 B/op`, `291 allocs/op`
-- `three_replica_get`: `0.045 ms/op`, `10,657 B/op`, `186 allocs/op`
-- `three_replica_put`: `0.325 ms/op`, `58,215 B/op`, `1,118 allocs/op`
+- `single_replica_get`: `0.048 ms/op`, `11,020 B/op`, `191 allocs/op`
+- `single_replica_put`: `0.099 ms/op`, `14,603 B/op`, `299 allocs/op`
+- `three_replica_get`: `0.053 ms/op`, `11,431 B/op`, `192 allocs/op`
+- `three_replica_put`: `0.355 ms/op`, `60,732 B/op`, `1,140 allocs/op`
 
 These are localhost benchmark numbers, not SLOs or cross-machine production guarantees.
 They include gRPC and durable local storage costs, but not network latency, TLS, or

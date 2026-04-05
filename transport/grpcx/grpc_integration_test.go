@@ -9,12 +9,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/client"
-	"github.com/danthegoodman1/chainrep/coordinator"
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
-	"github.com/danthegoodman1/chainrep/coordserver"
-	"github.com/danthegoodman1/chainrep/storage"
-	"github.com/danthegoodman1/chainrep/transport/grpcx"
+	"github.com/danthegoodman1/craq/client"
+	"github.com/danthegoodman1/craq/coordinator"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/coordserver"
+	"github.com/danthegoodman1/craq/storage"
+	"github.com/danthegoodman1/craq/transport/grpcx"
 )
 
 func TestClientTransportPutGetDeleteOverGRPC(t *testing.T) {
@@ -450,6 +450,79 @@ func TestReplicationTransportOverGRPC(t *testing.T) {
 	}
 }
 
+func TestClientTransportCRAQReadsOverGRPCFromNonTailReplica(t *testing.T) {
+	ctx := context.Background()
+	pool := grpcx.NewConnPool()
+	t.Cleanup(func() { _ = pool.Close() })
+
+	chain := mustStartQueuedCRAQGRPCChain(t, ctx, 18)
+	transport := grpcx.NewClientTransport(pool)
+
+	if _, err := chain.nodes["head"].SubmitPut(ctx, 18, "alpha", "v1"); err != nil {
+		t.Fatalf("SubmitPut returned error: %v", err)
+	}
+	queueDirtyCommittedMiddleWrite(t, ctx, chain, 18, "alpha", "v2", 2)
+
+	linearizable, err := transport.Get(ctx, chain.addresses["mid"], storage.ClientGetRequest{
+		Slot:                 18,
+		Key:                  "alpha",
+		ExpectedChainVersion: 1,
+	})
+	if err != nil {
+		t.Fatalf("linearizable Get returned error: %v", err)
+	}
+	if !linearizable.Found || linearizable.Value != "v2" || linearizable.Metadata == nil || linearizable.Metadata.Version != 2 {
+		t.Fatalf("linearizable Get result = %#v, want value v2 version 2", linearizable)
+	}
+
+	relaxed, err := transport.Get(ctx, chain.addresses["mid"], storage.ClientGetRequest{
+		Slot:                 18,
+		Key:                  "alpha",
+		ExpectedChainVersion: 1,
+		Consistency:          storage.ReadConsistencyLocalCommitted,
+	})
+	if err != nil {
+		t.Fatalf("local committed Get returned error: %v", err)
+	}
+	if !relaxed.Found || relaxed.Value != "v1" || relaxed.Metadata == nil || relaxed.Metadata.Version != 1 {
+		t.Fatalf("local committed Get result = %#v, want value v1 version 1", relaxed)
+	}
+}
+
+func TestClientTransportReturnsReadDependencyErrorOverGRPCForDirtyNonTailRead(t *testing.T) {
+	ctx := context.Background()
+	pool := grpcx.NewConnPool()
+	t.Cleanup(func() { _ = pool.Close() })
+
+	chain := mustStartQueuedCRAQGRPCChain(t, ctx, 19)
+	transport := grpcx.NewClientTransport(pool)
+
+	if _, err := chain.nodes["head"].SubmitPut(ctx, 19, "alpha", "v1"); err != nil {
+		t.Fatalf("SubmitPut returned error: %v", err)
+	}
+	queueDirtyCommittedMiddleWrite(t, ctx, chain, 19, "alpha", "v2", 2)
+	misconfigureCRAQReadDependency(t, chain.nodes["mid"], 19, "missing-tail")
+
+	_, err := transport.Get(ctx, chain.addresses["mid"], storage.ClientGetRequest{
+		Slot:                 19,
+		Key:                  "alpha",
+		ExpectedChainVersion: 1,
+	})
+	if err == nil {
+		t.Fatal("Get unexpectedly succeeded")
+	}
+	var dependency *storage.ReadDependencyError
+	if !errors.As(err, &dependency) {
+		t.Fatalf("Get error = %v, want ReadDependencyError", err)
+	}
+	if !errors.Is(err, storage.ErrReadDependencyUnavailable) {
+		t.Fatalf("Get error = %v, want ErrReadDependencyUnavailable", err)
+	}
+	if got, want := dependency.TailNodeID, "missing-tail"; got != want {
+		t.Fatalf("TailNodeID = %q, want %q", got, want)
+	}
+}
+
 func TestCoordinatorDispatchAndRoutingOverGRPC(t *testing.T) {
 	ctx := context.Background()
 	pool := grpcx.NewConnPool()
@@ -533,6 +606,133 @@ func TestCoordinatorDispatchAndRoutingOverGRPC(t *testing.T) {
 	}
 	if err := router.Refresh(ctx); err != nil {
 		t.Fatalf("Refresh returned error: %v", err)
+	}
+}
+
+type queuedCRAQGRPCChain struct {
+	nodes     map[string]*storage.Node
+	addresses map[string]string
+	repl      *storage.QueuedInMemoryReplicationTransport
+}
+
+func mustStartQueuedCRAQGRPCChain(t *testing.T, ctx context.Context, slot int) queuedCRAQGRPCChain {
+	t.Helper()
+	repl := storage.NewQueuedInMemoryReplicationTransport()
+	nodes := map[string]*storage.Node{}
+	addresses := map[string]string{}
+	for _, nodeID := range []string{"head", "mid", "tail"} {
+		backend := storage.NewInMemoryBackend()
+		node := mustOpenNode(t, ctx, storage.Config{NodeID: nodeID}, backend, storage.NewInMemoryCoordinatorClient(), repl)
+		repl.Register(nodeID, backend)
+		repl.RegisterNode(nodeID, node)
+		address := mustReserveAddress(t)
+		server := mustStartStorageServerAt(t, node, address)
+		t.Cleanup(func() { _ = server.Close() })
+		nodes[nodeID] = node
+		addresses[nodeID] = address
+	}
+
+	assignments := map[string]storage.ReplicaAssignment{
+		"head": {
+			Slot:         slot,
+			ChainVersion: 1,
+			Role:         storage.ReplicaRoleHead,
+			Peers: storage.ChainPeers{
+				SuccessorNodeID: "mid",
+				SuccessorTarget: "mid",
+				TailNodeID:      "tail",
+				TailTarget:      "tail",
+			},
+		},
+		"mid": {
+			Slot:         slot,
+			ChainVersion: 1,
+			Role:         storage.ReplicaRoleMiddle,
+			Peers: storage.ChainPeers{
+				PredecessorNodeID: "head",
+				PredecessorTarget: "head",
+				SuccessorNodeID:   "tail",
+				SuccessorTarget:   "tail",
+				TailNodeID:        "tail",
+				TailTarget:        "tail",
+			},
+		},
+		"tail": {
+			Slot:         slot,
+			ChainVersion: 1,
+			Role:         storage.ReplicaRoleTail,
+			Peers: storage.ChainPeers{
+				PredecessorNodeID: "mid",
+				PredecessorTarget: "mid",
+				TailNodeID:        "tail",
+				TailTarget:        "tail",
+			},
+		},
+	}
+	for _, nodeID := range []string{"head", "mid", "tail"} {
+		if err := nodes[nodeID].AddReplicaAsTail(ctx, storage.AddReplicaAsTailCommand{Assignment: assignments[nodeID]}); err != nil {
+			t.Fatalf("AddReplicaAsTail(%q) returned error: %v", nodeID, err)
+		}
+		if err := nodes[nodeID].ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: slot}); err != nil {
+			t.Fatalf("ActivateReplica(%q) returned error: %v", nodeID, err)
+		}
+		if err := nodes[nodeID].UpdateChainPeers(ctx, storage.UpdateChainPeersCommand{Assignment: assignments[nodeID]}); err != nil {
+			t.Fatalf("UpdateChainPeers(%q) returned error: %v", nodeID, err)
+		}
+	}
+
+	return queuedCRAQGRPCChain{
+		nodes:     nodes,
+		addresses: addresses,
+		repl:      repl,
+	}
+}
+
+func queueDirtyCommittedMiddleWrite(
+	t *testing.T,
+	ctx context.Context,
+	chain queuedCRAQGRPCChain,
+	slot int,
+	key string,
+	value string,
+	sequence uint64,
+) {
+	t.Helper()
+	ts := time.Unix(int64(sequence), 0).UTC()
+	if err := chain.nodes["mid"].HandleForwardWrite(ctx, storage.ForwardWriteRequest{
+		Operation: storage.WriteOperation{
+			Slot:     slot,
+			Sequence: sequence,
+			Kind:     storage.OperationKindPut,
+			Key:      key,
+			Value:    value,
+			Metadata: storage.ObjectMetadata{
+				Version:   sequence,
+				CreatedAt: ts,
+				UpdatedAt: ts,
+			},
+		},
+		FromNodeID: "head",
+	}); err != nil {
+		t.Fatalf("HandleForwardWrite returned error: %v", err)
+	}
+	if err := chain.repl.DeliverNext(ctx); err != nil {
+		t.Fatalf("DeliverNext returned error: %v", err)
+	}
+}
+
+func misconfigureCRAQReadDependency(t *testing.T, node *storage.Node, slot int, tailNodeID string) {
+	t.Helper()
+	state := node.State()
+	replica, ok := state.Replicas[slot]
+	if !ok {
+		t.Fatalf("slot %d missing from node %q", slot, state.NodeID)
+	}
+	assignment := replica.Assignment
+	assignment.Peers.TailNodeID = tailNodeID
+	assignment.Peers.TailTarget = tailNodeID
+	if err := node.UpdateChainPeers(context.Background(), storage.UpdateChainPeersCommand{Assignment: assignment}); err != nil {
+		t.Fatalf("UpdateChainPeers returned error: %v", err)
 	}
 }
 

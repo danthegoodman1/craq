@@ -3,8 +3,8 @@ package storage_test
 import (
 	"testing"
 
-	"github.com/danthegoodman1/chainrep/storage"
-	"github.com/danthegoodman1/chainrep/storage/storagetest"
+	"github.com/danthegoodman1/craq/storage"
+	"github.com/danthegoodman1/craq/storage/storagetest"
 )
 
 func TestInMemoryBackendConformance(t *testing.T) {

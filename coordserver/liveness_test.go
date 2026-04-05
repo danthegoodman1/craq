@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	coordruntime "github.com/danthegoodman1/chainrep/coordinator/runtime"
-	"github.com/danthegoodman1/chainrep/ops"
-	"github.com/danthegoodman1/chainrep/storage"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/ops"
+	"github.com/danthegoodman1/craq/storage"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -654,7 +654,7 @@ func TestFlapEvictionUpdatesMetricsAndAdminState(t *testing.T) {
 		}
 	}
 
-	if got, want := metricCounterValue(t, registry, "chainrep_coordserver_flap_detections_total"), 1.0; got != want {
+	if got, want := metricCounterValue(t, registry, "craq_coordserver_flap_detections_total"), 1.0; got != want {
 		t.Fatalf("flap detections metric = %v, want %v", got, want)
 	}
 	state := server.AdminState(ctx)

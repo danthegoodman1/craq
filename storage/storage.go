@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"sync"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/gologger"
-	"github.com/danthegoodman1/chainrep/ops"
+	"github.com/danthegoodman1/craq/gologger"
+	"github.com/danthegoodman1/craq/ops"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 )
@@ -33,6 +34,7 @@ var (
 	ErrWriteTimeout              = errors.New("storage write wait timed out or was canceled")
 	ErrAmbiguousWrite            = errors.New("storage client write outcome is ambiguous")
 	ErrConditionFailed           = errors.New("storage write conditions not satisfied")
+	ErrReadDependencyUnavailable = errors.New("storage linearizable read dependency unavailable")
 )
 
 type Config struct {
@@ -92,6 +94,13 @@ type WriteConditions struct {
 	Version   *VersionComparison
 	UpdatedAt *TimeComparison
 }
+
+type ReadConsistency string
+
+const (
+	ReadConsistencyLinearizable   ReadConsistency = "linearizable"
+	ReadConsistencyLocalCommitted ReadConsistency = "local_committed"
+)
 
 type Backend interface {
 	CreateReplica(slot int) error
@@ -174,6 +183,7 @@ type ClientGetRequest struct {
 	Slot                 int
 	Key                  string
 	ExpectedChainVersion uint64
+	Consistency          ReadConsistency
 }
 
 type ClientPutRequest struct {
@@ -219,6 +229,13 @@ type ConditionFailedError struct {
 	ExpectedChainVersion uint64
 	CurrentExists        bool
 	CurrentMetadata      *ObjectMetadata
+}
+
+type ReadDependencyError struct {
+	Slot                 int
+	ExpectedChainVersion uint64
+	TailNodeID           string
+	Cause                error
 }
 
 type BackpressureResource string
@@ -303,6 +320,25 @@ func (e *ConditionFailedError) Unwrap() error {
 	return ErrConditionFailed
 }
 
+func (e *ReadDependencyError) Error() string {
+	return fmt.Sprintf(
+		"%s: slot %d version %d tail %q: %v",
+		ErrReadDependencyUnavailable,
+		e.Slot,
+		e.ExpectedChainVersion,
+		e.TailNodeID,
+		e.Cause,
+	)
+}
+
+func (e *ReadDependencyError) Unwrap() error {
+	return e.Cause
+}
+
+func (e *ReadDependencyError) Is(target error) bool {
+	return target == ErrReadDependencyUnavailable
+}
+
 type RoutingMismatchReason string
 
 const (
@@ -363,6 +399,8 @@ type ChainPeers struct {
 	PredecessorTarget string
 	SuccessorNodeID   string
 	SuccessorTarget   string
+	TailNodeID        string
+	TailTarget        string
 }
 
 type ReplicaAssignment struct {
@@ -471,6 +509,7 @@ type replicaRecord struct {
 	recentCommittedCommits   map[uint64]CommitWriteRequest
 	recentForwardOrder       []uint64
 	recentCommitOrder        []uint64
+	dirtyByKey               map[string][]dirtyReadEntry
 	inFlightClientWrites     int
 }
 
@@ -480,7 +519,13 @@ type pendingWrite struct {
 	operation *WriteOperation
 }
 
+type dirtyReadEntry struct {
+	Sequence  uint64
+	Operation WriteOperation
+}
+
 type Node struct {
+	mu                                sync.RWMutex
 	nodeID                            string
 	backend                           Backend
 	local                             LocalStateStore
@@ -569,11 +614,11 @@ func OpenNode(
 	}
 
 	node := &Node{
-		nodeID:                            cfg.NodeID,
-		backend:                           backend,
-		local:                             local,
-		coord:                             coord,
-		repl:                              repl,
+		nodeID:  cfg.NodeID,
+		backend: backend,
+		local:   local,
+		coord:   coord,
+		repl:    repl,
 		registration: NodeRegistration{
 			NodeID:         cfg.NodeID,
 			RPCAddress:     cfg.RPCAddress,
@@ -735,7 +780,7 @@ func (n *Node) AddReplicaAsTail(ctx context.Context, cmd AddReplicaAsTailCommand
 		n.metrics.catchupOps.WithLabelValues("add_replica_as_tail", "success").Inc()
 		n.metrics.catchupDuration.Observe(time.Since(start).Seconds())
 	}
-	n.refreshMetricGauges()
+	n.refreshMetricGaugesLocked()
 	n.events.record(n.logger, zerolog.InfoLevel, "add_replica", "storage replica added as tail", ops.IntPtr(cmd.Assignment.Slot), ops.Uint64Ptr(cmd.Assignment.ChainVersion), nil, cmd.Assignment.Peers.PredecessorNodeID, "", nil)
 	return nil
 }
@@ -820,7 +865,7 @@ func (n *Node) RemoveReplica(ctx context.Context, cmd RemoveReplicaCommand) erro
 	}
 
 	delete(n.replicas, cmd.Slot)
-	n.refreshMetricGauges()
+	n.refreshMetricGaugesLocked()
 	n.events.record(n.logger, zerolog.InfoLevel, "remove_replica", "storage replica removed", ops.IntPtr(cmd.Slot), nil, nil, "", "", nil)
 	return nil
 }
@@ -973,7 +1018,7 @@ func (n *Node) RecoverReplica(ctx context.Context, cmd RecoverReplicaCommand) er
 		n.metrics.catchupOps.WithLabelValues("recover_replica", "success").Inc()
 		n.metrics.catchupDuration.Observe(time.Since(start).Seconds())
 	}
-	n.refreshMetricGauges()
+	n.refreshMetricGaugesLocked()
 	n.events.record(n.logger, zerolog.InfoLevel, "recover_replica", "storage replica recovered from peer", ops.IntPtr(cmd.Assignment.Slot), ops.Uint64Ptr(cmd.Assignment.ChainVersion), nil, cmd.SourceNodeID, "", nil)
 	return nil
 }
@@ -1032,31 +1077,36 @@ func (n *Node) SubmitDelete(ctx context.Context, slot int, key string) (CommitRe
 	return n.submitWrite(ctx, slot, OperationKindDelete, key, "", WriteConditions{})
 }
 
-func (n *Node) HandleClientGet(_ context.Context, req ClientGetRequest) (ReadResult, error) {
+func (n *Node) HandleClientGet(ctx context.Context, req ClientGetRequest) (ReadResult, error) {
+	n.mu.RLock()
 	record, ok := n.replicas[req.Slot]
 	if !ok {
+		n.mu.RUnlock()
 		return ReadResult{}, newRoutingMismatch(req.Slot, req.ExpectedChainVersion, replicaRecord{}, RoutingMismatchReasonUnknownSlot)
 	}
 	if record.state != ReplicaStateActive {
+		n.mu.RUnlock()
 		return ReadResult{}, newRoutingMismatch(req.Slot, req.ExpectedChainVersion, record, RoutingMismatchReasonInactiveReplica)
 	}
 	if record.assignment.ChainVersion != req.ExpectedChainVersion {
+		n.mu.RUnlock()
 		return ReadResult{}, newRoutingMismatch(req.Slot, req.ExpectedChainVersion, record, RoutingMismatchReasonWrongVersion)
 	}
-	if record.assignment.Role != ReplicaRoleTail && record.assignment.Role != ReplicaRoleSingle {
-		return ReadResult{}, newRoutingMismatch(req.Slot, req.ExpectedChainVersion, record, RoutingMismatchReasonWrongRole)
-	}
+	assignment := cloneAssignment(record.assignment)
+	dirtyEntries := n.dirtyEntriesForKey(record, req.Key)
+	n.mu.RUnlock()
 
-	object, found, err := n.backend.GetCommitted(req.Slot, req.Key)
+	consistency := normalizeReadConsistency(req.Consistency)
+	object, found, err := n.resolveRead(ctx, req, assignment, dirtyEntries, consistency)
 	if err != nil {
 		if n.metrics != nil {
-			n.metrics.clientReads.WithLabelValues("error").Inc()
+			n.metrics.clientReads.WithLabelValues(string(consistency), "error").Inc()
 		}
-		return ReadResult{}, fmt.Errorf("err in n.backend.GetCommitted: %w", err)
+		return ReadResult{}, err
 	}
 	result := ReadResult{
 		Slot:         req.Slot,
-		ChainVersion: record.assignment.ChainVersion,
+		ChainVersion: assignment.ChainVersion,
 		Found:        found,
 	}
 	if found {
@@ -1068,7 +1118,7 @@ func (n *Node) HandleClientGet(_ context.Context, req ClientGetRequest) (ReadRes
 		if found {
 			resultLabel = "hit"
 		}
-		n.metrics.clientReads.WithLabelValues(resultLabel).Inc()
+		n.metrics.clientReads.WithLabelValues(string(consistency), resultLabel).Inc()
 	}
 	return result, nil
 }
@@ -1330,6 +1380,8 @@ func (n *Node) BufferedCommitSequences(slot int) ([]uint64, error) {
 }
 
 func (n *Node) HighestCommittedSequence(slot int) (uint64, error) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	record, ok := n.replicas[slot]
 	if !ok {
 		return 0, fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -1338,10 +1390,14 @@ func (n *Node) HighestCommittedSequence(slot int) (uint64, error) {
 }
 
 func (n *Node) InFlightClientWrites() int {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return n.inFlightClientWrites
 }
 
 func (n *Node) InFlightClientWritesForSlot(slot int) (int, error) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	record, ok := n.replicas[slot]
 	if !ok {
 		return 0, fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -1354,10 +1410,14 @@ func (n *Node) BufferedReplicaMessages() int {
 }
 
 func (n *Node) CatchupCount() int {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return n.inFlightCatchups
 }
 
 func (n *Node) State() NodeState {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	state := NodeState{
 		NodeID:   n.nodeID,
 		Replicas: make(map[int]ReplicaStatus, len(n.replicas)),
@@ -1372,6 +1432,8 @@ func (n *Node) State() NodeState {
 }
 
 func (n *Node) snapshotNodeStatus() NodeStatus {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	status := NodeStatus{NodeID: n.nodeID}
 	slots := sortedReplicaSlots(n.replicas)
 	for _, slot := range slots {
@@ -1389,6 +1451,84 @@ func (n *Node) snapshotNodeStatus() NodeStatus {
 	return status
 }
 
+func normalizeReadConsistency(consistency ReadConsistency) ReadConsistency {
+	switch consistency {
+	case ReadConsistencyLocalCommitted:
+		return ReadConsistencyLocalCommitted
+	default:
+		return ReadConsistencyLinearizable
+	}
+}
+
+func (n *Node) resolveRead(
+	ctx context.Context,
+	req ClientGetRequest,
+	assignment ReplicaAssignment,
+	dirtyEntries []dirtyReadEntry,
+	consistency ReadConsistency,
+) (CommittedObject, bool, error) {
+	object, found, err := n.backend.GetCommitted(req.Slot, req.Key)
+	if err != nil {
+		return CommittedObject{}, false, fmt.Errorf("err in n.backend.GetCommitted: %w", err)
+	}
+	if consistency == ReadConsistencyLocalCommitted ||
+		assignment.Role == ReplicaRoleTail ||
+		assignment.Role == ReplicaRoleSingle {
+		return object, found, nil
+	}
+	if len(dirtyEntries) == 0 {
+		return object, found, nil
+	}
+
+	tailTarget := peerTransportTarget(assignment.Peers.TailTarget, assignment.Peers.TailNodeID)
+	if tailTarget == "" {
+		return CommittedObject{}, false, newReadDependencyError(req.Slot, req.ExpectedChainVersion, assignment.Peers.TailNodeID, ErrStateMismatch)
+	}
+	start := time.Now()
+	sequence, err := n.repl.FetchCommittedSequence(ctx, tailTarget, req.Slot)
+	if n.metrics != nil {
+		result := "success"
+		if err != nil {
+			result = "error"
+		}
+		n.metrics.tailResolutions.WithLabelValues(result).Inc()
+		n.metrics.tailResolutionDuration.Observe(time.Since(start).Seconds())
+	}
+	if err != nil {
+		if n.metrics != nil {
+			n.metrics.readDependencyFailures.Inc()
+		}
+		return CommittedObject{}, false, newReadDependencyError(req.Slot, req.ExpectedChainVersion, assignment.Peers.TailNodeID, err)
+	}
+	for i := len(dirtyEntries) - 1; i >= 0; i-- {
+		entry := dirtyEntries[i]
+		if entry.Sequence > sequence {
+			continue
+		}
+		switch entry.Operation.Kind {
+		case OperationKindPut:
+			return CommittedObject{
+				Value:    entry.Operation.Value,
+				Metadata: cloneObjectMetadata(entry.Operation.Metadata),
+			}, true, nil
+		case OperationKindDelete:
+			return CommittedObject{}, false, nil
+		default:
+			return CommittedObject{}, false, fmt.Errorf("%w: unsupported operation kind %q", ErrInvalidConfig, entry.Operation.Kind)
+		}
+	}
+	return object, found, nil
+}
+
+func newReadDependencyError(slot int, expectedChainVersion uint64, tailNodeID string, cause error) error {
+	return &ReadDependencyError{
+		Slot:                 slot,
+		ExpectedChainVersion: expectedChainVersion,
+		TailNodeID:           tailNodeID,
+		Cause:                cause,
+	}
+}
+
 func cloneAssignment(assignment ReplicaAssignment) ReplicaAssignment {
 	return ReplicaAssignment{
 		Slot:         assignment.Slot,
@@ -1399,6 +1539,8 @@ func cloneAssignment(assignment ReplicaAssignment) ReplicaAssignment {
 			PredecessorTarget: assignment.Peers.PredecessorTarget,
 			SuccessorNodeID:   assignment.Peers.SuccessorNodeID,
 			SuccessorTarget:   assignment.Peers.SuccessorTarget,
+			TailNodeID:        assignment.Peers.TailNodeID,
+			TailTarget:        assignment.Peers.TailTarget,
 		},
 	}
 }
@@ -1501,7 +1643,6 @@ func (n *Node) submitWrite(
 	if err := n.admitClientWrite(slot); err != nil {
 		return CommitResult{}, err
 	}
-	record = n.replicas[slot]
 	releasedAdmission := false
 	defer func() {
 		if releasedAdmission {
@@ -1511,6 +1652,8 @@ func (n *Node) submitWrite(
 		releasedAdmission = true
 	}()
 
+	n.mu.Lock()
+	record = n.replicas[slot]
 	operation := WriteOperation{
 		Slot:     slot,
 		Sequence: record.nextSequence,
@@ -1530,9 +1673,11 @@ func (n *Node) submitWrite(
 		},
 		operation: &opCopy,
 	}
+	record = n.addDirtyEntry(record, operation)
 
 	record.nextSequence++
 	n.replicas[slot] = record
+	n.mu.Unlock()
 
 	switch record.assignment.Role {
 	case ReplicaRoleSingle:
@@ -1565,6 +1710,8 @@ func (n *Node) submitWrite(
 }
 
 func (n *Node) activeReplicaRecord(slot int) (replicaRecord, error) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	record, ok := n.replicas[slot]
 	if !ok {
 		return replicaRecord{}, fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -1592,6 +1739,8 @@ func (n *Node) stageOperation(operation WriteOperation) error {
 }
 
 func (n *Node) validateClientWrite(slot int, expectedChainVersion uint64) error {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	record, ok := n.replicas[slot]
 	if !ok {
 		return newRoutingMismatch(slot, expectedChainVersion, replicaRecord{}, RoutingMismatchReasonUnknownSlot)
@@ -1744,6 +1893,8 @@ func newCatchupBackpressureError(current int, limit int) error {
 }
 
 func (n *Node) admitClientWrite(slot int) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	if n.maxInFlightClientWritesPerNode > 0 && n.inFlightClientWrites >= n.maxInFlightClientWritesPerNode {
 		return newWriteBackpressureError(slot, n.inFlightClientWrites, n.maxInFlightClientWritesPerNode)
 	}
@@ -1754,11 +1905,13 @@ func (n *Node) admitClientWrite(slot int) error {
 	record.inFlightClientWrites++
 	n.replicas[slot] = record
 	n.inFlightClientWrites++
-	n.refreshMetricGauges()
+	n.refreshMetricGaugesLocked()
 	return nil
 }
 
 func (n *Node) releaseClientWrite(slot int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	record, ok := n.replicas[slot]
 	if !ok {
 		if n.inFlightClientWrites > 0 {
@@ -1773,7 +1926,7 @@ func (n *Node) releaseClientWrite(slot int) {
 	if n.inFlightClientWrites > 0 {
 		n.inFlightClientWrites--
 	}
-	n.refreshMetricGauges()
+	n.refreshMetricGaugesLocked()
 }
 
 func (n *Node) admitCatchup() error {
@@ -1793,6 +1946,12 @@ func (n *Node) releaseCatchup() {
 }
 
 func (n *Node) bufferedReplicaMessagesForNode() int {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.bufferedReplicaMessagesForNodeLocked()
+}
+
+func (n *Node) bufferedReplicaMessagesForNodeLocked() int {
 	total := 0
 	for _, record := range n.replicas {
 		total += len(record.bufferedForwards) + len(record.bufferedCommits)
@@ -1801,6 +1960,8 @@ func (n *Node) bufferedReplicaMessagesForNode() int {
 }
 
 func (n *Node) commitLocalSequence(ctx context.Context, slot int, sequence uint64) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	record := n.replicas[slot]
 	record = n.ensureProtocolState(record)
 	operation, err := n.committableOperation(record, sequence)
@@ -1827,6 +1988,7 @@ func (n *Node) commitLocalSequence(ctx context.Context, slot int, sequence uint6
 		record = n.recordCommittedForward(record, staged)
 	}
 	delete(record.pendingWrites, sequence)
+	record = n.removeDirtyEntry(record, operation.Key, sequence)
 	n.replicas[slot] = record
 	if applyErr != nil {
 		return fmt.Errorf("err in n.backend.ApplyCommitted: %w", applyErr)
@@ -1857,6 +2019,9 @@ func (n *Node) ensureProtocolState(record replicaRecord) replicaRecord {
 	}
 	if record.recentCommittedCommits == nil {
 		record.recentCommittedCommits = map[uint64]CommitWriteRequest{}
+	}
+	if record.dirtyByKey == nil {
+		record.dirtyByKey = map[string][]dirtyReadEntry{}
 	}
 	return record
 }
@@ -1903,6 +2068,8 @@ func withDefaultTimeout(ctx context.Context, timeout time.Duration) (context.Con
 }
 
 func (n *Node) writeCommitted(slot int, sequence uint64) bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	record, ok := n.replicas[slot]
 	if !ok {
 		return false
@@ -1913,6 +2080,7 @@ func (n *Node) writeCommitted(slot int, sequence uint64) bool {
 func (n *Node) applyForward(ctx context.Context, record replicaRecord, req ForwardWriteRequest) error {
 	record = n.ensureProtocolState(record)
 	record.stagedForwards[req.Operation.Sequence] = cloneForwardRequest(req)
+	record = n.addDirtyEntry(record, req.Operation)
 	record.nextSequence++
 	n.replicas[req.Operation.Slot] = record
 
@@ -2063,6 +2231,65 @@ func (n *Node) bufferFutureCommit(record replicaRecord, req CommitWriteRequest) 
 
 func (n *Node) totalBufferedMessages(record replicaRecord) int {
 	return len(record.bufferedForwards) + len(record.bufferedCommits)
+}
+
+func (n *Node) addDirtyEntry(record replicaRecord, operation WriteOperation) replicaRecord {
+	record = n.ensureProtocolState(record)
+	entries := append([]dirtyReadEntry(nil), record.dirtyByKey[operation.Key]...)
+	for i, entry := range entries {
+		if entry.Sequence == operation.Sequence {
+			entries[i].Operation = cloneWriteOperation(operation)
+			record.dirtyByKey[operation.Key] = entries
+			return record
+		}
+	}
+	entries = append(entries, dirtyReadEntry{
+		Sequence:  operation.Sequence,
+		Operation: cloneWriteOperation(operation),
+	})
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Sequence < entries[j].Sequence
+	})
+	record.dirtyByKey[operation.Key] = entries
+	return record
+}
+
+func (n *Node) removeDirtyEntry(record replicaRecord, key string, sequence uint64) replicaRecord {
+	record = n.ensureProtocolState(record)
+	entries, ok := record.dirtyByKey[key]
+	if !ok {
+		return record
+	}
+	filtered := entries[:0]
+	for _, entry := range entries {
+		if entry.Sequence == sequence {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	if len(filtered) == 0 {
+		delete(record.dirtyByKey, key)
+		return record
+	}
+	record.dirtyByKey[key] = filtered
+	return record
+}
+
+func (n *Node) dirtyEntriesForKey(record replicaRecord, key string) []dirtyReadEntry {
+	record = n.ensureProtocolState(record)
+	entries := record.dirtyByKey[key]
+	cloned := make([]dirtyReadEntry, 0, len(entries))
+	for _, entry := range entries {
+		cloned = append(cloned, dirtyReadEntry{
+			Sequence:  entry.Sequence,
+			Operation: cloneWriteOperation(entry.Operation),
+		})
+	}
+	return cloned
+}
+
+func dirtyKeyCount(record replicaRecord) int {
+	return len(record.dirtyByKey)
 }
 
 func (n *Node) hasStagedForward(record replicaRecord, sequence uint64) bool {
