@@ -65,10 +65,12 @@ go test ./transport/grpcx -run '^$' -bench BenchmarkClientLatencyGRPC_Localhost 
 
 Average results from 5 localhost benchmark runs on an Apple M3 Max, using the command above:
 
-- `single_replica_get`: `0.048 ms/op`, `11,020 B/op`, `191 allocs/op`
-- `single_replica_put`: `0.099 ms/op`, `14,603 B/op`, `299 allocs/op`
-- `three_replica_get`: `0.053 ms/op`, `11,431 B/op`, `192 allocs/op`
-- `three_replica_put`: `0.355 ms/op`, `60,732 B/op`, `1,140 allocs/op`
+- `single_replica_get`: `0.049 ms/op`, `11,020 B/op`, `191 allocs/op`
+- `single_replica_put`: `0.101 ms/op`, `14,607 B/op`, `299 allocs/op`
+- `three_replica_get`: `0.052 ms/op`, `11,430 B/op`, `192 allocs/op`
+- `three_replica_put`: `0.331 ms/op`, `60,612 B/op`, `1,137 allocs/op`
+- `five_replica_get`: `0.054 ms/op`, `11,879 B/op`, `193 allocs/op`
+- `five_replica_put`: `0.595 ms/op`, `108,568 B/op`, `1,993 allocs/op`
 
 These are localhost benchmark numbers, not SLOs or cross-machine production guarantees.
 They include gRPC and durable local storage costs, but not network latency, TLS, or

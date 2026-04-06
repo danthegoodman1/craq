@@ -83,6 +83,39 @@ func BenchmarkClientLatencyGRPC_Localhost(b *testing.B) {
 			}
 		}
 	})
+
+	b.Run("five_replica_get", func(b *testing.B) {
+		h := newLocalhostGRPCBenchmarkHarness(b, 5)
+		readKey := h.mustSeedReadKey(b, "read-key", "value")
+
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			result, err := h.router.Get(context.Background(), readKey)
+			if err != nil {
+				b.Fatalf("Get returned error: %v", err)
+			}
+			if !result.Found || result.Value != "value" {
+				b.Fatalf("Get result = %#v, want found value", result)
+			}
+		}
+	})
+
+	b.Run("five_replica_put", func(b *testing.B) {
+		h := newLocalhostGRPCBenchmarkHarness(b, 5)
+		h.mustWarmConnections(b)
+
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			key := fmt.Sprintf("write-%d", i)
+			if _, err := h.router.Put(context.Background(), key, "value"); err != nil {
+				b.Fatalf("Put returned error: %v", err)
+			}
+		}
+	})
 }
 
 type localhostGRPCBenchmarkHarness struct {
