@@ -4,6 +4,7 @@ import (
 	"context"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -14,7 +15,7 @@ func TestTerraformFormattingAndValidate(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping terraform validation in short mode")
 	}
-	root := filepath.Join("..", "infra", "benchmark", "aws")
+	root := filepath.Join("..", "infra", "benchmark", "gcp")
 	if err := runCommand(context.Background(), nil, "", "terraform", "-chdir="+root, "fmt", "-check"); err != nil {
 		t.Fatalf("terraform fmt -check returned error: %v", err)
 	}
@@ -22,6 +23,9 @@ func TestTerraformFormattingAndValidate(t *testing.T) {
 		t.Skipf("terraform init unavailable in this environment: %v", err)
 	}
 	if err := runCommand(context.Background(), nil, root, "terraform", "validate"); err != nil {
+		if strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "Failed to load plugin schemas") {
+			t.Skipf("terraform validate unavailable in this environment: %v", err)
+		}
 		t.Fatalf("terraform validate returned error: %v", err)
 	}
 }

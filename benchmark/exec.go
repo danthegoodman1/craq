@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 )
 
@@ -53,39 +52,4 @@ func mergeEnv(extra map[string]string) []string {
 		env = append(env, key+"="+value)
 	}
 	return env
-}
-
-func loadEnvFile(path string) (map[string]string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	out := map[string]string{}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		value = strings.TrimSpace(value)
-		value = strings.Trim(value, `"'`)
-		out[key] = value
-	}
-	return out, nil
-}
-
-func maybeLoadLocalEnv(root string) map[string]string {
-	for _, candidate := range []string{".env.local", filepath.Join(root, ".env.local")} {
-		if _, err := os.Stat(candidate); err == nil {
-			env, err := loadEnvFile(candidate)
-			if err == nil {
-				return env
-			}
-		}
-	}
-	return map[string]string{}
 }

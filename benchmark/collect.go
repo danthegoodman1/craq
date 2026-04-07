@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/danthegoodman1/chainrep/quickstart"
+	"github.com/danthegoodman1/craq/quickstart"
 )
 
 type CollectConfig struct {
@@ -45,7 +45,7 @@ func CollectArtifacts(ctx context.Context, cfg CollectConfig) (ArtifactManifest,
 	if err := collectHTTP("http://"+manifest.Coordinator.AdminAddress+"/admin/v1/state", filepath.Join(cfg.OutputDir, "coordinator", "state.json")); err != nil {
 		return ArtifactManifest{}, err
 	}
-	if err := collectRemoteFile(ctx, cfg, coordHost, "sudo journalctl -u chainrep-bench-coordinator.service --no-pager", filepath.Join(cfg.OutputDir, "coordinator", "journal.log")); err != nil {
+	if err := collectRemoteFile(ctx, cfg, coordHost, "sudo journalctl -u craq-bench-coordinator.service --no-pager", filepath.Join(cfg.OutputDir, "coordinator", "journal.log")); err != nil {
 		return ArtifactManifest{}, err
 	}
 	for _, name := range []string{"probe.jsonl", "vmstat.txt", "iostat.txt", "pidstat.txt"} {
@@ -62,7 +62,7 @@ func CollectArtifacts(ctx context.Context, cfg CollectConfig) (ArtifactManifest,
 			return ArtifactManifest{}, err
 		}
 		host := hostPart(node.AdminAddress)
-		if err := collectRemoteFile(ctx, cfg, host, "sudo journalctl -u chainrep-bench-storage.service --no-pager", filepath.Join(nodeDir, "journal.log")); err != nil {
+		if err := collectRemoteFile(ctx, cfg, host, "sudo journalctl -u craq-bench-storage.service --no-pager", filepath.Join(nodeDir, "journal.log")); err != nil {
 			return ArtifactManifest{}, err
 		}
 		for _, name := range []string{"probe.jsonl", "vmstat.txt", "iostat.txt", "pidstat.txt"} {

@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/danthegoodman1/chainrep/quickstart"
+	"github.com/danthegoodman1/craq/quickstart"
 )
 
 type RenderedManifestParams struct {

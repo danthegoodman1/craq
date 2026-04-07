@@ -3,12 +3,15 @@ package benchmark
 import "testing"
 
 func TestLoadProfileDefaultsAndValidate(t *testing.T) {
-	profile, err := LoadProfile("../profiles/bench/aws_i8ge_steady.yaml")
+	profile, err := LoadProfile("../profiles/bench/gcp_c4a_steady.yaml")
 	if err != nil {
 		t.Fatalf("LoadProfile returned error: %v", err)
 	}
-	if profile.AWS.ClientInstanceType != "c8g.8xlarge" {
-		t.Fatalf("ClientInstanceType = %q, want c8g.8xlarge", profile.AWS.ClientInstanceType)
+	if profile.GCP.Project == "" {
+		t.Fatal("Project must not be empty")
+	}
+	if profile.GCP.ClientMachineType != "c4a-standard-16" {
+		t.Fatalf("ClientMachineType = %q, want c4a-standard-16", profile.GCP.ClientMachineType)
 	}
 	if profile.Cluster.SlotCount != 1024 {
 		t.Fatalf("SlotCount = %d, want 1024", profile.Cluster.SlotCount)

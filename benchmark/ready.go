@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/quickstart"
-	"github.com/danthegoodman1/chainrep/transport/grpcx"
+	"github.com/danthegoodman1/craq/client"
+	"github.com/danthegoodman1/craq/quickstart"
+	"github.com/danthegoodman1/craq/transport/grpcx"
 )
 
 func WaitForClusterReady(ctx context.Context, manifestPath string, timeout time.Duration) error {
@@ -17,18 +18,32 @@ func WaitForClusterReady(ctx context.Context, manifestPath string, timeout time.
 	deadline := time.Now().Add(timeout)
 	pool := grpcx.NewConnPool()
 	defer func() { _ = pool.Close() }()
-	admin := grpcx.NewCoordinatorAdminClient(manifest.Coordinator.RPCAddress, pool)
-	transport := grpcx.NewClientTransport(pool)
-	key := "chainrep-bench-ready"
+	router, err := client.NewRouter(
+		grpcx.NewCoordinatorAdminClient(manifest.Coordinator.RPCAddress, pool),
+		grpcx.NewClientTransport(pool),
+	)
+	if err != nil {
+		return fmt.Errorf("create benchmark client router: %w", err)
+	}
+	key := "craq-bench-ready"
 	value := "ready"
 	var lastErr error
 	for time.Now().Before(deadline) {
+		if err := router.Refresh(ctx); err != nil {
+			lastErr = err
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+			}
+			continue
+		}
 		reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		_, _, _, err := putWithRefresh(reqCtx, admin, transport, key, value)
+		_, err := router.Put(reqCtx, key, value)
 		cancel()
 		if err == nil {
 			readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
-			_, _, result, readErr := getWithRefresh(readCtx, admin, transport, key)
+			result, readErr := router.Get(readCtx, key)
 			readCancel()
 			if readErr == nil && result.Found && result.Value == value {
 				return nil

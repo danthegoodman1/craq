@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/coordserver"
+	"github.com/danthegoodman1/craq/coordserver"
 )
 
 type RunOptions struct {
@@ -45,7 +45,10 @@ func RunBenchmark(ctx context.Context, opts RunOptions) (string, error) {
 		return "", err
 	}
 	if opts.Region != "" {
-		profile.AWS.Region = opts.Region
+		profile.GCP.Region = opts.Region
+	}
+	if err := profile.ValidateRunnable(); err != nil {
+		return "", err
 	}
 	topology := NormalizeTopology(opts.Topology)
 	clientPlacement := NormalizeClientPlacement(opts.ClientPlacement)
@@ -56,7 +59,7 @@ func RunBenchmark(ctx context.Context, opts RunOptions) (string, error) {
 		return "", fmt.Errorf("mkdir run dir: %w", err)
 	}
 	terraformDir := filepath.Join(runDir, "terraform")
-	if err := copyTree(filepath.Join(repoRoot, "infra", "benchmark", "aws"), terraformDir); err != nil {
+	if err := copyTree(filepath.Join(repoRoot, "infra", "benchmark", "gcp"), terraformDir); err != nil {
 		return "", fmt.Errorf("copy terraform root: %w", err)
 	}
 
@@ -75,7 +78,7 @@ func RunBenchmark(ctx context.Context, opts RunOptions) (string, error) {
 		ProfilePath:     opts.ProfilePath,
 		Profile:         profile,
 		CreatedAt:       time.Now().UTC(),
-		Region:          profile.AWS.Region,
+		Region:          profile.GCP.Region,
 		Topology:        topology,
 		ClientPlacement: clientPlacement,
 		ArtifactsDir:    filepath.Join(runDir, "artifacts"),
@@ -89,7 +92,7 @@ func RunBenchmark(ctx context.Context, opts RunOptions) (string, error) {
 		return "", err
 	}
 
-	binPath := filepath.Join(runDir, "bin", "chainrep-bench")
+	binPath := filepath.Join(runDir, "bin", "craq-bench")
 	if err := os.MkdirAll(filepath.Dir(binPath), 0o755); err != nil {
 		return "", err
 	}
@@ -98,7 +101,7 @@ func RunBenchmark(ctx context.Context, opts RunOptions) (string, error) {
 		"GOARCH":      "arm64",
 		"CGO_ENABLED": "0",
 	}
-	if err := runCommand(ctx, buildEnv, repoRoot, "go", "build", "-o", binPath, "./cmd/chainrep-bench"); err != nil {
+	if err := runCommand(ctx, buildEnv, repoRoot, "go", "build", "-o", binPath, "./cmd/craq-bench"); err != nil {
 		return "", err
 	}
 
@@ -110,16 +113,15 @@ func RunBenchmark(ctx context.Context, opts RunOptions) (string, error) {
 		return "", err
 	}
 
-	env := maybeLoadLocalEnv(repoRoot)
-	if err := runCommand(ctx, env, terraformDir, "terraform", "init", "-input=false"); err != nil {
+	if err := runCommand(ctx, nil, terraformDir, "terraform", "init", "-input=false"); err != nil {
 		return "", err
 	}
-	if err := runCommand(ctx, env, terraformDir, "terraform", "apply", "-auto-approve", "-input=false"); err != nil {
+	if err := runCommand(ctx, nil, terraformDir, "terraform", "apply", "-auto-approve", "-input=false"); err != nil {
 		state.Status = "needs_cleanup"
 		_ = WriteRunState(filepath.Join(runDir, RunStateFileName), state)
 		return "", err
 	}
-	outputData, err := captureCommand(ctx, env, terraformDir, "terraform", "output", "-json")
+	outputData, err := captureCommand(ctx, nil, terraformDir, "terraform", "output", "-json")
 	if err != nil {
 		return "", err
 	}
@@ -135,7 +137,7 @@ func RunBenchmark(ctx context.Context, opts RunOptions) (string, error) {
 	}
 
 	if err := waitForSSH(context.WithoutCancel(ctx), SSHConfig{
-		User:         profile.AWS.SSHUser,
+		User:         profile.GCP.SSHUser,
 		PrivateKey:   state.SSHPrivateKey,
 		JumpPublicIP: outputs.PublicClientIP,
 		DisableJump:  true,
@@ -190,11 +192,7 @@ func DestroyBenchmark(ctx context.Context, opts DestroyOptions) error {
 	if err != nil {
 		return err
 	}
-	env := maybeLoadLocalEnv(opts.RepoRoot)
-	if err := runCommand(ctx, env, state.TerraformDir, "terraform", "destroy", "-auto-approve", "-input=false"); err != nil {
-		return err
-	}
-	if err := auditRunDestroyed(ctx, env, state); err != nil {
+	if err := runCommand(ctx, nil, state.TerraformDir, "terraform", "destroy", "-auto-approve", "-input=false"); err != nil {
 		return err
 	}
 	state.Status = "destroyed"
@@ -207,18 +205,18 @@ func renderTerraformVars(state RunState, runDir string) (map[string]any, error) 
 		return nil, err
 	}
 	return map[string]any{
-		"aws_region":                state.Region,
+		"gcp_project":               state.Profile.GCP.Project,
+		"gcp_region":                state.Region,
 		"run_id":                    state.RunID,
 		"topology":                  state.Topology,
 		"client_placement":          state.ClientPlacement,
-		"operator_cidrs":            state.Profile.AWS.OperatorCIDRs,
+		"operator_cidrs":            state.Profile.GCP.OperatorCIDRs,
 		"ssh_public_key":            strings.TrimSpace(string(pubKey)),
-		"ssh_user":                  state.Profile.AWS.SSHUser,
-		"coordinator_instance_type": state.Profile.AWS.CoordinatorInstanceType,
-		"client_instance_type":      state.Profile.AWS.ClientInstanceType,
-		"storage_instance_type":     state.Profile.AWS.StorageInstanceType,
-		"coordinator_volume_gib":    state.Profile.AWS.CoordinatorVolumeGiB,
-		"artifacts_dir":             filepath.Join(runDir, "artifacts"),
+		"ssh_user":                  state.Profile.GCP.SSHUser,
+		"coordinator_machine_type":  state.Profile.GCP.CoordinatorMachineType,
+		"client_machine_type":       state.Profile.GCP.ClientMachineType,
+		"storage_machine_type":      state.Profile.GCP.StorageMachineType,
+		"coordinator_boot_disk_gib": state.Profile.GCP.CoordinatorBootDiskGiB,
 	}, nil
 }
 
@@ -243,7 +241,7 @@ func decodeTerraformOutputs(data []byte) (TerraformOutputs, error) {
 	if err := read("region", &out.Region); err != nil {
 		return TerraformOutputs{}, err
 	}
-	if err := read("primary_az", &out.PrimaryAZ); err != nil {
+	if err := read("primary_zone", &out.PrimaryZone); err != nil {
 		return TerraformOutputs{}, err
 	}
 	if err := read("public_client_ip", &out.PublicClientIP); err != nil {
@@ -252,7 +250,7 @@ func decodeTerraformOutputs(data []byte) (TerraformOutputs, error) {
 	if err := read("private_ips", &out.PrivateIPs); err != nil {
 		return TerraformOutputs{}, err
 	}
-	if err := read("instance_ids", &out.InstanceIDs); err != nil {
+	if err := read("instance_names", &out.InstanceNames); err != nil {
 		return TerraformOutputs{}, err
 	}
 	return out, nil
@@ -276,8 +274,8 @@ func buildRunID(runName string, gitSHA string) string {
 }
 
 func deployAndRun(ctx context.Context, state RunState, manifestPath string, binPath string) error {
-	ssh := SSHConfig{User: state.Profile.AWS.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP}
-	clientSSH := SSHConfig{User: state.Profile.AWS.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP, DisableJump: true}
+	ssh := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP}
+	clientSSH := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP, DisableJump: true}
 	targets := map[string]string{
 		"client":      state.TerraformOutputs.PublicClientIP,
 		"coordinator": state.TerraformOutputs.PrivateIPs["coordinator"],
@@ -293,31 +291,31 @@ func deployAndRun(ctx context.Context, state RunState, manifestPath string, binP
 		if err := waitForSSH(ctx, currentSSH, host); err != nil {
 			return fmt.Errorf("wait for ssh %s: %w", name, err)
 		}
-		if err := SSH(ctx, currentSSH, host, "mkdir -p /tmp/chainrep-bench"); err != nil {
+		if err := SSH(ctx, currentSSH, host, "mkdir -p /tmp/craq-bench"); err != nil {
 			return err
 		}
-		if err := SCP(ctx, currentSSH, binPath, host, "/tmp/chainrep-bench/chainrep-bench"); err != nil {
+		if err := SCP(ctx, currentSSH, binPath, host, "/tmp/craq-bench/craq-bench"); err != nil {
 			return err
 		}
-		if err := SSH(ctx, currentSSH, host, "sudo install -m 0755 /tmp/chainrep-bench/chainrep-bench /opt/chainrep-bench/bin/chainrep-bench"); err != nil {
+		if err := SSH(ctx, currentSSH, host, "sudo install -m 0755 /tmp/craq-bench/craq-bench /opt/craq-bench/bin/craq-bench"); err != nil {
 			return err
 		}
 	}
-	if err := SCP(ctx, clientSSH, state.SSHPrivateKey, state.TerraformOutputs.PublicClientIP, "/tmp/chainrep-bench/id_ed25519"); err != nil {
+	if err := SCP(ctx, clientSSH, state.SSHPrivateKey, state.TerraformOutputs.PublicClientIP, "/tmp/craq-bench/id_ed25519"); err != nil {
 		return err
 	}
-	if err := SSH(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, "chmod 600 /tmp/chainrep-bench/id_ed25519"); err != nil {
+	if err := SSH(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, "chmod 600 /tmp/craq-bench/id_ed25519"); err != nil {
 		return err
 	}
 
 	if err := os.MkdirAll(filepath.Join(filepath.Dir(manifestPath), "remote"), 0o755); err != nil {
 		return err
 	}
-	if err := SCP(ctx, clientSSH, manifestPath, state.TerraformOutputs.PublicClientIP, "/tmp/chainrep-bench/manifest.json"); err != nil {
+	if err := SCP(ctx, clientSSH, manifestPath, state.TerraformOutputs.PublicClientIP, "/tmp/craq-bench/manifest.json"); err != nil {
 		return err
 	}
 	for _, host := range []string{state.TerraformOutputs.PrivateIPs["coordinator"], state.TerraformOutputs.PrivateIPs["storage-a"], state.TerraformOutputs.PrivateIPs["storage-b"], state.TerraformOutputs.PrivateIPs["storage-c"]} {
-		if err := SCP(ctx, ssh, manifestPath, host, "/tmp/chainrep-bench/manifest.json"); err != nil {
+		if err := SCP(ctx, ssh, manifestPath, host, "/tmp/craq-bench/manifest.json"); err != nil {
 			return err
 		}
 	}
@@ -351,10 +349,10 @@ func installRemoteConfigs(ctx context.Context, state RunState, manifestPath stri
 	if err != nil {
 		return err
 	}
-	runRoot := "/var/lib/chainrep-bench/runs/" + state.RunID
+	runRoot := "/var/lib/craq-bench/runs/" + state.RunID
 	coordCfg := CoordinatorProcessConfig{
-		ManifestPath: "/etc/chainrep-bench/manifest.json",
-		DataDir:      "/var/lib/chainrep-bench/coordinator",
+		ManifestPath: "/etc/craq-bench/manifest.json",
+		DataDir:      "/var/lib/craq-bench/coordinator",
 		Liveness: coordserver.LivenessPolicy{
 			SuspectAfter: state.Profile.Cluster.SuspectAfter,
 			DeadAfter:    state.Profile.Cluster.DeadAfter,
@@ -364,17 +362,17 @@ func installRemoteConfigs(ctx context.Context, state RunState, manifestPath stri
 	}
 	loadCfg := LoadGenProcessConfig{
 		RunID:        state.RunID,
-		ManifestPath: "/etc/chainrep-bench/manifest.json",
+		ManifestPath: "/etc/craq-bench/manifest.json",
 		OutputDir:    filepath.Join(runRoot, "client"),
 		Workload:     state.Profile.Workload,
 	}
 	collectCfg := CollectConfig{
 		RunID:         state.RunID,
-		ManifestPath:  "/etc/chainrep-bench/manifest.json",
+		ManifestPath:  "/etc/craq-bench/manifest.json",
 		RemoteRunRoot: runRoot,
 		OutputDir:     filepath.Join(runRoot, "bundle"),
-		SSHUser:       state.Profile.AWS.SSHUser,
-		SSHPrivateKey: "/tmp/chainrep-bench/id_ed25519",
+		SSHUser:       state.Profile.GCP.SSHUser,
+		SSHPrivateKey: "/tmp/craq-bench/id_ed25519",
 	}
 	configs := map[string][]byte{
 		"manifest.json":    manifestJSON,
@@ -384,9 +382,9 @@ func installRemoteConfigs(ctx context.Context, state RunState, manifestPath stri
 	}
 	for _, nodeID := range []string{"a", "b", "c"} {
 		cfg := StorageProcessConfig{
-			ManifestPath:       "/etc/chainrep-bench/manifest.json",
+			ManifestPath:       "/etc/craq-bench/manifest.json",
 			NodeID:             nodeID,
-			DataDir:            filepath.Join("/var/lib/chainrep-bench/storage-data", nodeID),
+			DataDir:            filepath.Join("/var/lib/craq-bench/storage-data", nodeID),
 			HeartbeatInterval:  state.Profile.Cluster.HeartbeatInterval,
 			ActivationInterval: state.Profile.Cluster.ActivationInterval,
 			RPCDeadline:        state.Profile.Cluster.RPCDeadline,
@@ -400,7 +398,7 @@ func installRemoteConfigs(ctx context.Context, state RunState, manifestPath stri
 		"storage-b":   state.TerraformOutputs.PrivateIPs["storage-b"],
 		"storage-c":   state.TerraformOutputs.PrivateIPs["storage-c"],
 	} {
-		ssh := SSHConfig{User: state.Profile.AWS.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP}
+		ssh := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP}
 		if name == "client" {
 			ssh.DisableJump = true
 		}
@@ -418,14 +416,14 @@ func installRemoteConfigs(ctx context.Context, state RunState, manifestPath stri
 			if err := os.WriteFile(local, content, 0o644); err != nil {
 				return err
 			}
-			if err := SCP(ctx, ssh, local, host, "/tmp/chainrep-bench/"+fileName); err != nil {
+			if err := SCP(ctx, ssh, local, host, "/tmp/craq-bench/"+fileName); err != nil {
 				return err
 			}
 			targetName := fileName
 			if strings.HasPrefix(fileName, "storage-") {
 				targetName = "storage.json"
 			}
-			if err := SSH(ctx, ssh, host, "sudo install -m 0644 /tmp/chainrep-bench/"+fileName+" /etc/chainrep-bench/"+targetName); err != nil {
+			if err := SSH(ctx, ssh, host, "sudo install -m 0644 /tmp/craq-bench/"+fileName+" /etc/craq-bench/"+targetName); err != nil {
 				return err
 			}
 		}
@@ -435,11 +433,11 @@ func installRemoteConfigs(ctx context.Context, state RunState, manifestPath stri
 
 func installSystemdUnits(ctx context.Context, state RunState) error {
 	units := map[string]string{
-		"chainrep-bench-coordinator.service": coordinatorUnit(),
-		"chainrep-bench-storage.service":     storageUnit(),
+		"craq-bench-coordinator.service": craqCoordinatorUnit(),
+		"craq-bench-storage.service":     craqStorageUnit(),
 	}
 	clientUnits := map[string]string{
-		"chainrep-bench-client-loadgen.service": loadgenUnit(),
+		"craq-bench-client-loadgen.service": craqLoadgenUnit(),
 	}
 	for name, host := range map[string]string{
 		"client":      state.TerraformOutputs.PublicClientIP,
@@ -448,7 +446,7 @@ func installSystemdUnits(ctx context.Context, state RunState) error {
 		"storage-b":   state.TerraformOutputs.PrivateIPs["storage-b"],
 		"storage-c":   state.TerraformOutputs.PrivateIPs["storage-c"],
 	} {
-		ssh := SSHConfig{User: state.Profile.AWS.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP}
+		ssh := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP}
 		if name == "client" {
 			ssh.DisableJump = true
 		}
@@ -461,10 +459,10 @@ func installSystemdUnits(ctx context.Context, state RunState) error {
 			if err := os.WriteFile(local, []byte(content), 0o644); err != nil {
 				return err
 			}
-			if err := SCP(ctx, ssh, local, host, "/tmp/chainrep-bench/"+fileName); err != nil {
+			if err := SCP(ctx, ssh, local, host, "/tmp/craq-bench/"+fileName); err != nil {
 				return err
 			}
-			if err := SSH(ctx, ssh, host, "sudo install -m 0644 /tmp/chainrep-bench/"+fileName+" /etc/systemd/system/"+fileName+" && sudo systemctl daemon-reload"); err != nil {
+			if err := SSH(ctx, ssh, host, "sudo install -m 0644 /tmp/craq-bench/"+fileName+" /etc/systemd/system/"+fileName+" && sudo systemctl daemon-reload"); err != nil {
 				return err
 			}
 		}
@@ -474,9 +472,9 @@ func installSystemdUnits(ctx context.Context, state RunState) error {
 
 func startRemoteTelemetry(ctx context.Context, state RunState) error {
 	duration := state.Profile.TotalRunDuration().Round(time.Second) + time.Minute
-	runRoot := "/var/lib/chainrep-bench/runs/" + state.RunID
+	runRoot := "/var/lib/craq-bench/runs/" + state.RunID
 	commands := []string{
-		fmt.Sprintf("mkdir -p %s && timeout %ds /opt/chainrep-bench/bin/chainrep-bench probe --output %s --interval %s --duration %s > /dev/null 2>&1 &", shellQuote(runRoot), int(duration.Seconds()), shellQuote(filepath.Join(runRoot, "probe.jsonl")), state.Profile.Telemetry.ProbeInterval, duration),
+		fmt.Sprintf("mkdir -p %s && timeout %ds /opt/craq-bench/bin/craq-bench probe --output %s --interval %s --duration %s > /dev/null 2>&1 &", shellQuote(runRoot), int(duration.Seconds()), shellQuote(filepath.Join(runRoot, "probe.jsonl")), state.Profile.Telemetry.ProbeInterval, duration),
 		fmt.Sprintf("timeout %ds vmstat 1 > %s 2>&1 &", int(duration.Seconds()), shellQuote(filepath.Join(runRoot, "vmstat.txt"))),
 		fmt.Sprintf("timeout %ds iostat -x 1 > %s 2>&1 &", int(duration.Seconds()), shellQuote(filepath.Join(runRoot, "iostat.txt"))),
 		fmt.Sprintf("timeout %ds pidstat -dur 1 > %s 2>&1 &", int(duration.Seconds()), shellQuote(filepath.Join(runRoot, "pidstat.txt"))),
@@ -488,7 +486,7 @@ func startRemoteTelemetry(ctx context.Context, state RunState) error {
 		"storage-b":   state.TerraformOutputs.PrivateIPs["storage-b"],
 		"storage-c":   state.TerraformOutputs.PrivateIPs["storage-c"],
 	} {
-		ssh := SSHConfig{User: state.Profile.AWS.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP}
+		ssh := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP}
 		if name == "client" {
 			ssh.DisableJump = true
 		}
@@ -500,12 +498,12 @@ func startRemoteTelemetry(ctx context.Context, state RunState) error {
 }
 
 func startServices(ctx context.Context, state RunState) error {
-	coordSSH := SSHConfig{User: state.Profile.AWS.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP}
-	if err := SSH(ctx, coordSSH, state.TerraformOutputs.PrivateIPs["coordinator"], "sudo systemctl restart chainrep-bench-coordinator.service"); err != nil {
+	coordSSH := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP}
+	if err := SSH(ctx, coordSSH, state.TerraformOutputs.PrivateIPs["coordinator"], "sudo systemctl restart craq-bench-coordinator.service"); err != nil {
 		return err
 	}
 	for _, name := range []string{"storage-a", "storage-b", "storage-c"} {
-		if err := SSH(ctx, coordSSH, state.TerraformOutputs.PrivateIPs[name], "sudo systemctl restart chainrep-bench-storage.service"); err != nil {
+		if err := SSH(ctx, coordSSH, state.TerraformOutputs.PrivateIPs[name], "sudo systemctl restart craq-bench-storage.service"); err != nil {
 			return err
 		}
 	}
@@ -513,7 +511,7 @@ func startServices(ctx context.Context, state RunState) error {
 }
 
 func waitForRoutingReady(ctx context.Context, state RunState) error {
-	clientSSH := SSHConfig{User: state.Profile.AWS.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP, DisableJump: true}
+	clientSSH := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP, DisableJump: true}
 	command := "curl -fsS http://" + state.TerraformOutputs.PrivateIPs["coordinator"] + ":7401/admin/v1/state"
 	deadline := time.Now().Add(2 * time.Minute)
 	for time.Now().Before(deadline) {
@@ -531,24 +529,24 @@ func waitForRoutingReady(ctx context.Context, state RunState) error {
 }
 
 func runRemoteLoadgen(ctx context.Context, state RunState) error {
-	clientSSH := SSHConfig{User: state.Profile.AWS.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP, DisableJump: true}
-	if err := SSH(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, "sudo systemctl restart chainrep-bench-client-loadgen.service"); err != nil {
+	clientSSH := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP, DisableJump: true}
+	if err := SSH(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, "sudo systemctl restart craq-bench-client-loadgen.service"); err != nil {
 		return err
 	}
-	if err := SSH(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, "sudo systemctl is-active --quiet chainrep-bench-client-loadgen.service || true"); err != nil {
+	if err := SSH(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, "sudo systemctl is-active --quiet craq-bench-client-loadgen.service || true"); err != nil {
 		return err
 	}
-	runRoot := "/var/lib/chainrep-bench/runs/" + state.RunID
+	runRoot := "/var/lib/craq-bench/runs/" + state.RunID
 	command := "bash -lc " + shellQuote(fmt.Sprintf("until test -f %s; do sleep 5; done", filepath.Join(runRoot, "client", "loadgen-report.json")))
 	return SSH(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, command)
 }
 
 func pullArtifacts(ctx context.Context, state RunState) error {
-	clientSSH := SSHConfig{User: state.Profile.AWS.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP, DisableJump: true}
-	if err := SSH(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, "/opt/chainrep-bench/bin/chainrep-bench collect --config /etc/chainrep-bench/collect.json"); err != nil {
+	clientSSH := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP, DisableJump: true}
+	if err := SSH(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, "/opt/craq-bench/bin/craq-bench collect --config /etc/craq-bench/collect.json"); err != nil {
 		return err
 	}
-	remoteBundleRoot := filepath.Join("/var/lib/chainrep-bench/runs", state.RunID, "bundle")
+	remoteBundleRoot := filepath.Join("/var/lib/craq-bench/runs", state.RunID, "bundle")
 	localArtifacts := filepath.Join(filepath.Dir(state.TerraformDir), "artifacts")
 	if err := SCPFrom(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, filepath.Join(remoteBundleRoot, ArtifactManifestName), filepath.Join(localArtifacts, ArtifactManifestName)); err != nil {
 		return err
@@ -569,26 +567,6 @@ func pullArtifacts(ctx context.Context, state RunState) error {
 	return nil
 }
 
-func auditRunDestroyed(ctx context.Context, env map[string]string, state RunState) error {
-	data, err := captureCommand(ctx, env, "", "aws", "resourcegroupstaggingapi", "get-resources", "--tag-filters", "Key=run_id,Values="+state.RunID, "--region", state.Region, "--output", "json")
-	if err != nil {
-		return err
-	}
-	if strings.Contains(string(data), `"ResourceTagMappingList": []`) {
-		return nil
-	}
-	var response struct {
-		ResourceTagMappingList []any `json:"ResourceTagMappingList"`
-	}
-	if err := json.Unmarshal(data, &response); err != nil {
-		return fmt.Errorf("decode destroy audit: %w", err)
-	}
-	if len(response.ResourceTagMappingList) > 0 {
-		return fmt.Errorf("destroy audit found %d remaining tagged resources", len(response.ResourceTagMappingList))
-	}
-	return nil
-}
-
 func mustJSON(value any) []byte {
 	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
@@ -597,14 +575,14 @@ func mustJSON(value any) []byte {
 	return append(data, '\n')
 }
 
-func coordinatorUnit() string {
+func craqCoordinatorUnit() string {
 	return `[Unit]
-Description=chainrep benchmark coordinator
+Description=craq benchmark coordinator
 After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/chainrep-bench/bin/chainrep-bench daemon coordinator --config /etc/chainrep-bench/coordinator.json
+ExecStart=/opt/craq-bench/bin/craq-bench daemon coordinator --config /etc/craq-bench/coordinator.json
 Restart=always
 RestartSec=2
 
@@ -613,14 +591,14 @@ WantedBy=multi-user.target
 `
 }
 
-func storageUnit() string {
+func craqStorageUnit() string {
 	return `[Unit]
-Description=chainrep benchmark storage
+Description=craq benchmark storage
 After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/chainrep-bench/bin/chainrep-bench daemon storage --config /etc/chainrep-bench/storage.json
+ExecStart=/opt/craq-bench/bin/craq-bench daemon storage --config /etc/craq-bench/storage.json
 Restart=always
 RestartSec=2
 
@@ -629,14 +607,14 @@ WantedBy=multi-user.target
 `
 }
 
-func loadgenUnit() string {
+func craqLoadgenUnit() string {
 	return `[Unit]
-Description=chainrep benchmark load generator
+Description=craq benchmark load generator
 After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/opt/chainrep-bench/bin/chainrep-bench loadgen --config /etc/chainrep-bench/loadgen.json
+ExecStart=/opt/craq-bench/bin/craq-bench loadgen --config /etc/craq-bench/loadgen.json
 
 [Install]
 WantedBy=multi-user.target

@@ -26,8 +26,8 @@ func TestAnalyzeRunGeneratesSummaryAndHTML(t *testing.T) {
 		RunID:           "run-123",
 		RunName:         "test",
 		GitSHA:          "abc123",
-		Topology:        "single-az",
-		ClientPlacement: "same-az",
+		Topology:        "single-zone",
+		ClientPlacement: "same-zone",
 	}
 	if err := SaveJSON(filepath.Join(runDir, RunStateFileName), state); err != nil {
 		t.Fatal(err)

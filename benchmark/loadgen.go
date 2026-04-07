@@ -3,7 +3,6 @@ package benchmark
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -16,11 +15,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/client"
-	"github.com/danthegoodman1/chainrep/coordserver"
-	"github.com/danthegoodman1/chainrep/quickstart"
-	"github.com/danthegoodman1/chainrep/storage"
-	"github.com/danthegoodman1/chainrep/transport/grpcx"
+	"github.com/danthegoodman1/craq/client"
+	"github.com/danthegoodman1/craq/quickstart"
+	"github.com/danthegoodman1/craq/transport/grpcx"
 )
 
 type LoadGenProcessConfig struct {
@@ -55,8 +52,16 @@ func RunLoadGen(ctx context.Context, cfg LoadGenProcessConfig) (LoadGenReport, e
 	report := LoadGenReport{RunID: cfg.RunID, StartedAt: time.Now().UTC()}
 	pool := grpcx.NewConnPool()
 	defer func() { _ = pool.Close() }()
-	admin := grpcx.NewCoordinatorAdminClient(manifest.Coordinator.RPCAddress, pool)
-	transport := grpcx.NewClientTransport(pool)
+	router, err := client.NewRouter(
+		grpcx.NewCoordinatorAdminClient(manifest.Coordinator.RPCAddress, pool),
+		grpcx.NewClientTransport(pool),
+	)
+	if err != nil {
+		return LoadGenReport{}, fmt.Errorf("create benchmark client router: %w", err)
+	}
+	if err := router.Refresh(ctx); err != nil {
+		return LoadGenReport{}, fmt.Errorf("refresh benchmark client router: %w", err)
+	}
 	rng := rand.New(rand.NewSource(cfg.Workload.Seed))
 
 	preloadStarted := time.Now()
@@ -64,7 +69,7 @@ func RunLoadGen(ctx context.Context, cfg LoadGenProcessConfig) (LoadGenReport, e
 		key := fmt.Sprintf("preload-%06d", i)
 		value := sizedValue("preload", cfg.Workload.ValueBytes)
 		reqCtx, cancel := context.WithTimeout(ctx, cfg.Workload.RequestTimeout)
-		_, _, _, err := putWithRefresh(reqCtx, admin, transport, key, value)
+		_, err := router.Put(reqCtx, key, value)
 		cancel()
 		if err != nil {
 			report.Errors = append(report.Errors, fmt.Sprintf("preload key %q: %v", key, err))
@@ -82,7 +87,7 @@ func RunLoadGen(ctx context.Context, cfg LoadGenProcessConfig) (LoadGenReport, e
 			return report, ctx.Err()
 		default:
 		}
-		result, err := runScenario(ctx, admin, transport, cfg.OutputDir, cfg.Workload, scenario, rng)
+		result, err := runScenario(ctx, router, cfg.OutputDir, cfg.Workload, scenario, rng)
 		if err != nil {
 			report.Errors = append(report.Errors, err.Error())
 			return report, err
@@ -108,8 +113,7 @@ func RunLoadGen(ctx context.Context, cfg LoadGenProcessConfig) (LoadGenReport, e
 
 func runScenario(
 	ctx context.Context,
-	admin *grpcx.CoordinatorAdminClient,
-	transport *grpcx.ClientTransport,
+	router *client.Router,
 	outputDir string,
 	workload WorkloadProfile,
 	scenario ScenarioProfile,
@@ -183,10 +187,10 @@ func runScenario(
 				var callErr error
 				switch kind {
 				case "get":
-					_, _, _, callErr = getWithRefresh(requestCtx, admin, transport, key)
+					_, callErr = router.Get(requestCtx, key)
 				case "put":
 					value := sizedValue(fmt.Sprintf("w-%d-%d", workerID, workerRand.Int63()), scenario.ValueBytes)
-					_, _, _, callErr = putWithRefresh(requestCtx, admin, transport, key, value)
+					_, callErr = router.Put(requestCtx, key, value)
 				default:
 					callErr = fmt.Errorf("unsupported scenario kind %q", kind)
 				}
@@ -383,106 +387,4 @@ func sizedValue(seed string, size int) string {
 	}
 	out := b.String()
 	return out[:size]
-}
-
-func getWithRefresh(
-	ctx context.Context,
-	admin *grpcx.CoordinatorAdminClient,
-	transport *grpcx.ClientTransport,
-	key string,
-) (coordserver.SlotRoute, string, storage.ReadResult, error) {
-	return withSnapshotRetry(
-		ctx,
-		admin,
-		key,
-		func(route coordserver.SlotRoute, target string) (storage.ReadResult, error) {
-			if !route.Readable || route.TailNodeID == "" {
-				return storage.ReadResult{}, fmt.Errorf("%w: slot %d is not readable", client.ErrNoRoute, route.Slot)
-			}
-			return transport.Get(ctx, target, storage.ClientGetRequest{
-				Slot:                 route.Slot,
-				Key:                  key,
-				ExpectedChainVersion: route.ChainVersion,
-			})
-		},
-		func(route coordserver.SlotRoute) string { return routeTarget(route.TailEndpoint, route.TailNodeID) },
-	)
-}
-
-func putWithRefresh(
-	ctx context.Context,
-	admin *grpcx.CoordinatorAdminClient,
-	transport *grpcx.ClientTransport,
-	key string,
-	value string,
-) (coordserver.SlotRoute, string, storage.CommitResult, error) {
-	return withSnapshotRetry(
-		ctx,
-		admin,
-		key,
-		func(route coordserver.SlotRoute, target string) (storage.CommitResult, error) {
-			if !route.Writable || route.HeadNodeID == "" {
-				return storage.CommitResult{}, fmt.Errorf("%w: slot %d is not writable", client.ErrNoRoute, route.Slot)
-			}
-			return transport.Put(ctx, target, storage.ClientPutRequest{
-				Slot:                 route.Slot,
-				Key:                  key,
-				Value:                value,
-				ExpectedChainVersion: route.ChainVersion,
-			})
-		},
-		func(route coordserver.SlotRoute) string { return routeTarget(route.HeadEndpoint, route.HeadNodeID) },
-	)
-}
-
-func withSnapshotRetry[T any](
-	ctx context.Context,
-	admin *grpcx.CoordinatorAdminClient,
-	key string,
-	call func(coordserver.SlotRoute, string) (T, error),
-	targetFor func(coordserver.SlotRoute) string,
-) (coordserver.SlotRoute, string, T, error) {
-	var zero T
-	snapshot, err := admin.RoutingSnapshot(ctx)
-	if err != nil {
-		return coordserver.SlotRoute{}, "", zero, fmt.Errorf("fetch routing snapshot: %w", err)
-	}
-	route, err := client.RouteForKey(snapshot, key)
-	if err != nil {
-		return coordserver.SlotRoute{}, "", zero, err
-	}
-	target := targetFor(route)
-	result, err := call(route, target)
-	if err == nil {
-		return route, target, result, nil
-	}
-	if !isRoutingMismatchError(err) {
-		return coordserver.SlotRoute{}, "", zero, err
-	}
-	snapshot, err = admin.RoutingSnapshot(ctx)
-	if err != nil {
-		return coordserver.SlotRoute{}, "", zero, fmt.Errorf("refresh routing snapshot: %w", err)
-	}
-	route, err = client.RouteForKey(snapshot, key)
-	if err != nil {
-		return coordserver.SlotRoute{}, "", zero, err
-	}
-	target = targetFor(route)
-	result, err = call(route, target)
-	if err != nil {
-		return coordserver.SlotRoute{}, "", zero, err
-	}
-	return route, target, result, nil
-}
-
-func isRoutingMismatchError(err error) bool {
-	var mismatch *storage.RoutingMismatchError
-	return errors.As(err, &mismatch) || strings.Contains(err.Error(), storage.ErrRoutingMismatch.Error())
-}
-
-func routeTarget(endpoint string, fallback string) string {
-	if endpoint != "" {
-		return endpoint
-	}
-	return fallback
 }

@@ -11,7 +11,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/danthegoodman1/chainrep/quickstart"
+	"github.com/danthegoodman1/craq/quickstart"
 )
 
 const (
@@ -46,10 +46,10 @@ type RunState struct {
 
 type TerraformOutputs struct {
 	Region         string            `json:"region"`
-	PrimaryAZ      string            `json:"primary_az"`
+	PrimaryZone    string            `json:"primary_zone"`
 	PublicClientIP string            `json:"public_client_ip"`
 	PrivateIPs     map[string]string `json:"private_ips"`
-	InstanceIDs    map[string]string `json:"instance_ids"`
+	InstanceNames  map[string]string `json:"instance_names"`
 }
 
 type ArtifactManifest struct {

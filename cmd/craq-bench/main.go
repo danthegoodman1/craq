@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/danthegoodman1/chainrep/benchmark"
+	"github.com/danthegoodman1/craq/benchmark"
 )
 
 func main() {
@@ -18,7 +18,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: chainrep-bench <run|destroy|analyze|daemon|loadgen|probe|collect> [flags]")
+		return fmt.Errorf("usage: craq-bench <run|destroy|analyze|daemon|loadgen|probe|collect> [flags]")
 	}
 	switch args[0] {
 	case "run":
@@ -42,10 +42,10 @@ func run(args []string) error {
 
 func runCommand(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
-	profile := fs.String("profile", "profiles/bench/aws_i8ge_steady.yaml", "benchmark profile yaml")
-	region := fs.String("region", "", "aws region override")
-	topology := fs.String("topology", "", "topology: single-az or multi-az")
-	clientPlacement := fs.String("client-placement", "", "client placement: same-az or remote-az")
+	profile := fs.String("profile", "profiles/bench/gcp_c4a_steady.yaml", "benchmark profile yaml")
+	region := fs.String("region", "", "gcp region override")
+	topology := fs.String("topology", "", "topology: single-zone or multi-zone")
+	clientPlacement := fs.String("client-placement", "", "client placement: same-zone or remote-zone")
 	runName := fs.String("run-name", "bench", "human readable run name")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -91,7 +91,7 @@ func analyzeCommand(args []string) error {
 
 func daemonCommand(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: chainrep-bench daemon <coordinator|storage> --config <path>")
+		return fmt.Errorf("usage: craq-bench daemon <coordinator|storage> --config <path>")
 	}
 	switch args[0] {
 	case "coordinator":

@@ -12,27 +12,28 @@ import (
 )
 
 const (
-	DefaultTopology        = "single-az"
-	DefaultClientPlacement = "same-az"
+	DefaultTopology        = "single-zone"
+	DefaultClientPlacement = "same-zone"
 )
 
 type Profile struct {
 	Name      string           `yaml:"name" json:"name"`
-	AWS       AWSProfile       `yaml:"aws" json:"aws"`
+	GCP       GCPProfile       `yaml:"gcp" json:"gcp"`
 	Cluster   ClusterProfile   `yaml:"cluster" json:"cluster"`
 	Workload  WorkloadProfile  `yaml:"workload" json:"workload"`
 	Telemetry TelemetryProfile `yaml:"telemetry" json:"telemetry"`
 	Artifacts ArtifactProfile  `yaml:"artifacts" json:"artifacts"`
 }
 
-type AWSProfile struct {
-	Region                  string   `yaml:"region" json:"region"`
-	OperatorCIDRs           []string `yaml:"operator_cidrs" json:"operator_cidrs"`
-	SSHUser                 string   `yaml:"ssh_user" json:"ssh_user"`
-	CoordinatorInstanceType string   `yaml:"coordinator_instance_type" json:"coordinator_instance_type"`
-	ClientInstanceType      string   `yaml:"client_instance_type" json:"client_instance_type"`
-	StorageInstanceType     string   `yaml:"storage_instance_type" json:"storage_instance_type"`
-	CoordinatorVolumeGiB    int      `yaml:"coordinator_volume_gib" json:"coordinator_volume_gib"`
+type GCPProfile struct {
+	Project                string   `yaml:"project" json:"project"`
+	Region                 string   `yaml:"region" json:"region"`
+	OperatorCIDRs          []string `yaml:"operator_cidrs" json:"operator_cidrs"`
+	SSHUser                string   `yaml:"ssh_user" json:"ssh_user"`
+	CoordinatorMachineType string   `yaml:"coordinator_machine_type" json:"coordinator_machine_type"`
+	ClientMachineType      string   `yaml:"client_machine_type" json:"client_machine_type"`
+	StorageMachineType     string   `yaml:"storage_machine_type" json:"storage_machine_type"`
+	CoordinatorBootDiskGiB int      `yaml:"coordinator_boot_disk_gib" json:"coordinator_boot_disk_gib"`
 }
 
 type ClusterProfile struct {
@@ -100,28 +101,28 @@ func LoadProfile(path string) (Profile, error) {
 
 func (p *Profile) ApplyDefaults() {
 	if p.Name == "" {
-		p.Name = "aws-i8ge-steady"
+		p.Name = "gcp-c4a-steady"
 	}
-	if p.AWS.Region == "" {
-		p.AWS.Region = "us-east-1"
+	if p.GCP.Region == "" {
+		p.GCP.Region = "us-central1"
 	}
-	if len(p.AWS.OperatorCIDRs) == 0 {
-		p.AWS.OperatorCIDRs = []string{"0.0.0.0/0"}
+	if len(p.GCP.OperatorCIDRs) == 0 {
+		p.GCP.OperatorCIDRs = []string{"0.0.0.0/0"}
 	}
-	if p.AWS.SSHUser == "" {
-		p.AWS.SSHUser = "ec2-user"
+	if p.GCP.SSHUser == "" {
+		p.GCP.SSHUser = "ubuntu"
 	}
-	if p.AWS.CoordinatorInstanceType == "" {
-		p.AWS.CoordinatorInstanceType = "m8g.2xlarge"
+	if p.GCP.CoordinatorMachineType == "" {
+		p.GCP.CoordinatorMachineType = "c4a-standard-8"
 	}
-	if p.AWS.ClientInstanceType == "" {
-		p.AWS.ClientInstanceType = "c8g.8xlarge"
+	if p.GCP.ClientMachineType == "" {
+		p.GCP.ClientMachineType = "c4a-standard-16"
 	}
-	if p.AWS.StorageInstanceType == "" {
-		p.AWS.StorageInstanceType = "i8ge.6xlarge"
+	if p.GCP.StorageMachineType == "" {
+		p.GCP.StorageMachineType = "c4a-standard-48-lssd"
 	}
-	if p.AWS.CoordinatorVolumeGiB == 0 {
-		p.AWS.CoordinatorVolumeGiB = 100
+	if p.GCP.CoordinatorBootDiskGiB == 0 {
+		p.GCP.CoordinatorBootDiskGiB = 100
 	}
 
 	if p.Cluster.SlotCount == 0 {
@@ -204,11 +205,23 @@ func (p Profile) Validate() error {
 	if p.Name == "" {
 		return fmt.Errorf("name must not be empty")
 	}
-	if p.AWS.Region == "" {
-		return fmt.Errorf("aws.region must not be empty")
+	if p.GCP.Region == "" {
+		return fmt.Errorf("gcp.region must not be empty")
 	}
-	if p.AWS.SSHUser == "" {
-		return fmt.Errorf("aws.ssh_user must not be empty")
+	if p.GCP.SSHUser == "" {
+		return fmt.Errorf("gcp.ssh_user must not be empty")
+	}
+	if p.GCP.CoordinatorMachineType == "" {
+		return fmt.Errorf("gcp.coordinator_machine_type must not be empty")
+	}
+	if p.GCP.ClientMachineType == "" {
+		return fmt.Errorf("gcp.client_machine_type must not be empty")
+	}
+	if p.GCP.StorageMachineType == "" {
+		return fmt.Errorf("gcp.storage_machine_type must not be empty")
+	}
+	if p.GCP.CoordinatorBootDiskGiB <= 0 {
+		return fmt.Errorf("gcp.coordinator_boot_disk_gib must be > 0")
 	}
 	if p.Cluster.SlotCount <= 0 {
 		return fmt.Errorf("cluster.slot_count must be > 0")
@@ -270,16 +283,37 @@ func (p Profile) TotalRunDuration() time.Duration {
 
 func NormalizeTopology(value string) string {
 	value = strings.TrimSpace(strings.ToLower(value))
-	if value == "" {
+	switch value {
+	case "", DefaultTopology:
 		return DefaultTopology
+	case "single-az":
+		return "single-zone"
+	case "multi-az":
+		return "multi-zone"
 	}
 	return value
 }
 
 func NormalizeClientPlacement(value string) string {
 	value = strings.TrimSpace(strings.ToLower(value))
-	if value == "" {
+	switch value {
+	case "", DefaultClientPlacement:
 		return DefaultClientPlacement
+	case "same-az":
+		return "same-zone"
+	case "remote-az":
+		return "remote-zone"
 	}
 	return value
+}
+
+func (p Profile) ValidateRunnable() error {
+	project := strings.TrimSpace(p.GCP.Project)
+	if project == "" {
+		return fmt.Errorf("gcp.project must be set before running a benchmark")
+	}
+	if strings.Contains(strings.ToUpper(project), "CHANGEME") {
+		return fmt.Errorf("gcp.project must be replaced with a real GCP project before running a benchmark")
+	}
+	return nil
 }

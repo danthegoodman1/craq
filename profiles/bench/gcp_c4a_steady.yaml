@@ -1,13 +1,14 @@
-name: aws-i8ge-steady
-aws:
-  region: us-east-1
+name: gcp-c4a-steady
+gcp:
+  project: projectvoice-442316
+  region: us-central1
   operator_cidrs:
     - 0.0.0.0/0
-  ssh_user: ec2-user
-  coordinator_instance_type: m8g.2xlarge
-  client_instance_type: c8g.8xlarge
-  storage_instance_type: i8ge.6xlarge
-  coordinator_volume_gib: 100
+  ssh_user: ubuntu
+  coordinator_machine_type: c4a-standard-8
+  client_machine_type: c4a-standard-16
+  storage_machine_type: c4a-standard-48-lssd
+  coordinator_boot_disk_gib: 100
 cluster:
   slot_count: 1024
   replication_factor: 3

@@ -2,17 +2,21 @@
 
 `chainrep` includes a separate benchmark operator CLI:
 
-- binary: `chainrep-bench`
-- entrypoint: [`cmd/chainrep-bench/main.go`](./cmd/chainrep-bench/main.go)
-- default profile: [`profiles/bench/aws_i8ge_steady.yaml`](./profiles/bench/aws_i8ge_steady.yaml)
+- binary: `craq-bench`
+- entrypoint: [`cmd/craq-bench/main.go`](./cmd/craq-bench/main.go)
+- default profile: [`profiles/bench/gcp_c4a_steady.yaml`](./profiles/bench/gcp_c4a_steady.yaml)
 
-This is the tool that creates AWS infrastructure, runs the benchmark, pulls
-artifacts locally, analyzes the run, and tears the stack down.
+This is the tool that prepares Terraform-managed GCP infrastructure, runs the
+benchmark, pulls artifacts locally, analyzes the run, and tears the stack down.
+
+The current repo state is intentionally not runnable against real cloud infra
+out of the box: the default profile contains a placeholder `gcp.project`
+setting that you must replace before attempting a live run.
 
 ## Build
 
 ```bash
-go build -o ./bin/chainrep-bench ./cmd/chainrep-bench
+go build -o ./bin/craq-bench ./cmd/craq-bench
 ```
 
 ## Prerequisites
@@ -21,18 +25,12 @@ Install locally:
 
 - `go`
 - `terraform`
-- `aws`
 - `ssh`
 - `scp`
 
-Provide AWS credentials in:
-
-```bash
-.env.local
-```
-
-The benchmark runner reads `.env.local` itself. It does not require you to
-`source` the file in your shell.
+For future live runs against GCP, authenticate locally using your normal GCP
+tooling and set a real `gcp.project` value in your profile before running
+`craq-bench run`.
 
 ## Main Commands
 
@@ -40,20 +38,20 @@ Create infra from scratch, run the benchmark, pull artifacts, and destroy on
 success:
 
 ```bash
-./bin/chainrep-bench run \
-  --profile profiles/bench/aws_i8ge_steady.yaml \
+./bin/craq-bench run \
+  --profile profiles/bench/gcp_c4a_steady.yaml \
   --run-name my-bench
 ```
 
 Useful run overrides:
 
 ```bash
-./bin/chainrep-bench run \
-  --profile profiles/bench/aws_i8ge_steady.yaml \
-  --region us-east-1 \
-  --topology multi-az \
-  --client-placement remote-az \
-  --run-name multi-az-worst-case
+./bin/craq-bench run \
+  --profile profiles/bench/gcp_c4a_steady.yaml \
+  --region us-central1 \
+  --topology multi-zone \
+  --client-placement remote-zone \
+  --run-name multi-zone-worst-case
 ```
 
 ## Run Overrides
@@ -61,26 +59,26 @@ Useful run overrides:
 Current `run` command overrides:
 
 - `--profile`
-  - default: `profiles/bench/aws_i8ge_steady.yaml`
+  - default: `profiles/bench/gcp_c4a_steady.yaml`
   - selects the benchmark profile YAML
 - `--region`
   - default: value from the profile
-  - overrides the AWS region for this run
+  - overrides the GCP region for this run
 - `--topology`
-  - values: `single-az`, `multi-az`
-  - default: `single-az`
-  - controls whether the stack is placed in one AZ or spread across three AZs
+  - values: `single-zone`, `multi-zone`
+  - default: `single-zone`
+  - controls whether the stack is placed in one zone or spread across three zones
 - `--client-placement`
-  - values: `same-az`, `remote-az`
-  - default: `same-az`
-  - relevant for `--topology multi-az`; `remote-az` places the client outside the primary AZ for a worse client path
+  - values: `same-zone`, `remote-zone`
+  - default: `same-zone`
+  - relevant for `--topology multi-zone`; `remote-zone` places the client outside the primary zone for a worse client path
 - `--run-name`
   - default: `bench`
   - used as the human-readable prefix for the generated run ID
 
 You can inspect the exact flag surface from:
 
-- [`cmd/chainrep-bench/main.go`](./cmd/chainrep-bench/main.go)
+- [`cmd/craq-bench/main.go`](./cmd/craq-bench/main.go)
 
 The current `destroy` and `analyze` commands each take:
 
@@ -90,14 +88,14 @@ The current `destroy` and `analyze` commands each take:
 Force teardown for a prior run directory:
 
 ```bash
-./bin/chainrep-bench destroy \
+./bin/craq-bench destroy \
   --run-dir artifacts/benchmarks/<run-id>
 ```
 
 Analyze an already-pulled run directory:
 
 ```bash
-./bin/chainrep-bench analyze \
+./bin/craq-bench analyze \
   --run-dir artifacts/benchmarks/<run-id>
 ```
 
@@ -129,10 +127,10 @@ The most important files are:
 ## Safety Notes
 
 - `terraform destroy` is scoped to the benchmark run's local Terraform state.
-- The benchmark code does not perform separate AWS delete or terminate calls
+- The benchmark code does not perform separate cloud delete or terminate calls
   outside Terraform.
-- The post-destroy AWS CLI call is read-only and is used only to audit whether
-  any resources tagged with the run ID are still present.
+- The default sample profile intentionally will not run until `gcp.project` is
+  replaced with a real project ID.
 - If artifact verification fails, the run is marked `needs_cleanup` and infra is
   intentionally preserved so you can recover data before running `destroy`.
 
@@ -140,10 +138,10 @@ The most important files are:
 
 The current benchmark implementation is:
 
-- AWS only
+- GCP only
 - steady-state only
-- designed around `i8ge.6xlarge` storage nodes
+- designed around `c4a-standard-48-lssd` storage nodes
 - one coordinator, three storage nodes, one client
-- storage-node data directories live on mounted local NVMe under `/var/lib/chainrep-bench/storage-data`
+- storage-node data directories live on RAID0-mounted Local SSD under `/var/lib/craq-bench/storage-data`
 
 It is not currently a failure-injection benchmark.
