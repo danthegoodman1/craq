@@ -137,6 +137,12 @@ func copyTree(src string, dst string) error {
 		if err != nil {
 			return err
 		}
+		if rel == ".terraform" {
+			return filepath.SkipDir
+		}
+		if strings.HasPrefix(rel, ".terraform"+string(filepath.Separator)) {
+			return nil
+		}
 		target := filepath.Join(dst, rel)
 		if info.IsDir() {
 			return os.MkdirAll(target, 0o755)
@@ -154,8 +160,10 @@ func copyTree(src string, dst string) error {
 			return err
 		}
 		defer out.Close()
-		_, err = io.Copy(out, in)
-		return err
+		if _, err = io.Copy(out, in); err != nil {
+			return err
+		}
+		return os.Chmod(target, info.Mode().Perm())
 	})
 }
 

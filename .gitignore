@@ -4,5 +4,6 @@ artifacts/
 *.terraform*
 .env*
 bin/craq-quickstart
+bin/craq-bench
 infra/**/*.tfstate
 infra/**/*.tfstate.*
