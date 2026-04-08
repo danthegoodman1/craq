@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -39,6 +40,48 @@ func TestAddReplicaAsTailReplayIsIdempotent(t *testing.T) {
 	}
 	if got, want := node.HighestAcceptedCoordinatorEpoch(), uint64(6); got != want {
 		t.Fatalf("highest accepted epoch = %d, want %d", got, want)
+	}
+}
+
+func TestAddReplicaAsTailConcurrentReplayIsIdempotent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	backend := newCoordinatedCreateBackend(2)
+	node := mustNewNode(t, ctx, Config{NodeID: "node-a"}, backend, NewInMemoryCoordinatorClient(), NewInMemoryReplicationTransport())
+	cmd := AddReplicaAsTailCommand{
+		Assignment: ReplicaAssignment{Slot: 1, ChainVersion: 1, Role: ReplicaRoleSingle},
+		Epoch:      5,
+	}
+
+	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errCh <- node.AddReplicaAsTail(ctx, cmd)
+		}()
+	}
+
+	select {
+	case <-backend.arrived:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for concurrent CreateReplica calls: %v", ctx.Err())
+	}
+	close(backend.release)
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent AddReplicaAsTail returned error: %v", err)
+		}
+	}
+
+	replica := node.State().Replicas[1]
+	if got, want := replica.State, ReplicaStateCatchingUp; got != want {
+		t.Fatalf("replica state = %q, want %q", got, want)
 	}
 }
 
@@ -149,4 +192,90 @@ func TestRecoverReplicaReplayIsIdempotent(t *testing.T) {
 	if got, want := replica.State, ReplicaStateActive; got != want {
 		t.Fatalf("target state after replay = %q, want %q", got, want)
 	}
+}
+
+type coordinatedCreateBackend struct {
+	delegate *InMemoryBackend
+	expected int
+	arrived  chan struct{}
+	release  chan struct{}
+
+	mu    sync.Mutex
+	count int
+}
+
+func newCoordinatedCreateBackend(expected int) *coordinatedCreateBackend {
+	return &coordinatedCreateBackend{
+		delegate: NewInMemoryBackend(),
+		expected: expected,
+		arrived:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+}
+
+func (b *coordinatedCreateBackend) CreateReplica(slot int) error {
+	b.mu.Lock()
+	b.count++
+	if b.count == b.expected {
+		close(b.arrived)
+	}
+	b.mu.Unlock()
+	<-b.release
+	return b.delegate.CreateReplica(slot)
+}
+
+func (b *coordinatedCreateBackend) DeleteReplica(slot int) error {
+	return b.delegate.DeleteReplica(slot)
+}
+
+func (b *coordinatedCreateBackend) Snapshot(slot int) (Snapshot, error) {
+	return b.delegate.Snapshot(slot)
+}
+
+func (b *coordinatedCreateBackend) InstallSnapshot(slot int, snap Snapshot) error {
+	return b.delegate.InstallSnapshot(slot, snap)
+}
+
+func (b *coordinatedCreateBackend) SetHighestCommittedSequence(slot int, sequence uint64) error {
+	return b.delegate.SetHighestCommittedSequence(slot, sequence)
+}
+
+func (b *coordinatedCreateBackend) ApplyCommitted(ctx context.Context, nodeID string, operation WriteOperation, persisted *PersistedReplica) error {
+	return b.delegate.ApplyCommitted(ctx, nodeID, operation, persisted)
+}
+
+func (b *coordinatedCreateBackend) StagePut(slot int, sequence uint64, key string, value string, metadata ObjectMetadata) error {
+	return b.delegate.StagePut(slot, sequence, key, value, metadata)
+}
+
+func (b *coordinatedCreateBackend) StageDelete(slot int, sequence uint64, key string, metadata ObjectMetadata) error {
+	return b.delegate.StageDelete(slot, sequence, key, metadata)
+}
+
+func (b *coordinatedCreateBackend) CommitSequence(slot int, sequence uint64) error {
+	return b.delegate.CommitSequence(slot, sequence)
+}
+
+func (b *coordinatedCreateBackend) CommittedSnapshot(slot int) (Snapshot, error) {
+	return b.delegate.CommittedSnapshot(slot)
+}
+
+func (b *coordinatedCreateBackend) GetCommitted(slot int, key string) (CommittedObject, bool, error) {
+	return b.delegate.GetCommitted(slot, key)
+}
+
+func (b *coordinatedCreateBackend) HighestCommittedSequence(slot int) (uint64, error) {
+	return b.delegate.HighestCommittedSequence(slot)
+}
+
+func (b *coordinatedCreateBackend) StagedSequences(slot int) ([]uint64, error) {
+	return b.delegate.StagedSequences(slot)
+}
+
+func (b *coordinatedCreateBackend) Close() error {
+	return b.delegate.Close()
+}
+
+func (b *coordinatedCreateBackend) BindLocalStateStore(local LocalStateStore) {
+	b.delegate.BindLocalStateStore(local)
 }

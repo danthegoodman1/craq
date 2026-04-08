@@ -33,6 +33,15 @@ func TestInMemoryBackendSnapshotIsDeepCopy(t *testing.T) {
 	}
 }
 
+func waitForTestSignal(t *testing.T, ctx context.Context, ch <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for %s: %v", name, ctx.Err())
+	}
+}
+
 func TestNodeAddReplicaAsTailCopiesSnapshotAndActivates(t *testing.T) {
 	ctx := context.Background()
 	transport := NewInMemoryReplicationTransport()
@@ -341,6 +350,12 @@ func TestNodeConcurrentLifecycleAndStateInspection(t *testing.T) {
 	done := make(chan struct{})
 	var readers sync.WaitGroup
 	readers.Add(3)
+	stateReaderStarted := make(chan struct{})
+	bufferReaderStarted := make(chan struct{})
+	heartbeatStarted := make(chan struct{})
+	var stateReaderOnce sync.Once
+	var bufferReaderOnce sync.Once
+	var heartbeatOnce sync.Once
 
 	go func() {
 		defer readers.Done()
@@ -349,6 +364,7 @@ func TestNodeConcurrentLifecycleAndStateInspection(t *testing.T) {
 			case <-done:
 				return
 			default:
+				stateReaderOnce.Do(func() { close(stateReaderStarted) })
 				_ = node.State()
 			}
 		}
@@ -360,6 +376,7 @@ func TestNodeConcurrentLifecycleAndStateInspection(t *testing.T) {
 			case <-done:
 				return
 			default:
+				bufferReaderOnce.Do(func() { close(bufferReaderStarted) })
 				_ = node.CatchingUpSlots()
 				_ = node.BufferedReplicaMessages()
 				_ = node.CatchupCount()
@@ -377,9 +394,14 @@ func TestNodeConcurrentLifecycleAndStateInspection(t *testing.T) {
 					errCh <- err
 					return
 				}
+				heartbeatOnce.Do(func() { close(heartbeatStarted) })
 			}
 		}
 	}()
+
+	waitForTestSignal(t, ctx, stateReaderStarted, "state reader startup")
+	waitForTestSignal(t, ctx, bufferReaderStarted, "buffer reader startup")
+	waitForTestSignal(t, ctx, heartbeatStarted, "heartbeat startup")
 
 	var writers sync.WaitGroup
 	for worker := 0; worker < workers; worker++ {
@@ -512,6 +534,12 @@ func TestNodeConcurrentRecoveryLifecycleAndStateInspection(t *testing.T) {
 	errCh := make(chan error, 8)
 	var readers sync.WaitGroup
 	readers.Add(3)
+	stateReaderStarted := make(chan struct{})
+	snapshotReaderStarted := make(chan struct{})
+	heartbeatStarted := make(chan struct{})
+	var stateReaderOnce sync.Once
+	var snapshotReaderOnce sync.Once
+	var heartbeatOnce sync.Once
 
 	go func() {
 		defer readers.Done()
@@ -520,6 +548,7 @@ func TestNodeConcurrentRecoveryLifecycleAndStateInspection(t *testing.T) {
 			case <-done:
 				return
 			default:
+				stateReaderOnce.Do(func() { close(stateReaderStarted) })
 				_ = recoveredTarget.State()
 				_ = recoveredTarget.CatchingUpSlots()
 			}
@@ -532,6 +561,7 @@ func TestNodeConcurrentRecoveryLifecycleAndStateInspection(t *testing.T) {
 			case <-done:
 				return
 			default:
+				snapshotReaderOnce.Do(func() { close(snapshotReaderStarted) })
 				if _, err := recoveredTarget.CommittedSnapshot(2); err != nil && !errors.Is(err, ErrUnknownReplica) {
 					errCh <- err
 					return
@@ -554,9 +584,14 @@ func TestNodeConcurrentRecoveryLifecycleAndStateInspection(t *testing.T) {
 					errCh <- err
 					return
 				}
+				heartbeatOnce.Do(func() { close(heartbeatStarted) })
 			}
 		}
 	}()
+
+	waitForTestSignal(t, ctx, stateReaderStarted, "recovery state reader startup")
+	waitForTestSignal(t, ctx, snapshotReaderStarted, "recovery snapshot reader startup")
+	waitForTestSignal(t, ctx, heartbeatStarted, "recovery heartbeat startup")
 
 	recoveredAssignment := ReplicaAssignment{
 		Slot:         2,

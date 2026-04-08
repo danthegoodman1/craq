@@ -716,6 +716,9 @@ func (n *Node) AddReplicaAsTail(ctx context.Context, cmd AddReplicaAsTailCommand
 	}
 
 	if err := n.backend.CreateReplica(cmd.Assignment.Slot); err != nil {
+		if errors.Is(err, ErrReplicaExists) && n.waitForReplicaCreationReplay(ctx, cmd.Assignment) {
+			return nil
+		}
 		return fmt.Errorf("err in n.backend.CreateReplica: %w", err)
 	}
 
@@ -2543,6 +2546,20 @@ func (n *Node) ensureBackendReplica(slot int) error {
 		return fmt.Errorf("err in n.backend.CreateReplica: %w", err)
 	}
 	return nil
+}
+
+func (n *Node) waitForReplicaCreationReplay(ctx context.Context, assignment ReplicaAssignment) bool {
+	for attempt := 0; attempt < 64; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return false
+		}
+		existing, exists := n.replicaRecordSnapshot(assignment.Slot)
+		if exists && reflect.DeepEqual(existing.assignment, assignment) && existing.state != ReplicaStateRemoved {
+			return true
+		}
+		time.Sleep(50 * time.Microsecond)
+	}
+	return false
 }
 
 func sortedReplicaSlots(replicas map[int]replicaRecord) []int {
