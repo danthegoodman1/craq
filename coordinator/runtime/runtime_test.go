@@ -715,6 +715,165 @@ func TestCheckpointPreservesCompletedProgressWhileAnotherSlotRemainsPending(t *t
 	}
 }
 
+func TestInterleavedRepairHeartbeatLivenessAndCheckpointReplay(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryStore()
+	rt := mustOpenRuntime(t, store)
+
+	state, err := rt.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 8, 3, "a", "b", "c"))
+	if err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	state, err = rt.Heartbeat(ctx, Command{
+		ID:              "heartbeat-a",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindHeartbeat,
+		Heartbeat: &HeartbeatCommand{
+			Status:             uniqueNodeStatus("a"),
+			ObservedAtUnixNano: int64((10 * time.Second).Nanoseconds()),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Heartbeat(a) returned error: %v", err)
+	}
+	state, err = rt.Heartbeat(ctx, Command{
+		ID:              "heartbeat-b",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindHeartbeat,
+		Heartbeat: &HeartbeatCommand{
+			Status:             uniqueNodeStatus("b"),
+			ObservedAtUnixNano: int64((11 * time.Second).Nanoseconds()),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Heartbeat(b) returned error: %v", err)
+	}
+
+	plan, state, err := rt.Reconfigure(ctx, Command{
+		ID:              "add-d",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindReconfigure,
+		Reconfigure: &ReconfigureCommand{
+			Events: []coordinator.Event{{Kind: coordinator.EventKindAddNode, Node: uniqueNode("d")}},
+			Policy: coordinator.ReconfigurationPolicy{MaxChangedChains: 2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconfigure(add-d) returned error: %v", err)
+	}
+	if got, want := len(plan.ChangedSlots), 2; got != want {
+		t.Fatalf("changed slot count = %d, want %d", got, want)
+	}
+
+	firstSlot := plan.ChangedSlots[0].Slot
+	secondSlot := plan.ChangedSlots[1].Slot
+	joiningNodeID := plan.ChangedSlots[0].Steps[0].NodeID
+	ackedFirstSlot := false
+	for i, entry := range append([]OutboxEntry(nil), state.Outbox...) {
+		if entry.Slot != firstSlot {
+			continue
+		}
+		ackedFirstSlot = true
+		state, err = rt.AcknowledgeOutbox(ctx, Command{
+			ID:              fmt.Sprintf("ack-first-slot-%d", i),
+			ExpectedVersion: state.Version,
+			Kind:            CommandKindAcknowledgeOutbox,
+			AcknowledgeOutbox: &AcknowledgeOutboxCommand{
+				EntryID: entry.ID,
+			},
+		})
+		if err != nil {
+			t.Fatalf("AcknowledgeOutbox(%s) returned error: %v", entry.ID, err)
+		}
+	}
+	if !ackedFirstSlot {
+		t.Fatal("failed to acknowledge any first-slot outbox entry")
+	}
+
+	state, err = rt.ApplyProgress(ctx, Command{
+		ID:              "progress-ready-d",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindProgress,
+		Progress: &ProgressCommand{
+			Event: coordinator.Event{
+				Kind:   coordinator.EventKindReplicaBecameActive,
+				Slot:   firstSlot,
+				NodeID: joiningNodeID,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplyProgress(ready) returned error: %v", err)
+	}
+	_, state, err = rt.Reconfigure(ctx, Command{
+		ID:              "reconcile-after-ready",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindReconfigure,
+		Reconfigure: &ReconfigureCommand{
+			Events: nil,
+			Policy: coordinator.ReconfigurationPolicy{MaxChangedChains: 2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconfigure(after ready) returned error: %v", err)
+	}
+	if got, want := state.PendingBySlot[firstSlot].Kind, PendingKindRemoved; got != want {
+		t.Fatalf("first slot pending kind = %q, want %q", got, want)
+	}
+	if got, want := state.PendingBySlot[secondSlot].Kind, PendingKindReady; got != want {
+		t.Fatalf("second slot pending kind = %q, want %q", got, want)
+	}
+	if got := countOutboxEntriesForSlot(state.Outbox, secondSlot); got == 0 {
+		t.Fatal("second slot unexpectedly lost its outbox work")
+	}
+
+	state, err = rt.Heartbeat(ctx, Command{
+		ID:              "heartbeat-d",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindHeartbeat,
+		Heartbeat: &HeartbeatCommand{
+			Status:             uniqueNodeStatus("d"),
+			ObservedAtUnixNano: int64((12 * time.Second).Nanoseconds()),
+			FlapWindowNanos:    int64((30 * time.Second).Nanoseconds()),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Heartbeat(d) returned error: %v", err)
+	}
+	state, err = rt.ApplyLiveness(ctx, Command{
+		ID:              "liveness-b-suspect",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindLiveness,
+		Liveness: &LivenessCommand{
+			NodeID:              "b",
+			State:               NodeLivenessStateSuspect,
+			EvaluatedAtUnixNano: int64((13 * time.Second).Nanoseconds()),
+			FlapWindowNanos:     int64((30 * time.Second).Nanoseconds()),
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplyLiveness returned error: %v", err)
+	}
+
+	if err := rt.Checkpoint(ctx); err != nil {
+		t.Fatalf("Checkpoint returned error: %v", err)
+	}
+	reopened := mustOpenRuntime(t, store)
+
+	want := state
+	want.AppliedCommands = map[string]AppliedCommand{}
+	if got := reopened.Current(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("recovered state mismatch\nrecovered=%#v\nwant=%#v", got, want)
+	}
+	if got, want := reopened.Current().NodeLivenessByID["b"].State, NodeLivenessStateSuspect; got != want {
+		t.Fatalf("reopened liveness state = %q, want %q", got, want)
+	}
+	if got, want := len(reopened.Current().CompletedProgressBySlot[firstSlot]), 1; got != want {
+		t.Fatalf("completed progress record count after reopen = %d, want %d", got, want)
+	}
+	assertCoordinatorStateValid(t, reopened.Current().Cluster)
+}
+
 func TestDuplicateOutboxAcknowledgeIsIdempotentBeforeAndAfterReopen(t *testing.T) {
 	ctx := context.Background()
 	store := NewInMemoryStore()
@@ -1264,6 +1423,31 @@ func bootstrapCommand(id string, expected uint64, slotCount int, replicationFact
 			},
 			Nodes: uniqueNodes(nodeIDs...),
 		},
+	}
+}
+
+func TestBootstrapPersistsReconfigurationPolicy(t *testing.T) {
+	rt := mustOpenRuntime(t, NewInMemoryStore())
+	state, err := rt.Bootstrap(context.Background(), Command{
+		ID:              "bootstrap-policy",
+		ExpectedVersion: 0,
+		Kind:            CommandKindBootstrap,
+		Bootstrap: &BootstrapCommand{
+			Config: coordinator.Config{
+				SlotCount:         8,
+				ReplicationFactor: 3,
+			},
+			Policy: coordinator.ReconfigurationPolicy{MaxChangedChains: 32},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	if got, want := state.LastPolicy.MaxChangedChains, 32; got != want {
+		t.Fatalf("state.LastPolicy.MaxChangedChains = %d, want %d", got, want)
+	}
+	if got, want := rt.Current().LastPolicy.MaxChangedChains, 32; got != want {
+		t.Fatalf("runtime current LastPolicy.MaxChangedChains = %d, want %d", got, want)
 	}
 }
 

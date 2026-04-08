@@ -21,3 +21,9 @@ output "instance_names" {
     for name, instance in google_compute_instance.node : name => instance.name
   }
 }
+
+output "node_zones" {
+  value = {
+    for name, instance in google_compute_instance.node : name => instance.zone
+  }
+}

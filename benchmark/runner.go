@@ -14,8 +14,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/danthegoodman1/craq/coordinator"
 	"github.com/danthegoodman1/craq/coordserver"
 )
+
+type remoteTarget struct {
+	Name string
+	Host string
+}
 
 type RunOptions struct {
 	ProfilePath     string
@@ -32,6 +38,7 @@ type DestroyOptions struct {
 }
 
 func RunBenchmark(ctx context.Context, opts RunOptions) (string, error) {
+	logProgress("loading benchmark profile from %s", opts.ProfilePath)
 	repoRoot := opts.RepoRoot
 	if repoRoot == "" {
 		var err error
@@ -55,10 +62,12 @@ func RunBenchmark(ctx context.Context, opts RunOptions) (string, error) {
 	gitSHA := gitSHA(ctx, repoRoot)
 	runID := buildRunID(opts.RunName, gitSHA)
 	runDir := filepath.Join(repoRoot, profile.Artifacts.RootDir, runID)
+	logProgress("preparing run %s in %s", runID, runDir)
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return "", fmt.Errorf("mkdir run dir: %w", err)
 	}
 	terraformDir := filepath.Join(runDir, "terraform")
+	logProgress("copying terraform config into %s", terraformDir)
 	if err := copyTree(filepath.Join(repoRoot, "infra", "benchmark", "gcp"), terraformDir); err != nil {
 		return "", fmt.Errorf("copy terraform root: %w", err)
 	}
@@ -67,6 +76,7 @@ func RunBenchmark(ctx context.Context, opts RunOptions) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(sshKeyBase), 0o755); err != nil {
 		return "", err
 	}
+	logProgress("generating temporary ssh keypair for benchmark hosts")
 	if err := runCommand(ctx, nil, "", "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", sshKeyBase); err != nil {
 		return "", fmt.Errorf("generate ssh key: %w", err)
 	}
@@ -101,6 +111,7 @@ func RunBenchmark(ctx context.Context, opts RunOptions) (string, error) {
 		"GOARCH":      "arm64",
 		"CGO_ENABLED": "0",
 	}
+	logProgress("building linux/arm64 craq-bench binary")
 	if err := runCommand(ctx, buildEnv, repoRoot, "go", "build", "-o", binPath, "./cmd/craq-bench"); err != nil {
 		return "", err
 	}
@@ -113,13 +124,24 @@ func RunBenchmark(ctx context.Context, opts RunOptions) (string, error) {
 		return "", err
 	}
 
+	logProgress("initializing terraform")
 	if err := runCommand(ctx, nil, terraformDir, "terraform", "init", "-input=false"); err != nil {
 		return "", err
 	}
+	logProgress("applying terraform to create benchmark infrastructure")
 	if err := runCommand(ctx, nil, terraformDir, "terraform", "apply", "-auto-approve", "-input=false"); err != nil {
 		state.Status = "needs_cleanup"
+		state.Notes = append(state.Notes, "terraform apply failed before benchmark execution")
 		_ = WriteRunState(filepath.Join(runDir, RunStateFileName), state)
-		return "", err
+		if destroyErr := bestEffortTerraformDestroy(context.WithoutCancel(ctx), terraformDir); destroyErr != nil {
+			state.Notes = append(state.Notes, "best-effort terraform destroy after apply failure also failed: "+destroyErr.Error())
+			_ = WriteRunState(filepath.Join(runDir, RunStateFileName), state)
+			return "", fmt.Errorf("terraform apply failed: %w; cleanup also failed: %v", err, destroyErr)
+		}
+		state.Status = "apply_failed_cleaned"
+		state.Notes = append(state.Notes, "best-effort terraform destroy completed after apply failure")
+		_ = WriteRunState(filepath.Join(runDir, RunStateFileName), state)
+		return "", fmt.Errorf("terraform apply failed and partial resources were cleaned up: %w", err)
 	}
 	outputData, err := captureCommand(ctx, nil, terraformDir, "terraform", "output", "-json")
 	if err != nil {
@@ -132,11 +154,15 @@ func RunBenchmark(ctx context.Context, opts RunOptions) (string, error) {
 	state.TerraformOutputs = outputs
 	state.ClientPublicIP = outputs.PublicClientIP
 	state.Status = "infra_ready"
+	logProgress("infrastructure ready: client=%s primary-zone=%s", outputs.PublicClientIP, outputs.PrimaryZone)
 	if err := WriteRunState(filepath.Join(runDir, RunStateFileName), state); err != nil {
 		return "", err
 	}
 
-	if err := waitForSSH(context.WithoutCancel(ctx), SSHConfig{
+	clientWaitCtx, clientWaitCancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer clientWaitCancel()
+	logProgress("waiting for ssh on public client %s", outputs.PublicClientIP)
+	if err := waitForSSH(clientWaitCtx, SSHConfig{
 		User:         profile.GCP.SSHUser,
 		PrivateKey:   state.SSHPrivateKey,
 		JumpPublicIP: outputs.PublicClientIP,
@@ -149,11 +175,13 @@ func RunBenchmark(ctx context.Context, opts RunOptions) (string, error) {
 		SlotCount:         profile.Cluster.SlotCount,
 		ReplicationFactor: profile.Cluster.ReplicationFactor,
 		PrivateIPs:        outputs.PrivateIPs,
+		NodeZones:         outputs.NodeZones,
 	})
 	if err != nil {
 		return "", err
 	}
 	manifestPath := filepath.Join(runDir, "rendered", "manifest.json")
+	logProgress("rendering benchmark manifest to %s", manifestPath)
 	if err := SaveManifest(manifestPath, manifest); err != nil {
 		return "", err
 	}
@@ -172,31 +200,42 @@ func RunBenchmark(ctx context.Context, opts RunOptions) (string, error) {
 	if err := SaveJSON(filepath.Join(runDir, RunMetadataFileName), metadata); err != nil {
 		return "", err
 	}
+	logProgress("deploying benchmark binary and configs to remote nodes")
 	if err := deployAndRun(ctx, state, manifestPath, binPath); err != nil {
 		state.Status = "needs_cleanup"
 		_ = WriteRunState(filepath.Join(runDir, RunStateFileName), state)
 		return runDir, err
 	}
 	state.Status = "artifacts_pulled"
+	logProgress("benchmark artifacts collected to %s", state.ArtifactsDir)
 	if err := WriteRunState(filepath.Join(runDir, RunStateFileName), state); err != nil {
 		return runDir, err
 	}
+	logProgress("destroying benchmark infrastructure")
 	if err := DestroyBenchmark(ctx, DestroyOptions{RunDir: runDir, RepoRoot: repoRoot}); err != nil {
 		return runDir, err
 	}
+	logProgress("benchmark run %s completed successfully", runID)
 	return runDir, nil
 }
 
 func DestroyBenchmark(ctx context.Context, opts DestroyOptions) error {
+	logProgress("loading run state from %s", opts.RunDir)
 	state, err := ReadRunState(filepath.Join(opts.RunDir, RunStateFileName))
 	if err != nil {
 		return err
 	}
-	if err := runCommand(ctx, nil, state.TerraformDir, "terraform", "destroy", "-auto-approve", "-input=false"); err != nil {
+	logProgress("running terraform destroy for %s", state.RunID)
+	if err := bestEffortTerraformDestroy(ctx, state.TerraformDir); err != nil {
 		return err
 	}
 	state.Status = "destroyed"
+	logProgress("benchmark infrastructure destroyed for %s", state.RunID)
 	return WriteRunState(filepath.Join(opts.RunDir, RunStateFileName), state)
+}
+
+func bestEffortTerraformDestroy(ctx context.Context, terraformDir string) error {
+	return runCommand(ctx, nil, terraformDir, "terraform", "destroy", "-auto-approve", "-input=false")
 }
 
 func renderTerraformVars(state RunState, runDir string) (map[string]any, error) {
@@ -253,6 +292,9 @@ func decodeTerraformOutputs(data []byte) (TerraformOutputs, error) {
 	if err := read("instance_names", &out.InstanceNames); err != nil {
 		return TerraformOutputs{}, err
 	}
+	if err := read("node_zones", &out.NodeZones); err != nil {
+		return TerraformOutputs{}, err
+	}
 	return out, nil
 }
 
@@ -276,31 +318,57 @@ func buildRunID(runName string, gitSHA string) string {
 func deployAndRun(ctx context.Context, state RunState, manifestPath string, binPath string) error {
 	ssh := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP}
 	clientSSH := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP, DisableJump: true}
-	targets := map[string]string{
-		"client":      state.TerraformOutputs.PublicClientIP,
-		"coordinator": state.TerraformOutputs.PrivateIPs["coordinator"],
-		"storage-a":   state.TerraformOutputs.PrivateIPs["storage-a"],
-		"storage-b":   state.TerraformOutputs.PrivateIPs["storage-b"],
-		"storage-c":   state.TerraformOutputs.PrivateIPs["storage-c"],
-	}
-	for name, host := range targets {
+	for _, target := range orderedRemoteTargets(state) {
+		name := target.Name
+		host := target.Host
 		currentSSH := ssh
 		if name == "client" {
 			currentSSH = clientSSH
 		}
-		if err := waitForSSH(ctx, currentSSH, host); err != nil {
+		logProgress("waiting for ssh on %s (%s)", name, host)
+		waitCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		err := waitForSSH(waitCtx, currentSSH, host)
+		cancel()
+		if err != nil {
 			return fmt.Errorf("wait for ssh %s: %w", name, err)
 		}
-		if err := SSH(ctx, currentSSH, host, "mkdir -p /tmp/craq-bench"); err != nil {
+		logProgress("waiting for bootstrap completion on %s", name)
+		bootstrapTimeout := 5 * time.Minute
+		if strings.HasPrefix(name, "storage-") {
+			bootstrapTimeout = 12 * time.Minute
+		}
+		bootstrapCtx, bootstrapCancel := context.WithTimeout(ctx, bootstrapTimeout)
+		err = waitForRemoteBootstrap(bootstrapCtx, currentSSH, host)
+		bootstrapCancel()
+		if err != nil {
+			if detail, detailErr := captureBootstrapDiagnostics(ctx, currentSSH, host); detailErr == nil {
+				return fmt.Errorf("wait for bootstrap %s: %w\n%s", name, err, detail)
+			}
+			return fmt.Errorf("wait for bootstrap %s: %w", name, err)
+		}
+		logProgress("uploading craq-bench binary to %s", name)
+		if err := retryRemoteStep(ctx, "prepare "+name, func() error {
+			return SSH(ctx, currentSSH, host, "mkdir -p /tmp/craq-bench")
+		}); err != nil {
 			return err
 		}
-		if err := SCP(ctx, currentSSH, binPath, host, "/tmp/craq-bench/craq-bench"); err != nil {
+		if err := retryRemoteStep(ctx, "mkdirs "+name, func() error {
+			return SSH(ctx, currentSSH, host, "sudo mkdir -p /opt/craq-bench/bin /etc/craq-bench /var/lib/craq-bench")
+		}); err != nil {
 			return err
 		}
-		if err := SSH(ctx, currentSSH, host, "sudo install -m 0755 /tmp/craq-bench/craq-bench /opt/craq-bench/bin/craq-bench"); err != nil {
+		if err := retryRemoteStep(ctx, "upload binary "+name, func() error {
+			return SCP(ctx, currentSSH, binPath, host, "/tmp/craq-bench/craq-bench")
+		}); err != nil {
+			return err
+		}
+		if err := retryRemoteStep(ctx, "install binary "+name, func() error {
+			return SSH(ctx, currentSSH, host, "sudo install -m 0755 /tmp/craq-bench/craq-bench /opt/craq-bench/bin/craq-bench")
+		}); err != nil {
 			return err
 		}
 	}
+	logProgress("copying benchmark ssh key to client jump host")
 	if err := SCP(ctx, clientSSH, state.SSHPrivateKey, state.TerraformOutputs.PublicClientIP, "/tmp/craq-bench/id_ed25519"); err != nil {
 		return err
 	}
@@ -314,6 +382,7 @@ func deployAndRun(ctx context.Context, state RunState, manifestPath string, binP
 	if err := SCP(ctx, clientSSH, manifestPath, state.TerraformOutputs.PublicClientIP, "/tmp/craq-bench/manifest.json"); err != nil {
 		return err
 	}
+	logProgress("copying manifest to private cluster nodes")
 	for _, host := range []string{state.TerraformOutputs.PrivateIPs["coordinator"], state.TerraformOutputs.PrivateIPs["storage-a"], state.TerraformOutputs.PrivateIPs["storage-b"], state.TerraformOutputs.PrivateIPs["storage-c"]} {
 		if err := SCP(ctx, ssh, manifestPath, host, "/tmp/craq-bench/manifest.json"); err != nil {
 			return err
@@ -345,6 +414,7 @@ func deployAndRun(ctx context.Context, state RunState, manifestPath string, binP
 }
 
 func installRemoteConfigs(ctx context.Context, state RunState, manifestPath string) error {
+	logProgress("installing benchmark config files on remote nodes")
 	manifestJSON, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return err
@@ -356,6 +426,9 @@ func installRemoteConfigs(ctx context.Context, state RunState, manifestPath stri
 		Liveness: coordserver.LivenessPolicy{
 			SuspectAfter: state.Profile.Cluster.SuspectAfter,
 			DeadAfter:    state.Profile.Cluster.DeadAfter,
+		},
+		Reconfiguration: coordinator.ReconfigurationPolicy{
+			MaxChangedChains: state.Profile.Cluster.Reconfiguration.MaxChangedChains,
 		},
 		TickInterval: state.Profile.Cluster.LivenessInterval,
 		RPCDeadline:  state.Profile.Cluster.RPCDeadline,
@@ -432,6 +505,7 @@ func installRemoteConfigs(ctx context.Context, state RunState, manifestPath stri
 }
 
 func installSystemdUnits(ctx context.Context, state RunState) error {
+	logProgress("installing systemd units on remote nodes")
 	units := map[string]string{
 		"craq-bench-coordinator.service": craqCoordinatorUnit(),
 		"craq-bench-storage.service":     craqStorageUnit(),
@@ -471,14 +545,8 @@ func installSystemdUnits(ctx context.Context, state RunState) error {
 }
 
 func startRemoteTelemetry(ctx context.Context, state RunState) error {
+	logProgress("starting background telemetry collection on all nodes")
 	duration := state.Profile.TotalRunDuration().Round(time.Second) + time.Minute
-	runRoot := "/var/lib/craq-bench/runs/" + state.RunID
-	commands := []string{
-		fmt.Sprintf("mkdir -p %s && timeout %ds /opt/craq-bench/bin/craq-bench probe --output %s --interval %s --duration %s > /dev/null 2>&1 &", shellQuote(runRoot), int(duration.Seconds()), shellQuote(filepath.Join(runRoot, "probe.jsonl")), state.Profile.Telemetry.ProbeInterval, duration),
-		fmt.Sprintf("timeout %ds vmstat 1 > %s 2>&1 &", int(duration.Seconds()), shellQuote(filepath.Join(runRoot, "vmstat.txt"))),
-		fmt.Sprintf("timeout %ds iostat -x 1 > %s 2>&1 &", int(duration.Seconds()), shellQuote(filepath.Join(runRoot, "iostat.txt"))),
-		fmt.Sprintf("timeout %ds pidstat -dur 1 > %s 2>&1 &", int(duration.Seconds()), shellQuote(filepath.Join(runRoot, "pidstat.txt"))),
-	}
 	for name, host := range map[string]string{
 		"client":      state.TerraformOutputs.PublicClientIP,
 		"coordinator": state.TerraformOutputs.PrivateIPs["coordinator"],
@@ -490,18 +558,33 @@ func startRemoteTelemetry(ctx context.Context, state RunState) error {
 		if name == "client" {
 			ssh.DisableJump = true
 		}
-		if err := SSH(ctx, ssh, host, "bash -lc "+shellQuote(strings.Join(commands, " "))); err != nil {
+		logProgress("starting telemetry on %s", name)
+		command := buildRemoteTelemetryCommand(filepath.Join("/var/lib/craq-bench/runs", state.RunID, name), state.Profile.Telemetry.ProbeInterval, duration)
+		if err := SSH(ctx, ssh, host, "bash -lc "+shellQuote(command)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+func buildRemoteTelemetryCommand(outputDir string, probeInterval time.Duration, duration time.Duration) string {
+	timeoutSeconds := int(duration.Seconds())
+	return strings.Join([]string{
+		fmt.Sprintf("mkdir -p %s", shellQuote(outputDir)),
+		fmt.Sprintf("nohup timeout %ds /opt/craq-bench/bin/craq-bench probe --output %s --interval %s --duration %s >/dev/null 2>&1 &", timeoutSeconds, shellQuote(filepath.Join(outputDir, "probe.jsonl")), probeInterval, duration),
+		fmt.Sprintf("nohup timeout %ds vmstat 1 > %s 2>&1 &", timeoutSeconds, shellQuote(filepath.Join(outputDir, "vmstat.txt"))),
+		fmt.Sprintf("nohup timeout %ds iostat -x 1 > %s 2>&1 &", timeoutSeconds, shellQuote(filepath.Join(outputDir, "iostat.txt"))),
+		fmt.Sprintf("nohup timeout %ds pidstat -dur 1 > %s 2>&1 &", timeoutSeconds, shellQuote(filepath.Join(outputDir, "pidstat.txt"))),
+	}, "\n")
+}
+
 func startServices(ctx context.Context, state RunState) error {
+	logProgress("starting coordinator service")
 	coordSSH := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP}
 	if err := SSH(ctx, coordSSH, state.TerraformOutputs.PrivateIPs["coordinator"], "sudo systemctl restart craq-bench-coordinator.service"); err != nil {
 		return err
 	}
+	logProgress("starting storage services")
 	for _, name := range []string{"storage-a", "storage-b", "storage-c"} {
 		if err := SSH(ctx, coordSSH, state.TerraformOutputs.PrivateIPs[name], "sudo systemctl restart craq-bench-storage.service"); err != nil {
 			return err
@@ -511,12 +594,20 @@ func startServices(ctx context.Context, state RunState) error {
 }
 
 func waitForRoutingReady(ctx context.Context, state RunState) error {
+	logProgress("waiting for coordinator routing state to become writable")
 	clientSSH := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP, DisableJump: true}
 	command := "curl -fsS http://" + state.TerraformOutputs.PrivateIPs["coordinator"] + ":7401/admin/v1/state"
 	deadline := time.Now().Add(2 * time.Minute)
+	var lastState []byte
+	var lastErr error
 	for time.Now().Before(deadline) {
 		data, err := SSHCapture(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, command)
+		if len(data) > 0 {
+			lastState = append(lastState[:0], data...)
+		}
+		lastErr = err
 		if err == nil && bytes.Contains(data, []byte(`"writable":true`)) {
+			logProgress("coordinator routing state is writable")
 			return nil
 		}
 		select {
@@ -525,29 +616,54 @@ func waitForRoutingReady(ctx context.Context, state RunState) error {
 		case <-time.After(3 * time.Second):
 		}
 	}
-	return fmt.Errorf("timed out waiting for writable routing state")
+	diag := strings.TrimSpace(string(lastState))
+	if len(diag) > 1200 {
+		diag = diag[:1200] + "...(truncated)"
+	}
+	switch {
+	case diag != "":
+		return fmt.Errorf("timed out waiting for writable routing state; last coordinator state: %s", diag)
+	case lastErr != nil:
+		return fmt.Errorf("timed out waiting for writable routing state; last poll error: %w", lastErr)
+	default:
+		return fmt.Errorf("timed out waiting for writable routing state")
+	}
 }
 
 func runRemoteLoadgen(ctx context.Context, state RunState) error {
 	clientSSH := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP, DisableJump: true}
+	logProgress("starting remote load generator on client")
 	if err := SSH(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, "sudo systemctl restart craq-bench-client-loadgen.service"); err != nil {
 		return err
 	}
-	if err := SSH(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, "sudo systemctl is-active --quiet craq-bench-client-loadgen.service || true"); err != nil {
+	if err := SSH(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, "sudo systemctl is-active --quiet craq-bench-client-loadgen.service"); err != nil {
 		return err
 	}
 	runRoot := "/var/lib/craq-bench/runs/" + state.RunID
 	command := "bash -lc " + shellQuote(fmt.Sprintf("until test -f %s; do sleep 5; done", filepath.Join(runRoot, "client", "loadgen-report.json")))
-	return SSH(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, command)
+	waitCtx, cancel := context.WithTimeout(ctx, state.Profile.TotalRunDuration()+2*time.Minute)
+	defer cancel()
+	logProgress("waiting for loadgen report, expected workload duration about %s", state.Profile.TotalRunDuration())
+	if err := SSH(waitCtx, clientSSH, state.TerraformOutputs.PublicClientIP, command); err != nil {
+		status, statusErr := SSHCapture(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, "sudo systemctl status craq-bench-client-loadgen.service --no-pager || sudo journalctl -u craq-bench-client-loadgen.service --no-pager -n 100")
+		if statusErr == nil {
+			return fmt.Errorf("wait for loadgen report: %w\n%s", err, strings.TrimSpace(string(status)))
+		}
+		return fmt.Errorf("wait for loadgen report: %w", err)
+	}
+	logProgress("load generator completed")
+	return nil
 }
 
 func pullArtifacts(ctx context.Context, state RunState) error {
 	clientSSH := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP, DisableJump: true}
+	logProgress("collecting benchmark artifacts on client")
 	if err := SSH(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, "/opt/craq-bench/bin/craq-bench collect --config /etc/craq-bench/collect.json"); err != nil {
 		return err
 	}
 	remoteBundleRoot := filepath.Join("/var/lib/craq-bench/runs", state.RunID, "bundle")
 	localArtifacts := filepath.Join(filepath.Dir(state.TerraformDir), "artifacts")
+	logProgress("copying artifact bundle back to local machine")
 	if err := SCPFrom(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, filepath.Join(remoteBundleRoot, ArtifactManifestName), filepath.Join(localArtifacts, ArtifactManifestName)); err != nil {
 		return err
 	}
@@ -613,7 +729,7 @@ Description=craq benchmark load generator
 After=network-online.target
 
 [Service]
-Type=oneshot
+Type=simple
 ExecStart=/opt/craq-bench/bin/craq-bench loadgen --config /etc/craq-bench/loadgen.json
 
 [Install]
@@ -664,4 +780,85 @@ func extractTarGz(path string, dest string) error {
 			}
 		}
 	}
+}
+
+func waitForRemoteBootstrap(ctx context.Context, ssh SSHConfig, host string) error {
+	command := "test -f /var/lib/craq-bench/bootstrap.ready"
+	started := time.Now()
+	lastLog := time.Time{}
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := SSH(ctx, ssh, host, command); err == nil {
+			return nil
+		} else if time.Since(lastLog) >= 15*time.Second {
+			logProgress("still waiting for bootstrap on %s after %s", host, time.Since(started).Round(time.Second))
+			lastLog = time.Now()
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
+}
+
+func orderedRemoteTargets(state RunState) []remoteTarget {
+	return []remoteTarget{
+		{Name: "client", Host: state.TerraformOutputs.PublicClientIP},
+		{Name: "coordinator", Host: state.TerraformOutputs.PrivateIPs["coordinator"]},
+		{Name: "storage-a", Host: state.TerraformOutputs.PrivateIPs["storage-a"]},
+		{Name: "storage-b", Host: state.TerraformOutputs.PrivateIPs["storage-b"]},
+		{Name: "storage-c", Host: state.TerraformOutputs.PrivateIPs["storage-c"]},
+	}
+}
+
+func retryRemoteStep(ctx context.Context, label string, fn func() error) error {
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := fn(); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			if attempt < 3 {
+				logProgress("%s failed on attempt %d/3, retrying: %v", label, attempt, err)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(5 * time.Second):
+				}
+			}
+		}
+	}
+	return lastErr
+}
+
+func captureBootstrapDiagnostics(ctx context.Context, ssh SSHConfig, host string) (string, error) {
+	diagCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	command := strings.Join([]string{
+		"echo '=== bootstrap marker ==='",
+		"ls -l /var/lib/craq-bench/bootstrap.ready || true",
+		"echo '=== startup service ==='",
+		"systemctl is-active google-startup-scripts.service || true",
+		"echo '=== startup journal ==='",
+		"sudo journalctl -u google-startup-scripts.service --no-pager -n 200 || true",
+		"echo '=== cloud-init status ==='",
+		"sudo cloud-init status || true",
+		"echo '=== local ssd by-id ==='",
+		"find /dev/disk/by-id -maxdepth 1 -type l \\( -name 'google-local-nvme-ssd-*' -o -name 'google-local-ssd-*' \\) | sort || true",
+		"echo '=== mdstat ==='",
+		"cat /proc/mdstat || true",
+		"echo '=== mount ==='",
+		"mount | grep craq-bench || true",
+	}, "; ")
+	data, err := SSHCapture(diagCtx, ssh, host, "bash -lc "+shellQuote(command))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
 }

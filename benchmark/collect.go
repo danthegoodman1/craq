@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/danthegoodman1/craq/quickstart"
 )
@@ -85,7 +86,8 @@ func CollectArtifacts(ctx context.Context, cfg CollectConfig) (ArtifactManifest,
 }
 
 func collectHTTP(url string, outputPath string) error {
-	resp, err := http.Get(url)
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(url)
 	if err != nil {
 		return fmt.Errorf("get %s: %w", url, err)
 	}
@@ -107,6 +109,9 @@ func collectHTTP(url string, outputPath string) error {
 
 func collectRemoteFile(ctx context.Context, cfg CollectConfig, host string, command string, outputPath string) error {
 	cmd := exec.CommandContext(ctx, "ssh",
+		"-o", "BatchMode=yes",
+		"-o", "IdentitiesOnly=yes",
+		"-o", "LogLevel=ERROR",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-i", cfg.SSHPrivateKey,

@@ -6,6 +6,7 @@ import (
 	"net"
 	"reflect"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -362,6 +363,241 @@ func TestDuplicateSameIdentityRegistrationOverFactoryBackedGRPCIsNoOp(t *testing
 	}
 	if got := coordImpl.Current().Cluster.NodesByID["n1"]; !reflect.DeepEqual(got, before.Cluster.NodesByID["n1"]) {
 		t.Fatalf("node identity changed after duplicate RegisterNode over gRPC\ngot=%#v\nwant=%#v", got, before.Cluster.NodesByID["n1"])
+	}
+}
+
+func TestConcurrentReporterAndAdminTrafficOverGRPC(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pool := grpcx.NewConnPool()
+	t.Cleanup(func() { _ = pool.Close() })
+
+	coordSvc, coordAddr, coordImpl := mustStartCoordinator(t, ctx, coordruntime.NewInMemoryStore(), pool)
+	defer func() { _ = coordSvc.Close() }()
+
+	admin := grpcx.NewCoordinatorAdminClient(coordAddr, pool)
+	nodes := []coordinator.Node{
+		{ID: "a", RPCAddress: "127.0.0.1:7411", FailureDomains: map[string]string{"host": "ha", "rack": "ra", "az": "za"}},
+		{ID: "b", RPCAddress: "127.0.0.1:7412", FailureDomains: map[string]string{"host": "hb", "rack": "rb", "az": "zb"}},
+		{ID: "c", RPCAddress: "127.0.0.1:7413", FailureDomains: map[string]string{"host": "hc", "rack": "rc", "az": "zc"}},
+	}
+	if _, err := admin.Bootstrap(ctx, coordruntime.Command{
+		ID:              "bootstrap",
+		ExpectedVersion: 0,
+		Kind:            coordruntime.CommandKindBootstrap,
+		Bootstrap: &coordruntime.BootstrapCommand{
+			Config: coordinator.Config{SlotCount: 8, ReplicationFactor: 3},
+			Nodes:  nodes,
+		},
+	}); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+
+	type reporterTarget struct {
+		reg      storage.NodeRegistration
+		reporter *grpcx.CoordinatorReporterClient
+	}
+	targets := make([]reporterTarget, 0, len(nodes))
+	for _, node := range nodes {
+		targets = append(targets, reporterTarget{
+			reg: storage.NodeRegistration{
+				NodeID:         node.ID,
+				RPCAddress:     node.RPCAddress,
+				FailureDomains: node.FailureDomains,
+			},
+			reporter: grpcx.NewCoordinatorReporterClient(node.ID, coordAddr, pool),
+		})
+	}
+
+	done := make(chan struct{})
+	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if _, err := admin.RoutingSnapshot(ctx); err != nil {
+					errCh <- err
+					return
+				}
+				if err := admin.EvaluateLiveness(ctx); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				for _, target := range targets {
+					if err := target.reporter.RegisterNode(ctx, target.reg); err != nil {
+						errCh <- err
+						return
+					}
+					if err := target.reporter.ReportNodeHeartbeat(ctx, storage.NodeStatus{
+						NodeID:       target.reg.NodeID,
+						ReplicaCount: 8,
+						ActiveCount:  8,
+					}); err != nil {
+						errCh <- err
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	close(done)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent gRPC control-plane traffic returned error: %v", err)
+		}
+	}
+
+	snapshot, err := admin.RoutingSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("RoutingSnapshot returned error: %v", err)
+	}
+	for _, route := range snapshot.Slots {
+		if !route.Readable || !route.Writable {
+			t.Fatalf("route %#v is not fully readable+writable", route)
+		}
+	}
+	for _, node := range nodes {
+		if !coordImpl.Current().Cluster.ReadyNodeIDs[node.ID] {
+			t.Fatalf("node %q not marked ready after concurrent heartbeats", node.ID)
+		}
+	}
+}
+
+func TestClientTransportReconnectsAcrossStorageServerRestart(t *testing.T) {
+	ctx := context.Background()
+	pool := grpcx.NewConnPool()
+	t.Cleanup(func() { _ = pool.Close() })
+
+	node := mustSingleReplicaNode(t, ctx, "node-a", storage.Config{NodeID: "node-a"}, storage.NewInMemoryCoordinatorClient(), storage.NewInMemoryReplicationTransport(), 7, 1)
+	address := mustReserveAddress(t)
+	server := mustStartStorageServerAt(t, node, address)
+
+	transport := grpcx.NewClientTransport(pool)
+	if _, err := transport.Put(ctx, address, storage.ClientPutRequest{
+		Slot:                 7,
+		Key:                  "alpha",
+		Value:                "one",
+		ExpectedChainVersion: 1,
+	}); err != nil {
+		t.Fatalf("initial Put returned error: %v", err)
+	}
+	_ = server.Close()
+	server = mustStartStorageServerAt(t, node, address)
+	defer func() { _ = server.Close() }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, err := transport.Put(ctx, address, storage.ClientPutRequest{
+			Slot:                 7,
+			Key:                  "alpha",
+			Value:                "two",
+			ExpectedChainVersion: 1,
+		})
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Put after restart returned error: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	result, err := transport.Get(ctx, address, storage.ClientGetRequest{
+		Slot:                 7,
+		Key:                  "alpha",
+		ExpectedChainVersion: 1,
+	})
+	if err != nil {
+		t.Fatalf("Get after restart returned error: %v", err)
+	}
+	if !result.Found || result.Value != "two" {
+		t.Fatalf("Get after restart = %#v, want value two", result)
+	}
+}
+
+func TestCoordinatorClientsReconnectAcrossCoordinatorRestart(t *testing.T) {
+	ctx := context.Background()
+	pool := grpcx.NewConnPool()
+	t.Cleanup(func() { _ = pool.Close() })
+
+	store := coordruntime.NewInMemoryStore()
+	address := mustReserveAddress(t)
+	service, server := mustStartCoordinatorAt(t, ctx, store, pool, address)
+
+	admin := grpcx.NewCoordinatorAdminClient(address, pool)
+	reporter := grpcx.NewCoordinatorReporterClient("n1", address, pool)
+	if _, err := admin.Bootstrap(ctx, coordruntime.Command{
+		ID:              "bootstrap",
+		ExpectedVersion: 0,
+		Kind:            coordruntime.CommandKindBootstrap,
+		Bootstrap: &coordruntime.BootstrapCommand{
+			Config: coordinator.Config{SlotCount: 1, ReplicationFactor: 1},
+		},
+	}); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	if err := reporter.RegisterNode(ctx, storage.NodeRegistration{
+		NodeID:         "n1",
+		RPCAddress:     "127.0.0.1:7411",
+		FailureDomains: map[string]string{"host": "h1"},
+	}); err != nil {
+		t.Fatalf("RegisterNode returned error: %v", err)
+	}
+	if err := reporter.ReportNodeHeartbeat(ctx, storage.NodeStatus{NodeID: "n1", ReplicaCount: 1, ActiveCount: 1}); err != nil {
+		t.Fatalf("ReportNodeHeartbeat returned error: %v", err)
+	}
+	_ = service.Close()
+	_ = server.Close()
+
+	service, server = mustStartCoordinatorAt(t, ctx, store, pool, address)
+	defer func() { _ = service.Close() }()
+	defer func() { _ = server.Close() }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err := reporter.ReportNodeHeartbeat(ctx, storage.NodeStatus{NodeID: "n1", ReplicaCount: 1, ActiveCount: 1})
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ReportNodeHeartbeat after restart returned error: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	snapshot, err := admin.RoutingSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("RoutingSnapshot after restart returned error: %v", err)
+	}
+	if got, want := snapshot.SlotCount, 1; got != want {
+		t.Fatalf("snapshot slot count after restart = %d, want %d", got, want)
+	}
+	if !server.Current().Cluster.ReadyNodeIDs["n1"] {
+		t.Fatalf("n1 not ready after restart heartbeat: %#v", server.Current().Cluster.ReadyNodeIDs)
 	}
 }
 
@@ -811,13 +1047,25 @@ func mustStartCoordinator(
 	pool *grpcx.ConnPool,
 ) (*grpcx.CoordinatorGRPCServer, string, *coordserver.Server) {
 	t.Helper()
+	address := mustReserveAddress(t)
+	service, server := mustStartCoordinatorAt(t, ctx, store, pool, address)
+	return service, address, server
+}
+
+func mustStartCoordinatorAt(
+	t *testing.T,
+	ctx context.Context,
+	store coordruntime.Store,
+	pool *grpcx.ConnPool,
+	address string,
+) (*grpcx.CoordinatorGRPCServer, *coordserver.Server) {
+	t.Helper()
 	server, err := coordserver.OpenWithConfig(ctx, store, nil, coordserver.ServerConfig{
 		NodeClientFactory: grpcx.NewDynamicNodeClientFactory(pool),
 	})
 	if err != nil {
 		t.Fatalf("OpenWithConfig returned error: %v", err)
 	}
-	address := mustReserveAddress(t)
 	lis, err := net.Listen("tcp", address)
 	if err != nil {
 		t.Fatalf("Listen returned error: %v", err)
@@ -828,7 +1076,7 @@ func mustStartCoordinator(
 			panic(err)
 		}
 	}()
-	return service, address, server
+	return service, server
 }
 
 func mustReserveAddress(t *testing.T) string {

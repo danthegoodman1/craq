@@ -13,6 +13,7 @@ type RenderedManifestParams struct {
 	SlotCount         int
 	ReplicationFactor int
 	PrivateIPs        map[string]string
+	NodeZones         map[string]string
 }
 
 func RenderManifest(params RenderedManifestParams) (quickstart.Config, error) {
@@ -30,25 +31,46 @@ func RenderManifest(params RenderedManifestParams) (quickstart.Config, error) {
 			ReplicationFactor: params.ReplicationFactor,
 		},
 		Nodes: []quickstart.Node{
-			renderNode("a", "storage-a", params.PrivateIPs["storage-a"], "az-a"),
-			renderNode("b", "storage-b", params.PrivateIPs["storage-b"], "az-b"),
-			renderNode("c", "storage-c", params.PrivateIPs["storage-c"], "az-c"),
+			renderNode("a", "storage-a", params.PrivateIPs["storage-a"], params.NodeZones["storage-a"], shouldExposeZoneFailureDomain(params)),
+			renderNode("b", "storage-b", params.PrivateIPs["storage-b"], params.NodeZones["storage-b"], shouldExposeZoneFailureDomain(params)),
+			renderNode("c", "storage-c", params.PrivateIPs["storage-c"], params.NodeZones["storage-c"], shouldExposeZoneFailureDomain(params)),
 		},
 	}
 	return cfg, cfg.Validate()
 }
 
-func renderNode(id string, key string, ip string, az string) quickstart.Node {
+func shouldExposeZoneFailureDomain(params RenderedManifestParams) bool {
+	if params.ReplicationFactor <= 1 {
+		return true
+	}
+	uniqueZones := map[string]struct{}{}
+	for _, key := range []string{"storage-a", "storage-b", "storage-c"} {
+		zone := params.NodeZones[key]
+		if zone == "" {
+			continue
+		}
+		uniqueZones[zone] = struct{}{}
+	}
+	return len(uniqueZones) >= params.ReplicationFactor
+}
+
+func renderNode(id string, key string, ip string, zone string, includeZone bool) quickstart.Node {
 	offset := map[string]int{"a": 11, "b": 12, "c": 13}[id]
+	failureDomains := map[string]string{
+		"host": key,
+		"rack": key,
+	}
+	if includeZone {
+		if zone == "" {
+			zone = "unknown-zone"
+		}
+		failureDomains["az"] = zone
+	}
 	return quickstart.Node{
 		ID:           id,
 		RPCAddress:   fmt.Sprintf("%s:74%02d", ip, offset),
 		AdminAddress: fmt.Sprintf("%s:75%02d", ip, offset),
-		FailureDomains: map[string]string{
-			"host": key,
-			"rack": key,
-			"az":   az,
-		},
+		FailureDomains: failureDomains,
 	}
 }
 

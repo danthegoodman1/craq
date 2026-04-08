@@ -134,6 +134,7 @@ type Command struct {
 type BootstrapCommand struct {
 	Config coordinator.Config
 	Nodes  []coordinator.Node
+	Policy coordinator.ReconfigurationPolicy
 }
 
 type ReconfigureCommand struct {
@@ -803,6 +804,7 @@ func cloneCommand(cmd Command) Command {
 		cloned.Bootstrap = &BootstrapCommand{
 			Config: cmd.Bootstrap.Config,
 			Nodes:  cloneNodes(cmd.Bootstrap.Nodes),
+			Policy: cmd.Bootstrap.Policy,
 		}
 	}
 	if cmd.Reconfigure != nil {
@@ -943,6 +945,9 @@ func cloneOutbox(current []OutboxEntry) []OutboxEntry {
 }
 
 func nextLastPolicy(current coordinator.ReconfigurationPolicy, cmd Command) coordinator.ReconfigurationPolicy {
+	if cmd.Kind == CommandKindBootstrap && cmd.Bootstrap != nil {
+		return cmd.Bootstrap.Policy
+	}
 	if cmd.Kind == CommandKindReconfigure && cmd.Reconfigure != nil {
 		return cmd.Reconfigure.Policy
 	}

@@ -109,6 +109,7 @@ type Clock interface {
 
 type ServerConfig struct {
 	LivenessPolicy         LivenessPolicy
+	ReconfigurationPolicy  coordinator.ReconfigurationPolicy
 	Clock                  Clock
 	DispatchTimeout        time.Duration
 	DispatchRetryInterval  time.Duration
@@ -125,13 +126,16 @@ type NodeClientFactory interface {
 
 type Server struct {
 	rt                     *coordruntime.Runtime
+	runtimeMu              sync.RWMutex
 	nodes                  map[string]StorageNodeClient
+	nodesMu                sync.RWMutex
 	heartbeats             map[string]storage.NodeStatus
 	liveness               map[string]coordruntime.NodeLivenessRecord
 	pending                map[int]PendingWork
 	completed              map[int][]coordruntime.CompletedProgressRecord
 	routingSnapshot        RoutingSnapshot
 	routingSnapshotMu      sync.RWMutex
+	viewMu                 sync.RWMutex
 	lastPolicy             coordinator.ReconfigurationPolicy
 	unavailableReplicas    map[string]map[int]bool
 	lastRecoveryReports    map[string]storage.NodeRecoveryReport
@@ -155,6 +159,7 @@ const (
 	defaultRecoveryCommandTimeout = 5 * time.Second
 	defaultFlapWindow             = 30 * time.Second
 	defaultFlapThreshold          = 3
+	runtimeVersionRetryLimit      = 1024
 )
 
 func Open(ctx context.Context, store coordruntime.Store, nodes map[string]StorageNodeClient) (*Server, error) {
@@ -190,6 +195,7 @@ func OpenWithConfig(
 		unavailableReplicas:    map[string]map[int]bool{},
 		lastRecoveryReports:    map[string]storage.NodeRecoveryReport{},
 		livenessPolicy:         normalizeLivenessPolicy(cfg.LivenessPolicy),
+		lastPolicy:             cfg.ReconfigurationPolicy,
 		clock:                  cfg.Clock,
 		dispatchTimeout:        cfg.DispatchTimeout,
 		dispatchRetryInterval:  cfg.DispatchRetryInterval,
@@ -213,6 +219,9 @@ func OpenWithConfig(
 		server.recoveryCommandTimeout = defaultRecoveryCommandTimeout
 	}
 	server.syncViewsFromRuntime()
+	if server.lastPolicy == (coordinator.ReconfigurationPolicy{}) && cfg.ReconfigurationPolicy != (coordinator.ReconfigurationPolicy{}) {
+		server.lastPolicy = cfg.ReconfigurationPolicy
+	}
 	server.rebuildRoutingSnapshot()
 	if cfg.HA != nil {
 		if err := server.enableHA(*cfg.HA); err != nil {
@@ -243,10 +252,12 @@ func (s *Server) Current() coordruntime.State {
 			s.syncFromHASnapshot(snapshot)
 		}
 	}
-	return s.rt.Current()
+	return s.currentState()
 }
 
 func (s *Server) Heartbeats() map[string]storage.NodeStatus {
+	s.viewMu.RLock()
+	defer s.viewMu.RUnlock()
 	cloned := make(map[string]storage.NodeStatus, len(s.heartbeats))
 	for nodeID, status := range s.heartbeats {
 		cloned[nodeID] = status
@@ -255,6 +266,8 @@ func (s *Server) Heartbeats() map[string]storage.NodeStatus {
 }
 
 func (s *Server) Liveness() map[string]coordruntime.NodeLivenessRecord {
+	s.viewMu.RLock()
+	defer s.viewMu.RUnlock()
 	cloned := make(map[string]coordruntime.NodeLivenessRecord, len(s.liveness))
 	for nodeID, record := range s.liveness {
 		cloned[nodeID] = cloneLivenessRecord(record)
@@ -263,11 +276,33 @@ func (s *Server) Liveness() map[string]coordruntime.NodeLivenessRecord {
 }
 
 func (s *Server) Pending() map[int]PendingWork {
+	s.viewMu.RLock()
+	defer s.viewMu.RUnlock()
 	cloned := make(map[int]PendingWork, len(s.pending))
 	for slot, pending := range s.pending {
 		cloned[slot] = pending
 	}
 	return cloned
+}
+
+func (s *Server) pendingWork(slot int) (PendingWork, bool) {
+	s.viewMu.RLock()
+	defer s.viewMu.RUnlock()
+	pending, ok := s.pending[slot]
+	return pending, ok
+}
+
+func (s *Server) completedRecords(slot int) []coordruntime.CompletedProgressRecord {
+	s.viewMu.RLock()
+	defer s.viewMu.RUnlock()
+	return append([]coordruntime.CompletedProgressRecord(nil), s.completed[slot]...)
+}
+
+func (s *Server) livenessRecord(nodeID string) (coordruntime.NodeLivenessRecord, bool) {
+	s.viewMu.RLock()
+	defer s.viewMu.RUnlock()
+	record, ok := s.liveness[nodeID]
+	return cloneLivenessRecord(record), ok
 }
 
 func (s *Server) RoutingSnapshot(ctx context.Context) (RoutingSnapshot, error) {
@@ -282,13 +317,16 @@ func (s *Server) RoutingSnapshot(ctx context.Context) (RoutingSnapshot, error) {
 }
 
 func (s *Server) clientForNodeID(nodeID string) (StorageNodeClient, error) {
+	s.nodesMu.RLock()
 	if client, ok := s.nodes[nodeID]; ok {
+		s.nodesMu.RUnlock()
 		return client, nil
 	}
+	s.nodesMu.RUnlock()
 	if s.nodeClientFactory == nil {
 		return nil, fmt.Errorf("%w: %q", ErrUnknownNode, nodeID)
 	}
-	node, ok := s.rt.Current().Cluster.NodesByID[nodeID]
+	node, ok := s.currentState().Cluster.NodesByID[nodeID]
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", ErrUnknownNode, nodeID)
 	}
@@ -296,7 +334,9 @@ func (s *Server) clientForNodeID(nodeID string) (StorageNodeClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("err in s.nodeClientFactory.ClientForNode: %w", err)
 	}
+	s.nodesMu.Lock()
 	s.nodes[nodeID] = client
+	s.nodesMu.Unlock()
 	return client, nil
 }
 
@@ -312,9 +352,10 @@ func (s *Server) Bootstrap(ctx context.Context, cmd coordruntime.Command) (coord
 		s.observeCommandResult("bootstrap", err)
 		return coordruntime.State{}, err
 	}
-	state, err := s.rt.Bootstrap(ctx, cmd)
+	rt := s.runtimeRef()
+	state, err := rt.Bootstrap(ctx, cmd)
 	if err != nil {
-		err = fmt.Errorf("err in s.rt.Bootstrap: %w", err)
+		err = fmt.Errorf("err in rt.Bootstrap: %w", err)
 		s.observeCommandResult("bootstrap", err)
 		s.observeTimeoutOrFailure("bootstrap", err)
 		return coordruntime.State{}, err
@@ -364,9 +405,9 @@ func (s *Server) ReportReplicaReady(ctx context.Context, nodeID string, slot int
 		})
 	}
 	defer s.refreshMetricGauges()
-	state := s.rt.Current()
+	state := s.currentState()
 	slotVersion := state.SlotVersions[slot]
-	pending, ok := s.pending[slot]
+	pending, ok := s.pendingWork(slot)
 	if !ok || pending.Kind != pendingKindReady || pending.NodeID != nodeID {
 		if s.matchesCompleted(slot, nodeID, pendingKindReady, slotVersion, commandID) {
 			return state, nil
@@ -416,7 +457,8 @@ func (s *Server) ReportReplicaReady(ctx context.Context, nodeID string, slot int
 	if progressID == "" {
 		progressID = fmt.Sprintf("server-progress-ready-%s-%d-v%d", nodeID, slot, state.Version)
 	}
-	if _, err := s.rt.ApplyProgress(ctx, coordruntime.Command{
+	rt := s.runtimeRef()
+	if _, err := rt.ApplyProgress(ctx, coordruntime.Command{
 		ID:              progressID,
 		ExpectedVersion: state.Version,
 		Kind:            coordruntime.CommandKindProgress,
@@ -428,7 +470,7 @@ func (s *Server) ReportReplicaReady(ctx context.Context, nodeID string, slot int
 			},
 		},
 	}); err != nil {
-		return coordruntime.State{}, fmt.Errorf("err in s.rt.ApplyProgress: %w", err)
+		return coordruntime.State{}, fmt.Errorf("err in rt.ApplyProgress: %w", err)
 	}
 	s.syncViewsFromRuntime()
 	s.rebuildRoutingSnapshot()
@@ -442,7 +484,7 @@ func (s *Server) ReportReplicaReady(ctx context.Context, nodeID string, slot int
 		}
 	}
 	s.events.record(s.logger, zerolog.InfoLevel, "replica_ready", "coordinator accepted replica ready progress", nodeID, ops.IntPtr(slot), ops.Uint64Ptr(slotVersion), "", commandID, nil)
-	return s.rt.Current(), nil
+	return s.currentState(), nil
 }
 
 func (s *Server) ReportReplicaRemoved(ctx context.Context, nodeID string, slot int, epoch uint64, commandID string) (coordruntime.State, error) {
@@ -452,9 +494,9 @@ func (s *Server) ReportReplicaRemoved(ctx context.Context, nodeID string, slot i
 		})
 	}
 	defer s.refreshMetricGauges()
-	state := s.rt.Current()
+	state := s.currentState()
 	slotVersion := state.SlotVersions[slot]
-	pending, ok := s.pending[slot]
+	pending, ok := s.pendingWork(slot)
 	if !ok || pending.Kind != pendingKindRemoved || pending.NodeID != nodeID {
 		if s.matchesCompleted(slot, nodeID, pendingKindRemoved, slotVersion, commandID) {
 			return state, nil
@@ -504,7 +546,8 @@ func (s *Server) ReportReplicaRemoved(ctx context.Context, nodeID string, slot i
 	if progressID == "" {
 		progressID = fmt.Sprintf("server-progress-removed-%s-%d-v%d", nodeID, slot, state.Version)
 	}
-	updated, err := s.rt.ApplyProgress(ctx, coordruntime.Command{
+	rt := s.runtimeRef()
+	updated, err := rt.ApplyProgress(ctx, coordruntime.Command{
 		ID:              progressID,
 		ExpectedVersion: state.Version,
 		Kind:            coordruntime.CommandKindProgress,
@@ -517,7 +560,7 @@ func (s *Server) ReportReplicaRemoved(ctx context.Context, nodeID string, slot i
 		},
 	})
 	if err != nil {
-		return coordruntime.State{}, fmt.Errorf("err in s.rt.ApplyProgress: %w", err)
+		return coordruntime.State{}, fmt.Errorf("err in rt.ApplyProgress: %w", err)
 	}
 	s.syncViewsFromRuntime()
 	s.rebuildRoutingSnapshot()
@@ -540,14 +583,14 @@ func (s *Server) ReportNodeHeartbeat(ctx context.Context, status storage.NodeSta
 			if err := planner.ReportNodeHeartbeat(ctx, status); err != nil {
 				return coordruntime.State{}, err
 			}
-			return planner.rt.Current(), nil
+			return planner.currentState(), nil
 		})
 		return err
 	}
-	if _, ok := s.rt.Current().Cluster.NodesByID[status.NodeID]; !ok {
+	if _, ok := s.currentState().Cluster.NodesByID[status.NodeID]; !ok {
 		return fmt.Errorf("%w: %q", ErrUnknownNode, status.NodeID)
 	}
-	current := s.rt.Current()
+	current := s.currentState()
 	currentRecord, hadCurrentRecord := current.NodeLivenessByID[status.NodeID]
 	wasDead := currentRecord.State == coordruntime.NodeLivenessStateDead ||
 		nodeMarkedDead(current.Cluster, status.NodeID)
@@ -558,18 +601,21 @@ func (s *Server) ReportNodeHeartbeat(ctx context.Context, status storage.NodeSta
 		return fmt.Errorf("%w: %q", ErrUnknownNode, status.NodeID)
 	}
 	observedAt := s.clock.Now().UnixNano()
-	_, err := s.rt.Heartbeat(ctx, coordruntime.Command{
-		ID:              fmt.Sprintf("server-heartbeat-%s-%d", status.NodeID, observedAt),
-		ExpectedVersion: s.rt.Current().Version,
-		Kind:            coordruntime.CommandKindHeartbeat,
-		Heartbeat: &coordruntime.HeartbeatCommand{
-			Status:             status,
-			ObservedAtUnixNano: observedAt,
-			FlapWindowNanos:    s.livenessPolicy.FlapWindow.Nanoseconds(),
-		},
+	rt := s.runtimeRef()
+	_, err := retryOnRuntimeVersionMismatch(ctx, rt, func(current coordruntime.State, attempt int) (coordruntime.State, error) {
+		return rt.Heartbeat(ctx, coordruntime.Command{
+			ID:              fmt.Sprintf("server-heartbeat-%s-%d-r%d-v%d", status.NodeID, observedAt, attempt, current.Version),
+			ExpectedVersion: current.Version,
+			Kind:            coordruntime.CommandKindHeartbeat,
+			Heartbeat: &coordruntime.HeartbeatCommand{
+				Status:             status,
+				ObservedAtUnixNano: observedAt,
+				FlapWindowNanos:    s.livenessPolicy.FlapWindow.Nanoseconds(),
+			},
+		})
 	})
 	if err != nil {
-		err = fmt.Errorf("err in s.rt.Heartbeat: %w", err)
+		err = fmt.Errorf("err in rt.Heartbeat: %w", err)
 		s.observeTimeoutOrFailure("heartbeat", err)
 		return err
 	}
@@ -582,7 +628,7 @@ func (s *Server) ReportNodeHeartbeat(ctx context.Context, status storage.NodeSta
 			return err
 		}
 	}
-	if wasDead && s.liveness[status.NodeID].State != coordruntime.NodeLivenessStateDead {
+	if currentLiveness, ok := s.livenessRecord(status.NodeID); wasDead && ok && currentLiveness.State != coordruntime.NodeLivenessStateDead {
 		deadActionFired := hadCurrentRecord && currentRecord.DeadActionFired
 		if nodeMarkedDead(current.Cluster, status.NodeID) {
 			deadActionFired = true
@@ -602,7 +648,7 @@ func (s *Server) EvaluateLiveness(ctx context.Context) error {
 			if err := planner.EvaluateLiveness(ctx); err != nil {
 				return coordruntime.State{}, err
 			}
-			return planner.rt.Current(), nil
+			return planner.currentState(), nil
 		})
 		return err
 	}
@@ -614,14 +660,15 @@ func (s *Server) EvaluateLiveness(ctx context.Context) error {
 	}
 	nowUnix := s.clock.Now().UnixNano()
 
-	nodeIDs := make([]string, 0, len(s.liveness))
-	for nodeID := range s.liveness {
+	liveness := s.Liveness()
+	nodeIDs := make([]string, 0, len(liveness))
+	for nodeID := range liveness {
 		nodeIDs = append(nodeIDs, nodeID)
 	}
 	sort.Strings(nodeIDs)
 
 	for _, nodeID := range nodeIDs {
-		record := s.liveness[nodeID]
+		record := liveness[nodeID]
 		age := time.Duration(nowUnix - record.LastHeartbeatUnixNano)
 		target := record.State
 		switch {
@@ -662,10 +709,11 @@ func (s *Server) EvaluateLiveness(ctx context.Context) error {
 		}
 
 		if record.State == coordruntime.NodeLivenessStateDead && !record.DeadActionFired {
-			if len(s.pending) > 0 {
+			if len(s.Pending()) > 0 {
 				continue
 			}
-			if nodeMarkedDead(s.rt.Current().Cluster, nodeID) || !isRuntimeInitialized(s.rt.Current()) {
+			currentState := s.currentState()
+			if nodeMarkedDead(currentState.Cluster, nodeID) || !isRuntimeInitialized(currentState) {
 				updated, err := s.applyLivenessTransition(ctx, nodeID, coordruntime.NodeLivenessStateDead, nowUnix, true)
 				if err != nil {
 					return err
@@ -675,16 +723,17 @@ func (s *Server) EvaluateLiveness(ctx context.Context) error {
 				continue
 			}
 
+			currentState = s.currentState()
 			if _, err := s.MarkNodeDead(ctx, coordruntime.Command{
-				ID:              fmt.Sprintf("server-auto-dead-%s-v%d", nodeID, s.rt.Current().Version),
-				ExpectedVersion: s.rt.Current().Version,
+				ID:              fmt.Sprintf("server-auto-dead-%s-v%d", nodeID, currentState.Version),
+				ExpectedVersion: currentState.Version,
 				Kind:            coordruntime.CommandKindReconfigure,
 				Reconfigure: &coordruntime.ReconfigureCommand{
 					Events: []coordinator.Event{{
 						Kind:   coordinator.EventKindMarkNodeDead,
 						NodeID: nodeID,
 					}},
-					Policy: s.lastPolicy,
+					Policy: s.reconfigurationPolicy(),
 				},
 			}); err != nil {
 				return fmt.Errorf("err in s.MarkNodeDead: %w", err)
@@ -705,24 +754,27 @@ func (s *Server) ReportNodeRecovered(ctx context.Context, report storage.NodeRec
 			if err := planner.ReportNodeRecovered(ctx, report); err != nil {
 				return coordruntime.State{}, err
 			}
-			return planner.rt.Current(), nil
+			return planner.currentState(), nil
 		})
 		return err
 	}
 	defer s.refreshMetricGauges()
-	if _, ok := s.rt.Current().Cluster.NodesByID[report.NodeID]; !ok {
-		if _, fallbackOK := s.nodes[report.NodeID]; !fallbackOK {
+	if _, ok := s.currentState().Cluster.NodesByID[report.NodeID]; !ok {
+		s.nodesMu.RLock()
+		_, fallbackOK := s.nodes[report.NodeID]
+		s.nodesMu.RUnlock()
+		if !fallbackOK {
 			return fmt.Errorf("%w: %q", ErrUnknownNode, report.NodeID)
 		}
 	}
-	if prior, ok := s.lastRecoveryReports[report.NodeID]; ok && reflect.DeepEqual(prior, report) && !s.nodeHasUnavailableSlots(report.NodeID) {
+	if prior, ok := s.lastRecoveryReport(report.NodeID); ok && reflect.DeepEqual(prior, report) && !s.nodeHasUnavailableSlots(report.NodeID) {
 		return nil
 	}
 
 	reportSlots := make(map[int]storage.RecoveredReplica, len(report.Replicas))
 	s.markUnavailableReplicas(report)
 
-	state := s.rt.Current()
+	state := s.currentState()
 	for _, recovered := range report.Replicas {
 		reportSlots[recovered.Assignment.Slot] = recovered
 		currentAssignment, ok := currentAssignmentForNode(state, report.NodeID, recovered.Assignment.Slot)
@@ -754,14 +806,16 @@ func (s *Server) ReportNodeRecovered(ctx context.Context, report storage.NodeRec
 		}
 	}
 
+	s.viewMu.Lock()
 	s.lastRecoveryReports[report.NodeID] = cloneRecoveryReport(report)
+	s.viewMu.Unlock()
 	s.rebuildRoutingSnapshot()
 	s.events.record(s.logger, zerolog.InfoLevel, "node_recovered_report", "coordinator processed node recovered report", report.NodeID, nil, nil, "", "", nil)
 	return nil
 }
 
 func (s *Server) RegisterNode(ctx context.Context, reg storage.NodeRegistration) (coordruntime.State, error) {
-	current := s.rt.Current()
+	current := s.currentState()
 	if existing, ok := current.Cluster.NodesByID[reg.NodeID]; ok &&
 		current.Cluster.NodeHealthByID[reg.NodeID] != coordinator.NodeHealthDead &&
 		existing.RPCAddress == reg.RPCAddress &&
@@ -773,22 +827,31 @@ func (s *Server) RegisterNode(ctx context.Context, reg storage.NodeRegistration)
 			return planner.RegisterNode(ctx, reg)
 		})
 	}
-	return s.applyMembershipMutation(ctx, coordruntime.Command{
-		ID:              fmt.Sprintf("server-register-%s-v%d", reg.NodeID, s.rt.Current().Version),
-		ExpectedVersion: s.rt.Current().Version,
-		Kind:            coordruntime.CommandKindReconfigure,
-		Reconfigure: &coordruntime.ReconfigureCommand{
-			Policy: s.lastPolicy,
-			Events: []coordinator.Event{{
-				Kind: coordinator.EventKindRegisterNode,
-				Node: coordinator.Node{
-					ID:             reg.NodeID,
-					RPCAddress:     reg.RPCAddress,
-					FailureDomains: cloneFailureDomains(reg.FailureDomains),
-				},
-			}},
-		},
-	}, coordinator.EventKindRegisterNode)
+	rt := s.runtimeRef()
+	return retryOnRuntimeVersionMismatch(ctx, rt, func(current coordruntime.State, attempt int) (coordruntime.State, error) {
+		if existing, ok := current.Cluster.NodesByID[reg.NodeID]; ok &&
+			current.Cluster.NodeHealthByID[reg.NodeID] != coordinator.NodeHealthDead &&
+			existing.RPCAddress == reg.RPCAddress &&
+			reflect.DeepEqual(existing.FailureDomains, reg.FailureDomains) {
+			return current, nil
+		}
+		return s.applyMembershipMutation(ctx, coordruntime.Command{
+			ID:              fmt.Sprintf("server-register-%s-r%d-v%d", reg.NodeID, attempt, current.Version),
+			ExpectedVersion: current.Version,
+			Kind:            coordruntime.CommandKindReconfigure,
+			Reconfigure: &coordruntime.ReconfigureCommand{
+				Policy: s.reconfigurationPolicy(),
+				Events: []coordinator.Event{{
+					Kind: coordinator.EventKindRegisterNode,
+					Node: coordinator.Node{
+						ID:             reg.NodeID,
+						RPCAddress:     reg.RPCAddress,
+						FailureDomains: cloneFailureDomains(reg.FailureDomains),
+					},
+				}},
+			},
+		}, coordinator.EventKindRegisterNode)
+	})
 }
 
 func (s *Server) applyMembershipMutation(
@@ -812,9 +875,10 @@ func (s *Server) applyMembershipMutation(
 		return coordruntime.State{}, err
 	}
 
-	plan, state, err := s.rt.Reconfigure(ctx, cmd)
+	rt := s.runtimeRef()
+	plan, state, err := rt.Reconfigure(ctx, cmd)
 	if err != nil {
-		err = fmt.Errorf("err in s.rt.Reconfigure: %w", err)
+		err = fmt.Errorf("err in rt.Reconfigure: %w", err)
 		s.observeCommandResult(string(expectedEvent), err)
 		s.observeTimeoutOrFailure(string(expectedEvent), err)
 		return coordruntime.State{}, err
@@ -840,27 +904,32 @@ func (s *Server) applyMembershipMutation(
 }
 
 func (s *Server) reconcileAndDispatch(ctx context.Context) error {
-	current := s.rt.Current()
-	preview, err := coordinator.PlanReconfiguration(current.Cluster, nil, s.lastPolicy)
-	if err != nil {
-		return fmt.Errorf("err in coordinator.PlanReconfiguration preview: %w", err)
-	}
-	if len(preview.ChangedSlots) == 0 && reflect.DeepEqual(preview.UpdatedState, current.Cluster) {
-		return nil
-	}
+	rt := s.runtimeRef()
+	_, err := retryOnRuntimeVersionMismatch(ctx, rt, func(current coordruntime.State, attempt int) (coordruntime.State, error) {
+		preview, err := coordinator.PlanReconfiguration(current.Cluster, nil, s.reconfigurationPolicy())
+		if err != nil {
+			return coordruntime.State{}, fmt.Errorf("err in coordinator.PlanReconfiguration preview: %w", err)
+		}
+		if len(preview.ChangedSlots) == 0 && reflect.DeepEqual(preview.UpdatedState, current.Cluster) {
+			return current, nil
+		}
 
-	cmd := coordruntime.Command{
-		ID:              fmt.Sprintf("server-reconcile-v%d", current.Version),
-		ExpectedVersion: current.Version,
-		Kind:            coordruntime.CommandKindReconfigure,
-		Reconfigure: &coordruntime.ReconfigureCommand{
-			Events: nil,
-			Policy: s.lastPolicy,
-		},
-	}
-	_, _, err = s.rt.Reconfigure(ctx, cmd)
+		_, next, err := rt.Reconfigure(ctx, coordruntime.Command{
+			ID:              fmt.Sprintf("server-reconcile-r%d-v%d", attempt, current.Version),
+			ExpectedVersion: current.Version,
+			Kind:            coordruntime.CommandKindReconfigure,
+			Reconfigure: &coordruntime.ReconfigureCommand{
+				Events: nil,
+				Policy: s.reconfigurationPolicy(),
+			},
+		})
+		if err != nil {
+			return coordruntime.State{}, err
+		}
+		return next, nil
+	})
 	if err != nil {
-		return fmt.Errorf("err in s.rt.Reconcile: %w", err)
+		return fmt.Errorf("err in rt.Reconcile: %w", err)
 	}
 	s.syncViewsFromRuntime()
 	s.rebuildRoutingSnapshot()
@@ -888,20 +957,23 @@ func (s *Server) startDispatchLoop() {
 }
 
 func (s *Server) dispatchRuntimeOutbox(ctx context.Context) error {
-	entries := cloneRuntimeOutbox(s.rt.Current().Outbox)
+	entries := cloneRuntimeOutbox(s.currentState().Outbox)
 	for _, entry := range entries {
 		if err := s.dispatchRuntimeOutboxEntry(ctx, entry); err != nil {
 			return err
 		}
-		if _, err := s.rt.AcknowledgeOutbox(ctx, coordruntime.Command{
-			ID:              fmt.Sprintf("server-ack-outbox-%s-v%d", entry.ID, s.rt.Current().Version),
-			ExpectedVersion: s.rt.Current().Version,
-			Kind:            coordruntime.CommandKindAcknowledgeOutbox,
-			AcknowledgeOutbox: &coordruntime.AcknowledgeOutboxCommand{
-				EntryID: entry.ID,
-			},
+		rt := s.runtimeRef()
+		if _, err := retryOnRuntimeVersionMismatch(ctx, rt, func(current coordruntime.State, attempt int) (coordruntime.State, error) {
+			return rt.AcknowledgeOutbox(ctx, coordruntime.Command{
+				ID:              fmt.Sprintf("server-ack-outbox-%s-r%d-v%d", entry.ID, attempt, current.Version),
+				ExpectedVersion: current.Version,
+				Kind:            coordruntime.CommandKindAcknowledgeOutbox,
+				AcknowledgeOutbox: &coordruntime.AcknowledgeOutboxCommand{
+					EntryID: entry.ID,
+				},
+			})
 		}); err != nil {
-			return fmt.Errorf("err in s.rt.AcknowledgeOutbox: %w", err)
+			return fmt.Errorf("err in rt.AcknowledgeOutbox: %w", err)
 		}
 		s.syncViewsFromRuntime()
 	}
@@ -969,10 +1041,13 @@ func runtimeOutboxHasSlot(entries []coordruntime.OutboxEntry, slot int) bool {
 }
 
 func (s *Server) shouldDispatchActivePeerRefresh(slot int) bool {
-	if _, ok := s.pending[slot]; ok {
+	s.viewMu.RLock()
+	_, pending := s.pending[slot]
+	s.viewMu.RUnlock()
+	if pending {
 		return false
 	}
-	return !runtimeOutboxHasSlot(s.rt.Current().Outbox, slot)
+	return !runtimeOutboxHasSlot(s.currentState().Outbox, slot)
 }
 
 func (s *Server) resumeRecoveredReplica(
@@ -1012,7 +1087,7 @@ func (s *Server) recoverReplica(
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrRecoveryFailed, err)
 	}
-	if _, ok := s.rt.Current().Cluster.NodesByID[sourceNodeID]; !ok {
+	if _, ok := s.currentState().Cluster.NodesByID[sourceNodeID]; !ok {
 		return fmt.Errorf("%w: %w: %q", ErrRecoveryFailed, ErrUnknownNode, sourceNodeID)
 	}
 	dispatchCtx, cancel := deriveDeadlineContext(ctx, s.recoveryCommandTimeout)
@@ -1057,7 +1132,7 @@ func (s *Server) dropRecoveredReplica(ctx context.Context, nodeID string, slot i
 }
 
 func (s *Server) dispatchActivePeerUpdates(ctx context.Context, slot int) error {
-	state := s.rt.Current()
+	state := s.currentState()
 	var chain *coordinator.Chain
 	for i := range state.Cluster.Chains {
 		if state.Cluster.Chains[i].Slot == slot {
@@ -1172,7 +1247,10 @@ func activeAfterNodeIDs(chain coordinator.Chain, skipped map[string]bool) []stri
 }
 
 func (s *Server) rebuildRoutingSnapshot() {
-	state := s.rt.Current()
+	state := s.currentState()
+	s.viewMu.RLock()
+	unavailable := cloneUnavailableReplicasMap(s.unavailableReplicas)
+	s.viewMu.RUnlock()
 	snapshot := RoutingSnapshot{
 		Version:   state.Version,
 		SlotCount: state.Cluster.SlotCount,
@@ -1183,7 +1261,7 @@ func (s *Server) rebuildRoutingSnapshot() {
 			Slot:         chain.Slot,
 			ChainVersion: state.SlotVersions[chain.Slot],
 		}
-		if chainHasUnavailableReplica(chain, s.unavailableReplicas) {
+		if chainHasUnavailableReplica(chain, unavailable) {
 			snapshot.Slots = append(snapshot.Slots, route)
 			continue
 		}
@@ -1191,7 +1269,7 @@ func (s *Server) rebuildRoutingSnapshot() {
 			if replica.State != coordinator.ReplicaStateActive {
 				continue
 			}
-			if s.replicaUnavailable(replica.NodeID, chain.Slot) {
+			if replicaUnavailable(unavailable, replica.NodeID, chain.Slot) {
 				continue
 			}
 			role := storage.ReplicaRoleMiddle
@@ -1246,8 +1324,8 @@ func cloneRoutingSnapshot(snapshot RoutingSnapshot) RoutingSnapshot {
 }
 
 func (s *Server) matchesCompleted(slot int, nodeID string, kind pendingKind, slotVersion uint64, _ string) bool {
-	records, ok := s.completed[slot]
-	if !ok {
+	records := s.completedRecords(slot)
+	if len(records) == 0 {
 		return false
 	}
 	matches := 0
@@ -1316,6 +1394,7 @@ func slotContainsReplicaInState(
 }
 
 func (s *Server) markUnavailableReplicas(report storage.NodeRecoveryReport) {
+	s.viewMu.Lock()
 	slots := s.unavailableReplicas[report.NodeID]
 	if slots == nil {
 		slots = map[int]bool{}
@@ -1324,23 +1403,27 @@ func (s *Server) markUnavailableReplicas(report storage.NodeRecoveryReport) {
 	for _, replica := range report.Replicas {
 		slots[replica.Assignment.Slot] = true
 	}
+	s.viewMu.Unlock()
 	s.rebuildRoutingSnapshot()
 }
 
 func (s *Server) clearUnavailable(nodeID string, slot int) {
+	s.viewMu.Lock()
 	slots, ok := s.unavailableReplicas[nodeID]
 	if !ok {
+		s.viewMu.Unlock()
 		return
 	}
 	delete(slots, slot)
 	if len(slots) == 0 {
 		delete(s.unavailableReplicas, nodeID)
 	}
+	s.viewMu.Unlock()
 	s.rebuildRoutingSnapshot()
 }
 
-func (s *Server) replicaUnavailable(nodeID string, slot int) bool {
-	slots, ok := s.unavailableReplicas[nodeID]
+func replicaUnavailable(unavailable map[string]map[int]bool, nodeID string, slot int) bool {
+	slots, ok := unavailable[nodeID]
 	if !ok {
 		return false
 	}
@@ -1348,6 +1431,8 @@ func (s *Server) replicaUnavailable(nodeID string, slot int) bool {
 }
 
 func (s *Server) nodeHasUnavailableSlots(nodeID string) bool {
+	s.viewMu.RLock()
+	defer s.viewMu.RUnlock()
 	slots, ok := s.unavailableReplicas[nodeID]
 	return ok && len(slots) > 0
 }
@@ -1450,28 +1535,54 @@ func (s *Server) applyLivenessTransition(
 	evaluatedAtUnixNano int64,
 	deadActionFired bool,
 ) (coordruntime.NodeLivenessRecord, error) {
-	current := s.rt.Current()
-	if _, err := s.rt.ApplyLiveness(ctx, coordruntime.Command{
-		ID:              fmt.Sprintf("server-liveness-%s-%s-%d-%t-v%d", nodeID, state, evaluatedAtUnixNano, deadActionFired, current.Version),
-		ExpectedVersion: current.Version,
-		Kind:            coordruntime.CommandKindLiveness,
-		Liveness: &coordruntime.LivenessCommand{
-			NodeID:              nodeID,
-			State:               state,
-			EvaluatedAtUnixNano: evaluatedAtUnixNano,
-			DeadActionFired:     deadActionFired,
-			FlapWindowNanos:     s.livenessPolicy.FlapWindow.Nanoseconds(),
-		},
+	rt := s.runtimeRef()
+	if _, err := retryOnRuntimeVersionMismatch(ctx, rt, func(current coordruntime.State, attempt int) (coordruntime.State, error) {
+		return rt.ApplyLiveness(ctx, coordruntime.Command{
+			ID:              fmt.Sprintf("server-liveness-%s-%s-%d-%t-r%d-v%d", nodeID, state, evaluatedAtUnixNano, deadActionFired, attempt, current.Version),
+			ExpectedVersion: current.Version,
+			Kind:            coordruntime.CommandKindLiveness,
+			Liveness: &coordruntime.LivenessCommand{
+				NodeID:              nodeID,
+				State:               state,
+				EvaluatedAtUnixNano: evaluatedAtUnixNano,
+				DeadActionFired:     deadActionFired,
+				FlapWindowNanos:     s.livenessPolicy.FlapWindow.Nanoseconds(),
+			},
+		})
 	}); err != nil {
-		return coordruntime.NodeLivenessRecord{}, fmt.Errorf("err in s.rt.ApplyLiveness: %w", err)
+		return coordruntime.NodeLivenessRecord{}, fmt.Errorf("err in rt.ApplyLiveness: %w", err)
 	}
 	s.syncViewsFromRuntime()
 	s.rebuildRoutingSnapshot()
-	return cloneLivenessRecord(s.liveness[nodeID]), nil
+	record, _ := s.livenessRecord(nodeID)
+	return record, nil
+}
+
+func retryOnRuntimeVersionMismatch[T any](
+	ctx context.Context,
+	rt *coordruntime.Runtime,
+	op func(current coordruntime.State, attempt int) (T, error),
+) (T, error) {
+	var zero T
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return zero, err
+		}
+		value, err := op(rt.Current(), attempt)
+		if err == nil {
+			return value, nil
+		}
+		if !errors.Is(err, coordruntime.ErrVersionMismatch) || attempt >= runtimeVersionRetryLimit {
+			return zero, err
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (s *Server) syncViewsFromRuntime() {
-	current := s.rt.Current()
+	current := s.currentState()
+	s.viewMu.Lock()
+	defer s.viewMu.Unlock()
 	s.heartbeats = make(map[string]storage.NodeStatus, len(current.NodeLivenessByID))
 	s.liveness = make(map[string]coordruntime.NodeLivenessRecord, len(current.NodeLivenessByID))
 	s.pending = make(map[int]PendingWork, len(current.PendingBySlot))
@@ -1495,6 +1606,49 @@ func (s *Server) syncViewsFromRuntime() {
 	s.lastPolicy = current.LastPolicy
 }
 
+func (s *Server) runtimeRef() *coordruntime.Runtime {
+	s.runtimeMu.RLock()
+	defer s.runtimeMu.RUnlock()
+	return s.rt
+}
+
+func (s *Server) currentState() coordruntime.State {
+	s.runtimeMu.RLock()
+	defer s.runtimeMu.RUnlock()
+	return s.rt.Current()
+}
+
+func (s *Server) replaceRuntime(rt *coordruntime.Runtime) {
+	s.runtimeMu.Lock()
+	s.rt = rt
+	s.runtimeMu.Unlock()
+}
+
+func (s *Server) reconfigurationPolicy() coordinator.ReconfigurationPolicy {
+	s.viewMu.RLock()
+	defer s.viewMu.RUnlock()
+	return s.lastPolicy
+}
+
+func (s *Server) lastRecoveryReport(nodeID string) (storage.NodeRecoveryReport, bool) {
+	s.viewMu.RLock()
+	defer s.viewMu.RUnlock()
+	report, ok := s.lastRecoveryReports[nodeID]
+	return cloneRecoveryReport(report), ok
+}
+
+func cloneUnavailableReplicasMap(unavailable map[string]map[int]bool) map[string]map[int]bool {
+	cloned := make(map[string]map[int]bool, len(unavailable))
+	for nodeID, slots := range unavailable {
+		nodeSlots := make(map[int]bool, len(slots))
+		for slot, value := range slots {
+			nodeSlots[slot] = value
+		}
+		cloned[nodeID] = nodeSlots
+	}
+	return cloned
+}
+
 func validateServerConfig(cfg ServerConfig) error {
 	if cfg.LivenessPolicy.SuspectAfter < 0 || cfg.LivenessPolicy.DeadAfter < 0 || cfg.LivenessPolicy.FlapWindow < 0 {
 		return fmt.Errorf("%w: liveness durations must be >= 0", ErrInvalidServerConfig)
@@ -1510,6 +1664,9 @@ func validateServerConfig(cfg ServerConfig) error {
 	}
 	if cfg.DispatchTimeout < 0 {
 		return fmt.Errorf("%w: dispatch timeout must be >= 0", ErrInvalidServerConfig)
+	}
+	if cfg.ReconfigurationPolicy.MaxChangedChains < 0 {
+		return fmt.Errorf("%w: max changed chains must be >= 0", ErrInvalidServerConfig)
 	}
 	if cfg.DispatchRetryInterval < 0 {
 		return fmt.Errorf("%w: dispatch retry interval must be >= 0", ErrInvalidServerConfig)

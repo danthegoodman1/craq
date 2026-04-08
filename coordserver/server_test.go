@@ -37,6 +37,23 @@ func TestBootstrapCreatesCoordinatorStateAndDispatchesNothing(t *testing.T) {
 	}
 }
 
+func TestOpenWithConfigSeedsReconfigurationPolicy(t *testing.T) {
+	server, err := OpenWithConfig(context.Background(), coordruntime.NewInMemoryStore(), nil, ServerConfig{
+		Clock: &fakeClock{now: time.Unix(1, 0)},
+		ReconfigurationPolicy: coordinator.ReconfigurationPolicy{
+			MaxChangedChains: 32,
+		},
+	})
+	if err != nil {
+		t.Fatalf("OpenWithConfig returned error: %v", err)
+	}
+	defer func() { _ = server.Close() }()
+
+	if got, want := server.lastPolicy.MaxChangedChains, 32; got != want {
+		t.Fatalf("server.lastPolicy.MaxChangedChains = %d, want %d", got, want)
+	}
+}
+
 func TestBootstrapFailsCleanlyOnInvalidConfig(t *testing.T) {
 	server := mustOpenServer(t, nil)
 	_, err := server.Bootstrap(context.Background(), coordruntime.Command{

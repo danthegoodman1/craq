@@ -50,18 +50,20 @@ func runCommand(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	runDir, err := benchmark.RunBenchmark(context.Background(), benchmark.RunOptions{
-		ProfilePath:     *profile,
-		Region:          *region,
-		Topology:        *topology,
-		ClientPlacement: *clientPlacement,
-		RunName:         *runName,
+	return benchmark.RunSignalContext(func(ctx context.Context) error {
+		runDir, err := benchmark.RunBenchmark(ctx, benchmark.RunOptions{
+			ProfilePath:     *profile,
+			Region:          *region,
+			Topology:        *topology,
+			ClientPlacement: *clientPlacement,
+			RunName:         *runName,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Println(runDir)
+		return nil
 	})
-	if err != nil {
-		return err
-	}
-	fmt.Println(runDir)
-	return nil
 }
 
 func destroyCommand(args []string) error {
@@ -73,7 +75,9 @@ func destroyCommand(args []string) error {
 	if *runDir == "" {
 		return fmt.Errorf("destroy requires --run-dir")
 	}
-	return benchmark.DestroyBenchmark(context.Background(), benchmark.DestroyOptions{RunDir: *runDir})
+	return benchmark.RunSignalContext(func(ctx context.Context) error {
+		return benchmark.DestroyBenchmark(ctx, benchmark.DestroyOptions{RunDir: *runDir})
+	})
 }
 
 func analyzeCommand(args []string) error {
@@ -131,8 +135,10 @@ func loadgenCommand(args []string) error {
 	if err := benchmark.LoadJSON(*configPath, &cfg); err != nil {
 		return err
 	}
-	_, err := benchmark.RunLoadGen(context.Background(), cfg)
-	return err
+	return benchmark.RunSignalContext(func(ctx context.Context) error {
+		_, err := benchmark.RunLoadGen(ctx, cfg)
+		return err
+	})
 }
 
 func probeCommand(args []string) error {
@@ -162,6 +168,8 @@ func collectCommand(args []string) error {
 	if err := benchmark.LoadJSON(*configPath, &cfg); err != nil {
 		return err
 	}
-	_, err := benchmark.CollectArtifacts(context.Background(), cfg)
-	return err
+	return benchmark.RunSignalContext(func(ctx context.Context) error {
+		_, err := benchmark.CollectArtifacts(ctx, cfg)
+		return err
+	})
 }

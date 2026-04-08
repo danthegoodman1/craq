@@ -22,11 +22,12 @@ import (
 )
 
 type CoordinatorProcessConfig struct {
-	ManifestPath string                     `json:"manifest_path"`
-	DataDir      string                     `json:"data_dir"`
-	Liveness     coordserver.LivenessPolicy `json:"liveness"`
-	TickInterval time.Duration              `json:"tick_interval"`
-	RPCDeadline  time.Duration              `json:"rpc_deadline"`
+	ManifestPath    string                               `json:"manifest_path"`
+	DataDir         string                               `json:"data_dir"`
+	Liveness        coordserver.LivenessPolicy           `json:"liveness"`
+	Reconfiguration coordinator.ReconfigurationPolicy    `json:"reconfiguration"`
+	TickInterval    time.Duration                        `json:"tick_interval"`
+	RPCDeadline     time.Duration                        `json:"rpc_deadline"`
 }
 
 type StorageProcessConfig struct {
@@ -70,6 +71,7 @@ func RunCoordinatorProcess(ctx context.Context, cfg CoordinatorProcessConfig) er
 
 	server, err := coordserver.OpenWithConfig(ctx, store, nil, coordserver.ServerConfig{
 		LivenessPolicy:        cfg.Liveness,
+		ReconfigurationPolicy: cfg.Reconfiguration,
 		NodeClientFactory:     grpcx.NewDynamicNodeClientFactory(pool),
 		DispatchRetryInterval: 200 * time.Millisecond,
 	})
@@ -88,6 +90,7 @@ func RunCoordinatorProcess(ctx context.Context, cfg CoordinatorProcessConfig) er
 					SlotCount:         manifest.Coordinator.SlotCount,
 					ReplicationFactor: manifest.Coordinator.ReplicationFactor,
 				},
+				Policy: cfg.Reconfiguration,
 			},
 		}); err != nil {
 			return fmt.Errorf("bootstrap coordinator: %w", err)
@@ -217,7 +220,7 @@ func RunStorageProcess(ctx context.Context, cfg StorageProcessConfig) error {
 			}
 			registered = true
 		}
-		_ = reporter.ReportNodeHeartbeat(hbCtx, nodeStatusFromState(node.State()))
+		_ = node.ReportHeartbeat(hbCtx)
 	})
 	go runTicker(ctx, cfg.ActivationInterval, func() {
 		actCtx, cancel := context.WithTimeout(context.Background(), cfg.RPCDeadline)
@@ -262,26 +265,7 @@ func runTicker(ctx context.Context, interval time.Duration, fn func()) {
 }
 
 func activateCatchingUpReplicas(ctx context.Context, node *storage.Node) {
-	for slot, replica := range node.State().Replicas {
-		if replica.State != storage.ReplicaStateCatchingUp {
-			continue
-		}
+	for _, slot := range node.CatchingUpSlots() {
 		_ = node.ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: slot})
 	}
-}
-
-func nodeStatusFromState(state storage.NodeState) storage.NodeStatus {
-	status := storage.NodeStatus{NodeID: state.NodeID}
-	for _, replica := range state.Replicas {
-		status.ReplicaCount++
-		switch replica.State {
-		case storage.ReplicaStateActive:
-			status.ActiveCount++
-		case storage.ReplicaStateCatchingUp:
-			status.CatchingUpCount++
-		case storage.ReplicaStateLeaving:
-			status.LeavingCount++
-		}
-	}
-	return status
 }

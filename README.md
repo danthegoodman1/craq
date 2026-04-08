@@ -27,6 +27,49 @@ Documentation:
 - [Quickstart](./QUICKSTART.md)
 - [Security](./SECURITY.md)
 
+## Testing
+
+Normal functional coverage stays on the standard Go test path:
+
+```bash
+go test ./...
+```
+
+For concurrency-sensitive control-plane and storage changes, run the targeted
+core race suite before pushing or before a cloud benchmark:
+
+```bash
+scripts/test-race-core.sh
+```
+
+That race suite intentionally covers the packages with the most live
+concurrency:
+
+- `./storage`
+- `./benchmark`
+- `./coordserver`
+- `./coordinator/runtime`
+- `./transport/grpcx`
+- `./client`
+- `./adminhttp`
+
+For the benchmark-critical coordination stack, the more focused pre-benchmark
+race command is:
+
+```bash
+go test -race -count=1 ./coordserver ./coordinator/runtime ./benchmark ./client ./transport/grpcx
+```
+
+External or env-gated suites stay opt-in. For example, Postgres-backed
+coordinator HA tests are still gated by `CRAQ_TEST_POSTGRES_DSN` and are not
+part of the default race script. When those tests are needed, run them
+explicitly with the same env var set instead of folding them into the default
+core workflow. A typical manual invocation is:
+
+```bash
+CRAQ_TEST_POSTGRES_DSN=postgres://... go test -race -count=1 ./coordserver -run TestPostgres
+```
+
 ## Ops Surfaces
 
 Observability is documented in [OBSERVABILITY.md](./OBSERVABILITY.md).

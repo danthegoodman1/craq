@@ -189,6 +189,8 @@ func (s *Server) RecentEvents() []ops.Event {
 }
 
 func (s *Server) UnavailableReplicas() map[string][]int {
+	s.viewMu.RLock()
+	defer s.viewMu.RUnlock()
 	out := make(map[string][]int, len(s.unavailableReplicas))
 	for nodeID, slots := range s.unavailableReplicas {
 		if len(slots) == 0 {
@@ -205,6 +207,8 @@ func (s *Server) UnavailableReplicas() map[string][]int {
 }
 
 func (s *Server) LastRecoveryReports() map[string]storage.NodeRecoveryReport {
+	s.viewMu.RLock()
+	defer s.viewMu.RUnlock()
 	out := make(map[string]storage.NodeRecoveryReport, len(s.lastRecoveryReports))
 	for nodeID, report := range s.lastRecoveryReports {
 		out[nodeID] = cloneRecoveryReport(report)
@@ -231,11 +235,14 @@ func (s *Server) refreshMetricGauges() {
 	if s.metrics == nil {
 		return
 	}
-	s.metrics.pendingGauge.Set(float64(len(s.pending)))
+	s.viewMu.RLock()
+	pendingCount := len(s.pending)
 	count := 0
 	for _, slots := range s.unavailableReplicas {
 		count += len(slots)
 	}
+	s.viewMu.RUnlock()
+	s.metrics.pendingGauge.Set(float64(pendingCount))
 	s.metrics.unavailableGauge.Set(float64(count))
 }
 

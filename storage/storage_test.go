@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 )
@@ -296,6 +297,332 @@ func TestNodeReportHeartbeatSummarizesReplicas(t *testing.T) {
 		CatchingUpCount: 1,
 	}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("heartbeat = %#v, want %#v", got, want)
+	}
+}
+
+func TestNodeCatchingUpSlotsReturnsSortedSnapshot(t *testing.T) {
+	ctx := context.Background()
+	transport := NewInMemoryReplicationTransport()
+	backend := NewInMemoryBackend()
+	coord := NewInMemoryCoordinatorClient()
+	node := mustNewNode(t, ctx, Config{NodeID: "node-a"}, backend, coord, transport)
+
+	for _, slot := range []int{3, 1, 2} {
+		if err := node.AddReplicaAsTail(ctx, AddReplicaAsTailCommand{
+			Assignment: ReplicaAssignment{Slot: slot, ChainVersion: 1, Role: ReplicaRoleSingle},
+		}); err != nil {
+			t.Fatalf("AddReplicaAsTail(slot=%d) returned error: %v", slot, err)
+		}
+	}
+	if err := node.ActivateReplica(ctx, ActivateReplicaCommand{Slot: 2}); err != nil {
+		t.Fatalf("ActivateReplica returned error: %v", err)
+	}
+
+	if got, want := node.CatchingUpSlots(), []int{1, 3}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("CatchingUpSlots() = %v, want %v", got, want)
+	}
+}
+
+func TestNodeConcurrentLifecycleAndStateInspection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	transport := NewInMemoryReplicationTransport()
+	backend := NewInMemoryBackend()
+	coord := NewInMemoryCoordinatorClient()
+	node := mustNewNode(t, ctx, Config{NodeID: "node-a"}, backend, coord, transport)
+
+	const (
+		slotCount = 24
+		workers   = 4
+	)
+
+	errCh := make(chan error, workers+3)
+	done := make(chan struct{})
+	var readers sync.WaitGroup
+	readers.Add(3)
+
+	go func() {
+		defer readers.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				_ = node.State()
+			}
+		}
+	}()
+	go func() {
+		defer readers.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				_ = node.CatchingUpSlots()
+				_ = node.BufferedReplicaMessages()
+				_ = node.CatchupCount()
+			}
+		}
+	}()
+	go func() {
+		defer readers.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				if err := node.ReportHeartbeat(ctx); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}
+	}()
+
+	var writers sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		worker := worker
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			for slot := worker; slot < slotCount; slot += workers {
+				added := ReplicaAssignment{
+					Slot:         slot,
+					ChainVersion: uint64(slot + 1),
+					Role:         ReplicaRoleSingle,
+				}
+				if err := node.AddReplicaAsTail(ctx, AddReplicaAsTailCommand{Assignment: added}); err != nil {
+					errCh <- err
+					return
+				}
+				updated := added
+				updated.ChainVersion++
+				if err := node.UpdateChainPeers(ctx, UpdateChainPeersCommand{Assignment: updated}); err != nil {
+					errCh <- err
+					return
+				}
+				if err := node.ActivateReplica(ctx, ActivateReplicaCommand{Slot: slot}); err != nil {
+					errCh <- err
+					return
+				}
+				if _, err := node.HighestCommittedSequence(slot); err != nil {
+					errCh <- err
+					return
+				}
+				if _, err := node.StagedSequences(slot); err != nil {
+					errCh <- err
+					return
+				}
+				if _, err := node.BufferedForwardSequences(slot); err != nil {
+					errCh <- err
+					return
+				}
+				if _, err := node.BufferedCommitSequences(slot); err != nil {
+					errCh <- err
+					return
+				}
+				if err := node.MarkReplicaLeaving(ctx, MarkReplicaLeavingCommand{Slot: slot}); err != nil {
+					errCh <- err
+					return
+				}
+				if err := node.RemoveReplica(ctx, RemoveReplicaCommand{Slot: slot}); err != nil {
+					errCh <- err
+					return
+				}
+				if _, err := node.StagedSequences(slot); !errors.Is(err, ErrUnknownReplica) {
+					errCh <- err
+					return
+				}
+			}
+		}()
+	}
+
+	writers.Wait()
+	close(done)
+	readers.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent lifecycle returned error: %v", err)
+		}
+	}
+	if got := len(coord.Heartbeats); got == 0 {
+		t.Fatal("expected at least one heartbeat during concurrent lifecycle")
+	}
+	if got, want := len(node.State().Replicas), 0; got != want {
+		t.Fatalf("len(node.State().Replicas) = %d, want %d", got, want)
+	}
+}
+
+func TestNodeConcurrentRecoveryLifecycleAndStateInspection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	repl := NewInMemoryReplicationTransport()
+
+	sourceBackend := NewInMemoryBackend()
+	sourceCoord := NewInMemoryCoordinatorClient()
+	source := mustNewNode(t, ctx, Config{NodeID: "source"}, sourceBackend, sourceCoord, repl)
+	repl.Register("source", sourceBackend)
+	repl.RegisterNode("source", source)
+	if err := source.AddReplicaAsTail(ctx, AddReplicaAsTailCommand{
+		Assignment: ReplicaAssignment{Slot: 2, ChainVersion: 2, Role: ReplicaRoleSingle},
+	}); err != nil {
+		t.Fatalf("source AddReplicaAsTail returned error: %v", err)
+	}
+	if err := source.ActivateReplica(ctx, ActivateReplicaCommand{Slot: 2}); err != nil {
+		t.Fatalf("source ActivateReplica returned error: %v", err)
+	}
+	if _, err := source.SubmitPut(ctx, 2, "k", "v1"); err != nil {
+		t.Fatalf("source SubmitPut returned error: %v", err)
+	}
+
+	targetBackend := NewInMemoryBackend()
+	targetLocal := NewInMemoryLocalStateStore()
+	targetCoord := NewInMemoryCoordinatorClient()
+	target, err := OpenNode(ctx, Config{NodeID: "target"}, targetBackend, targetLocal, targetCoord, repl)
+	if err != nil {
+		t.Fatalf("OpenNode(target) returned error: %v", err)
+	}
+	if err := target.AddReplicaAsTail(ctx, AddReplicaAsTailCommand{
+		Assignment: ReplicaAssignment{Slot: 2, ChainVersion: 1, Role: ReplicaRoleSingle},
+	}); err != nil {
+		t.Fatalf("target AddReplicaAsTail returned error: %v", err)
+	}
+	if err := target.ActivateReplica(ctx, ActivateReplicaCommand{Slot: 2}); err != nil {
+		t.Fatalf("target ActivateReplica returned error: %v", err)
+	}
+	if _, err := target.SubmitPut(ctx, 2, "stale", "old"); err != nil {
+		t.Fatalf("target SubmitPut returned error: %v", err)
+	}
+	_ = target.Close()
+
+	recoveredTarget, err := OpenNode(ctx, Config{NodeID: "target"}, targetBackend, targetLocal, targetCoord, repl)
+	if err != nil {
+		t.Fatalf("reopen OpenNode(target) returned error: %v", err)
+	}
+	t.Cleanup(func() { _ = recoveredTarget.Close() })
+	repl.Register("target", targetBackend)
+	repl.RegisterNode("target", recoveredTarget)
+
+	done := make(chan struct{})
+	errCh := make(chan error, 8)
+	var readers sync.WaitGroup
+	readers.Add(3)
+
+	go func() {
+		defer readers.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				_ = recoveredTarget.State()
+				_ = recoveredTarget.CatchingUpSlots()
+			}
+		}
+	}()
+	go func() {
+		defer readers.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				if _, err := recoveredTarget.CommittedSnapshot(2); err != nil && !errors.Is(err, ErrUnknownReplica) {
+					errCh <- err
+					return
+				}
+				if _, err := recoveredTarget.HighestCommittedSequence(2); err != nil && !errors.Is(err, ErrUnknownReplica) {
+					errCh <- err
+					return
+				}
+			}
+		}
+	}()
+	go func() {
+		defer readers.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				if err := recoveredTarget.ReportHeartbeat(ctx); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}
+	}()
+
+	recoveredAssignment := ReplicaAssignment{
+		Slot:         2,
+		ChainVersion: 5,
+		Role:         ReplicaRoleTail,
+		Peers:        ChainPeers{PredecessorNodeID: "source"},
+	}
+	if err := recoveredTarget.RecoverReplica(ctx, RecoverReplicaCommand{
+		Assignment:   recoveredAssignment,
+		SourceNodeID: "source",
+	}); err != nil {
+		close(done)
+		readers.Wait()
+		t.Fatalf("RecoverReplica returned error: %v", err)
+	}
+	if err := recoveredTarget.UpdateChainPeers(ctx, UpdateChainPeersCommand{
+		Assignment: ReplicaAssignment{Slot: 2, ChainVersion: 6, Role: ReplicaRoleSingle},
+	}); err != nil {
+		close(done)
+		readers.Wait()
+		t.Fatalf("UpdateChainPeers returned error: %v", err)
+	}
+	if err := recoveredTarget.MarkReplicaLeaving(ctx, MarkReplicaLeavingCommand{Slot: 2}); err != nil {
+		close(done)
+		readers.Wait()
+		t.Fatalf("MarkReplicaLeaving returned error: %v", err)
+	}
+	if err := recoveredTarget.RemoveReplica(ctx, RemoveReplicaCommand{Slot: 2}); err != nil {
+		close(done)
+		readers.Wait()
+		t.Fatalf("RemoveReplica returned error: %v", err)
+	}
+	if err := recoveredTarget.AddReplicaAsTail(ctx, AddReplicaAsTailCommand{
+		Assignment: ReplicaAssignment{Slot: 2, ChainVersion: 7, Role: ReplicaRoleSingle},
+	}); err != nil {
+		close(done)
+		readers.Wait()
+		t.Fatalf("AddReplicaAsTail(re-add) returned error: %v", err)
+	}
+	if err := recoveredTarget.ActivateReplica(ctx, ActivateReplicaCommand{Slot: 2}); err != nil {
+		close(done)
+		readers.Wait()
+		t.Fatalf("ActivateReplica(re-add) returned error: %v", err)
+	}
+
+	close(done)
+	readers.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent recovery lifecycle returned error: %v", err)
+		}
+	}
+
+	if _, err := recoveredTarget.SubmitPut(ctx, 2, "final", "v2"); err != nil {
+		t.Fatalf("SubmitPut after re-add returned error: %v", err)
+	}
+	snapshot, err := recoveredTarget.CommittedSnapshot(2)
+	if err != nil {
+		t.Fatalf("CommittedSnapshot returned error: %v", err)
+	}
+	if got, want := snapshot["final"].Value, "v2"; got != want {
+		t.Fatalf("final snapshot value = %q, want %q", got, want)
+	}
+	if got := len(targetCoord.Heartbeats); got == 0 {
+		t.Fatal("expected heartbeat traffic during recovery lifecycle overlap")
 	}
 }
 

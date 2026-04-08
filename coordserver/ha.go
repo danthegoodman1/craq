@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
@@ -20,11 +21,12 @@ type HAConfig struct {
 }
 
 type haController struct {
-	cfg     HAConfig
-	lease   LeaderLease
+	cfg      HAConfig
+	mu       sync.RWMutex
+	lease    LeaderLease
 	isLeader bool
-	stop    chan struct{}
-	done    chan struct{}
+	stop     chan struct{}
+	done     chan struct{}
 }
 
 const defaultHALeaseTTL = 2 * time.Second
@@ -85,8 +87,7 @@ func (s *Server) StepHA(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("err in ha store AcquireOrRenew: %w", err)
 	}
-	s.ha.lease = cloneLeaderLease(lease)
-	s.ha.isLeader = isLeader
+	s.ha.setLease(lease, isLeader)
 	snapshot, err := s.ha.cfg.Store.LoadSnapshot(ctx)
 	if err != nil {
 		return false, fmt.Errorf("err in ha store LoadSnapshot: %w", err)
@@ -108,7 +109,7 @@ func (s *Server) StepHA(ctx context.Context) (bool, error) {
 	}
 	if err := s.dispatchOutbox(ctx); err != nil {
 		if isNotLeader(err) {
-			s.ha.isLeader = false
+			s.ha.setIsLeader(false)
 			return false, nil
 		}
 		return true, err
@@ -117,8 +118,9 @@ func (s *Server) StepHA(ctx context.Context) (bool, error) {
 }
 
 func (s *Server) syncFromHASnapshot(snapshot HASnapshot) {
-	s.rt = coordruntime.OpenInMemoryFromState(snapshot.State)
+	s.replaceRuntime(coordruntime.OpenInMemoryFromState(snapshot.State))
 	s.syncViewsFromRuntime()
+	s.viewMu.Lock()
 	s.pending = make(map[int]PendingWork, len(snapshot.Pending))
 	for slot, pending := range snapshot.Pending {
 		s.pending[slot] = pending
@@ -136,13 +138,19 @@ func (s *Server) syncFromHASnapshot(snapshot HASnapshot) {
 	for nodeID, report := range snapshot.LastRecoveryReports {
 		s.lastRecoveryReports[nodeID] = cloneRecoveryReport(report)
 	}
+	s.viewMu.Unlock()
 	s.rebuildRoutingSnapshot()
 }
 
 func (s *Server) currentHASnapshot() HASnapshot {
 	snapshot := zeroHASnapshot()
-	snapshot.State = s.rt.Current()
-	snapshot.Pending = s.Pending()
+	snapshot.State = s.currentState()
+	s.viewMu.RLock()
+	defer s.viewMu.RUnlock()
+	snapshot.Pending = make(map[int]PendingWork, len(s.pending))
+	for slot, pending := range s.pending {
+		snapshot.Pending[slot] = pending
+	}
 	snapshot.LastPolicy = s.lastPolicy
 	snapshot.UnavailableReplicas = make(map[string]map[int]bool, len(s.unavailableReplicas))
 	for nodeID, slots := range s.unavailableReplicas {
@@ -163,7 +171,8 @@ func (s *Server) ensureLeader(ctx context.Context) error {
 	if s.ha == nil {
 		return nil
 	}
-	if s.ha.isLeader && s.clock.Now().UnixNano() < s.ha.lease.ExpiresAtUnixNano {
+	lease, isLeader := s.ha.currentLease()
+	if isLeader && s.clock.Now().UnixNano() < lease.ExpiresAtUnixNano {
 		return nil
 	}
 	isLeader, err := s.StepHA(ctx)
@@ -180,7 +189,7 @@ func (s *Server) CurrentLeaderLease() (LeaderLease, bool) {
 	if s.ha == nil {
 		return LeaderLease{}, false
 	}
-	return cloneLeaderLease(s.ha.lease), s.ha.isLeader
+	return s.ha.currentLease()
 }
 
 func isNotLeader(err error) bool {
@@ -191,12 +200,13 @@ func (s *Server) notLeaderError() error {
 	if s.ha == nil {
 		return ErrNotLeader
 	}
-	lease := cloneLeaderLease(s.ha.lease)
+	lease, _ := s.ha.currentLease()
 	return &NotLeaderError{LeaderEndpoint: lease.HolderEndpoint}
 }
 
 func (s *Server) saveHASnapshot(ctx context.Context, expectedSnapshotVersion uint64, snapshot HASnapshot) error {
-	version, err := s.ha.cfg.Store.SaveSnapshot(ctx, s.ha.lease, s.clock.Now(), expectedSnapshotVersion, snapshot)
+	lease, _ := s.ha.currentLease()
+	version, err := s.ha.cfg.Store.SaveSnapshot(ctx, lease, s.clock.Now(), expectedSnapshotVersion, snapshot)
 	if err != nil {
 		return err
 	}
@@ -441,7 +451,8 @@ func (s *Server) applyHAWithPlanner(
 		return coordruntime.State{}, err
 	}
 	next := planner.currentHASnapshot()
-	planned := s.plannerEntries(clients, s.ha.lease.Epoch)
+	lease, _ := s.ha.currentLease()
+	planned := s.plannerEntries(clients, lease.Epoch)
 	next.Outbox = appendOutbox(snapshot.Outbox, planned)
 	for slot, pending := range next.Pending {
 		if pending.Epoch != 0 {
@@ -477,7 +488,10 @@ func (s *Server) applyHAWithPlanner(
 }
 
 func (s *Server) dispatchOutbox(ctx context.Context) error {
-	if s.ha == nil || !s.ha.isLeader {
+	if s.ha == nil {
+		return nil
+	}
+	if _, isLeader := s.ha.currentLease(); !isLeader {
 		return nil
 	}
 	snapshot, err := s.loadCurrentHASnapshot(ctx)
@@ -496,6 +510,7 @@ func (s *Server) dispatchOutbox(ctx context.Context) error {
 		next.Outbox = removeOutboxEntry(current.Outbox, entry.ID)
 		if isRecoveryOutboxKind(entry.Kind) {
 			s.clearUnavailable(entry.NodeID, entry.Slot)
+			s.viewMu.RLock()
 			next.UnavailableReplicas = make(map[string]map[int]bool, len(s.unavailableReplicas))
 			for nodeID, slots := range s.unavailableReplicas {
 				cloned := make(map[int]bool, len(slots))
@@ -504,12 +519,32 @@ func (s *Server) dispatchOutbox(ctx context.Context) error {
 				}
 				next.UnavailableReplicas[nodeID] = cloned
 			}
+			s.viewMu.RUnlock()
 		}
 		if err := s.saveHASnapshot(ctx, current.SnapshotVersion, next); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (c *haController) setLease(lease LeaderLease, isLeader bool) {
+	c.mu.Lock()
+	c.lease = cloneLeaderLease(lease)
+	c.isLeader = isLeader
+	c.mu.Unlock()
+}
+
+func (c *haController) setIsLeader(isLeader bool) {
+	c.mu.Lock()
+	c.isLeader = isLeader
+	c.mu.Unlock()
+}
+
+func (c *haController) currentLease() (LeaderLease, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return cloneLeaderLease(c.lease), c.isLeader
 }
 
 func (s *Server) dispatchOutboxEntry(ctx context.Context, entry OutboxEntry) error {

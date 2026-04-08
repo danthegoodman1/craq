@@ -50,6 +50,7 @@ type TerraformOutputs struct {
 	PublicClientIP string            `json:"public_client_ip"`
 	PrivateIPs     map[string]string `json:"private_ips"`
 	InstanceNames  map[string]string `json:"instance_names"`
+	NodeZones      map[string]string `json:"node_zones"`
 }
 
 type ArtifactManifest struct {

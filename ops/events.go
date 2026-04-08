@@ -1,6 +1,9 @@
 package ops
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 type Event struct {
 	Time         time.Time `json:"time"`
@@ -18,6 +21,7 @@ type Event struct {
 }
 
 type EventRing struct {
+	mu     sync.RWMutex
 	events []Event
 	next   int
 	full   bool
@@ -34,6 +38,8 @@ func (r *EventRing) Add(event Event) {
 	if r == nil || len(r.events) == 0 {
 		return
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.events[r.next] = event
 	r.next = (r.next + 1) % len(r.events)
 	if r.next == 0 {
@@ -45,6 +51,8 @@ func (r *EventRing) Snapshot() []Event {
 	if r == nil || len(r.events) == 0 {
 		return nil
 	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if !r.full {
 		out := make([]Event, 0, r.next)
 		out = append(out, r.events[:r.next]...)

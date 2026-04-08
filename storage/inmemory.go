@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"sync"
 )
 
 type stagedOperation struct {
@@ -20,6 +21,7 @@ type replicaData struct {
 }
 
 type InMemoryBackend struct {
+	mu       sync.RWMutex
 	replicas map[int]*replicaData
 	local    LocalStateStore
 }
@@ -31,10 +33,14 @@ func NewInMemoryBackend() *InMemoryBackend {
 }
 
 func (b *InMemoryBackend) BindLocalStateStore(local LocalStateStore) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.local = local
 }
 
 func (b *InMemoryBackend) CreateReplica(slot int) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if _, exists := b.replicas[slot]; exists {
 		return fmt.Errorf("%w: slot %d", ErrReplicaExists, slot)
 	}
@@ -46,6 +52,8 @@ func (b *InMemoryBackend) CreateReplica(slot int) error {
 }
 
 func (b *InMemoryBackend) DeleteReplica(slot int) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if _, exists := b.replicas[slot]; !exists {
 		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
 	}
@@ -54,6 +62,8 @@ func (b *InMemoryBackend) DeleteReplica(slot int) error {
 }
 
 func (b *InMemoryBackend) Snapshot(slot int) (Snapshot, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return nil, fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -62,6 +72,8 @@ func (b *InMemoryBackend) Snapshot(slot int) (Snapshot, error) {
 }
 
 func (b *InMemoryBackend) InstallSnapshot(slot int, snap Snapshot) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -72,6 +84,8 @@ func (b *InMemoryBackend) InstallSnapshot(slot int, snap Snapshot) error {
 }
 
 func (b *InMemoryBackend) SetHighestCommittedSequence(slot int, sequence uint64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -82,6 +96,8 @@ func (b *InMemoryBackend) SetHighestCommittedSequence(slot int, sequence uint64)
 }
 
 func (b *InMemoryBackend) ApplyCommitted(ctx context.Context, nodeID string, operation WriteOperation, persisted *PersistedReplica) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	replica, exists := b.replicas[operation.Slot]
 	if !exists {
 		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, operation.Slot)
@@ -117,6 +133,8 @@ func (b *InMemoryBackend) ApplyCommitted(ctx context.Context, nodeID string, ope
 }
 
 func (b *InMemoryBackend) Put(slot int, key string, value string, metadata ObjectMetadata) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -130,6 +148,8 @@ func (b *InMemoryBackend) ReplicaData(slot int) (Snapshot, error) {
 }
 
 func (b *InMemoryBackend) StagePut(slot int, sequence uint64, key string, value string, metadata ObjectMetadata) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -147,6 +167,8 @@ func (b *InMemoryBackend) StagePut(slot int, sequence uint64, key string, value 
 }
 
 func (b *InMemoryBackend) StageDelete(slot int, sequence uint64, key string, metadata ObjectMetadata) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -163,6 +185,8 @@ func (b *InMemoryBackend) StageDelete(slot int, sequence uint64, key string, met
 }
 
 func (b *InMemoryBackend) CommitSequence(slot int, sequence uint64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -201,6 +225,8 @@ func (b *InMemoryBackend) CommittedSnapshot(slot int) (Snapshot, error) {
 }
 
 func (b *InMemoryBackend) GetCommitted(slot int, key string) (CommittedObject, bool, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return CommittedObject{}, false, fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -210,6 +236,8 @@ func (b *InMemoryBackend) GetCommitted(slot int, key string) (CommittedObject, b
 }
 
 func (b *InMemoryBackend) HighestCommittedSequence(slot int) (uint64, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return 0, fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -218,6 +246,8 @@ func (b *InMemoryBackend) HighestCommittedSequence(slot int) (uint64, error) {
 }
 
 func (b *InMemoryBackend) StagedSequences(slot int) ([]uint64, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return nil, fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -237,7 +267,8 @@ func (b *InMemoryBackend) Close() error {
 }
 
 type InMemoryCoordinatorClient struct {
-	Registrations    []NodeRegistration
+	mu              sync.Mutex
+	Registrations   []NodeRegistration
 	ReadySlots      []int
 	RemovedSlots    []int
 	RecoveryReports []NodeRecoveryReport
@@ -254,6 +285,8 @@ func NewInMemoryCoordinatorClient() *InMemoryCoordinatorClient {
 }
 
 func (c *InMemoryCoordinatorClient) RegisterNode(_ context.Context, reg NodeRegistration) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.RegisterErr != nil {
 		return c.RegisterErr
 	}
@@ -266,6 +299,8 @@ func (c *InMemoryCoordinatorClient) RegisterNode(_ context.Context, reg NodeRegi
 }
 
 func (c *InMemoryCoordinatorClient) ReportReplicaReady(_ context.Context, slot int, _ uint64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.ReadyErr != nil {
 		return c.ReadyErr
 	}
@@ -274,6 +309,8 @@ func (c *InMemoryCoordinatorClient) ReportReplicaReady(_ context.Context, slot i
 }
 
 func (c *InMemoryCoordinatorClient) ReportReplicaRemoved(_ context.Context, slot int, _ uint64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.RemovedErr != nil {
 		return c.RemovedErr
 	}
@@ -282,6 +319,8 @@ func (c *InMemoryCoordinatorClient) ReportReplicaRemoved(_ context.Context, slot
 }
 
 func (c *InMemoryCoordinatorClient) ReportNodeRecovered(_ context.Context, report NodeRecoveryReport) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.RecoveredErr != nil {
 		return c.RecoveredErr
 	}
@@ -290,6 +329,8 @@ func (c *InMemoryCoordinatorClient) ReportNodeRecovered(_ context.Context, repor
 }
 
 func (c *InMemoryCoordinatorClient) ReportNodeHeartbeat(_ context.Context, status NodeStatus) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.HeartbeatErr != nil {
 		return c.HeartbeatErr
 	}
@@ -298,6 +339,7 @@ func (c *InMemoryCoordinatorClient) ReportNodeHeartbeat(_ context.Context, statu
 }
 
 type InMemoryLocalStateStore struct {
+	mu    sync.RWMutex
 	nodes map[string]PersistedNodeState
 }
 
@@ -308,6 +350,8 @@ func NewInMemoryLocalStateStore() *InMemoryLocalStateStore {
 }
 
 func (s *InMemoryLocalStateStore) LoadNode(_ context.Context, nodeID string) (PersistedNodeState, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	state, ok := s.nodes[nodeID]
 	if !ok {
 		return PersistedNodeState{NodeID: nodeID}, nil
@@ -316,6 +360,8 @@ func (s *InMemoryLocalStateStore) LoadNode(_ context.Context, nodeID string) (Pe
 }
 
 func (s *InMemoryLocalStateStore) UpsertReplica(_ context.Context, nodeID string, replica PersistedReplica) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	state, ok := s.nodes[nodeID]
 	if !ok {
 		state = PersistedNodeState{NodeID: nodeID}
@@ -339,6 +385,8 @@ func (s *InMemoryLocalStateStore) UpsertReplica(_ context.Context, nodeID string
 }
 
 func (s *InMemoryLocalStateStore) DeleteReplica(_ context.Context, nodeID string, slot int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	state, ok := s.nodes[nodeID]
 	if !ok {
 		return nil
@@ -356,6 +404,8 @@ func (s *InMemoryLocalStateStore) DeleteReplica(_ context.Context, nodeID string
 }
 
 func (s *InMemoryLocalStateStore) SetHighestAcceptedCoordinatorEpoch(_ context.Context, nodeID string, epoch uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	state, ok := s.nodes[nodeID]
 	if !ok {
 		state = PersistedNodeState{NodeID: nodeID}

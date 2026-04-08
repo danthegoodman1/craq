@@ -3,14 +3,18 @@ package benchmark
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/danthegoodman1/craq/adminhttp"
+	"github.com/danthegoodman1/craq/client"
 	"github.com/danthegoodman1/craq/coordinator"
 	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
 	"github.com/danthegoodman1/craq/coordserver"
@@ -226,6 +230,461 @@ func TestLocalRuntimeAndLoadGen(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(outputDir, "loadgen-report.json")); err != nil {
 		t.Fatalf("loadgen-report.json stat error: %v", err)
+	}
+}
+
+func TestActivateCatchingUpReplicasActivatesAllCurrentSlots(t *testing.T) {
+	ctx := context.Background()
+	transport := storage.NewInMemoryReplicationTransport()
+	backend := storage.NewInMemoryBackend()
+	coord := storage.NewInMemoryCoordinatorClient()
+	node, err := storage.NewNode(ctx, storage.Config{NodeID: "node-a"}, backend, coord, transport)
+	if err != nil {
+		t.Fatalf("storage.NewNode returned error: %v", err)
+	}
+	t.Cleanup(func() { _ = node.Close() })
+
+	for _, slot := range []int{3, 1, 2} {
+		if err := node.AddReplicaAsTail(ctx, storage.AddReplicaAsTailCommand{
+			Assignment: storage.ReplicaAssignment{Slot: slot, ChainVersion: 1, Role: storage.ReplicaRoleSingle},
+		}); err != nil {
+			t.Fatalf("AddReplicaAsTail(slot=%d) returned error: %v", slot, err)
+		}
+	}
+
+	activateCatchingUpReplicas(ctx, node)
+
+	for _, slot := range []int{1, 2, 3} {
+		if got, want := node.State().Replicas[slot].State, storage.ReplicaStateActive; got != want {
+			t.Fatalf("slot %d state = %q, want %q", slot, got, want)
+		}
+	}
+	if got, want := coord.ReadySlots, []int{1, 2, 3}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("ready slots = %v, want %v", got, want)
+	}
+}
+
+func TestRuntimeProcessesReachWritableRoutingUnderConcurrentAdminReads(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	tempDir := t.TempDir()
+	manifest := quickstart.Config{
+		Coordinator: quickstart.Coordinator{
+			RPCAddress:        reserveAddress(t),
+			AdminAddress:      reserveAddress(t),
+			SlotCount:         8,
+			ReplicationFactor: 3,
+		},
+		Nodes: []quickstart.Node{
+			{ID: "a", RPCAddress: reserveAddress(t), AdminAddress: reserveAddress(t), FailureDomains: map[string]string{"host": "a", "rack": "a", "az": "a"}},
+			{ID: "b", RPCAddress: reserveAddress(t), AdminAddress: reserveAddress(t), FailureDomains: map[string]string{"host": "b", "rack": "b", "az": "b"}},
+			{ID: "c", RPCAddress: reserveAddress(t), AdminAddress: reserveAddress(t), FailureDomains: map[string]string{"host": "c", "rack": "c", "az": "c"}},
+		},
+	}
+	if err := manifest.Validate(); err != nil {
+		t.Fatalf("manifest.Validate returned error: %v", err)
+	}
+	manifestPath := filepath.Join(tempDir, "manifest.json")
+	if err := SaveManifest(manifestPath, manifest); err != nil {
+		t.Fatalf("SaveManifest returned error: %v", err)
+	}
+
+	processCtx, stopProcesses := context.WithCancel(ctx)
+	defer stopProcesses()
+
+	processErrs := make(chan error, len(manifest.Nodes)+1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		processErrs <- RunCoordinatorProcess(processCtx, CoordinatorProcessConfig{
+			ManifestPath:    manifestPath,
+			DataDir:         filepath.Join(tempDir, "coordinator"),
+			Reconfiguration: coordinator.ReconfigurationPolicy{MaxChangedChains: manifest.Coordinator.SlotCount},
+			TickInterval:    25 * time.Millisecond,
+			RPCDeadline:     250 * time.Millisecond,
+		})
+	}()
+	for _, node := range manifest.Nodes {
+		node := node
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			processErrs <- RunStorageProcess(processCtx, StorageProcessConfig{
+				ManifestPath:       manifestPath,
+				NodeID:             node.ID,
+				DataDir:            filepath.Join(tempDir, "storage-"+node.ID),
+				HeartbeatInterval:  25 * time.Millisecond,
+				ActivationInterval: 10 * time.Millisecond,
+				RPCDeadline:        250 * time.Millisecond,
+			})
+		}()
+	}
+
+	pool := grpcx.NewConnPool()
+	t.Cleanup(func() { _ = pool.Close() })
+	admin := grpcx.NewCoordinatorAdminClient(manifest.Coordinator.RPCAddress, pool)
+	router, err := client.NewRouter(admin, grpcx.NewClientTransport(pool))
+	if err != nil {
+		t.Fatalf("client.NewRouter returned error: %v", err)
+	}
+
+	pollCtx, stopPoll := context.WithCancel(ctx)
+	defer stopPoll()
+	pollErrs := make(chan error, 2)
+	var pollWG sync.WaitGroup
+	startConcurrentAdminPoller(&pollWG, pollCtx, pollErrs, func(pollCtx context.Context) error {
+		snapCtx, cancel := context.WithTimeout(pollCtx, 250*time.Millisecond)
+		defer cancel()
+		_, err := admin.RoutingSnapshot(snapCtx)
+		return err
+	})
+	startConcurrentAdminPoller(&pollWG, pollCtx, pollErrs, func(pollCtx context.Context) error {
+		refreshCtx, cancel := context.WithTimeout(pollCtx, 250*time.Millisecond)
+		defer cancel()
+		return router.Refresh(refreshCtx)
+	})
+
+	snapshot, err := waitForWritableRouting(ctx, admin)
+	if err != nil {
+		t.Fatalf("waitForWritableRouting returned error: %v", err)
+	}
+	for _, route := range snapshot.Slots {
+		if !route.Readable || !route.Writable {
+			t.Fatalf("route %#v is not fully readable+writable", route)
+		}
+	}
+
+	opCtx, opCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer opCancel()
+	if err := router.Refresh(opCtx); err != nil {
+		t.Fatalf("router.Refresh returned error: %v", err)
+	}
+	putResult, err := router.Put(opCtx, "alpha", "one")
+	if err != nil {
+		t.Fatalf("router.Put returned error: %v", err)
+	}
+	if got, want := putResult.Applied, true; got != want {
+		t.Fatalf("putResult.Applied = %t, want %t", got, want)
+	}
+	readResult, err := router.Get(opCtx, "alpha")
+	if err != nil {
+		t.Fatalf("router.Get returned error: %v", err)
+	}
+	if !readResult.Found || readResult.Value != "one" {
+		t.Fatalf("router.Get result = %#v, want found value", readResult)
+	}
+
+	stopPoll()
+	pollWG.Wait()
+	stopProcesses()
+	wg.Wait()
+	close(processErrs)
+	close(pollErrs)
+	for err := range processErrs {
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("runtime process returned error: %v", err)
+		}
+	}
+	for err := range pollErrs {
+		if err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "connection refused") {
+			t.Fatalf("admin poller returned error: %v", err)
+		}
+	}
+}
+
+func TestRuntimeProcessesStayWritableAcrossSequentialAutoJoinRepairs(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	tempDir := t.TempDir()
+	manifest := quickstart.Config{
+		Coordinator: quickstart.Coordinator{
+			RPCAddress:        reserveAddress(t),
+			AdminAddress:      reserveAddress(t),
+			SlotCount:         8,
+			ReplicationFactor: 3,
+		},
+		Nodes: []quickstart.Node{
+			{ID: "a", RPCAddress: reserveAddress(t), AdminAddress: reserveAddress(t), FailureDomains: map[string]string{"host": "a", "rack": "a", "az": "a"}},
+			{ID: "b", RPCAddress: reserveAddress(t), AdminAddress: reserveAddress(t), FailureDomains: map[string]string{"host": "b", "rack": "b", "az": "b"}},
+			{ID: "c", RPCAddress: reserveAddress(t), AdminAddress: reserveAddress(t), FailureDomains: map[string]string{"host": "c", "rack": "c", "az": "c"}},
+			{ID: "d", RPCAddress: reserveAddress(t), AdminAddress: reserveAddress(t), FailureDomains: map[string]string{"host": "d", "rack": "d", "az": "d"}},
+			{ID: "e", RPCAddress: reserveAddress(t), AdminAddress: reserveAddress(t), FailureDomains: map[string]string{"host": "e", "rack": "e", "az": "e"}},
+		},
+	}
+	if err := manifest.Validate(); err != nil {
+		t.Fatalf("manifest.Validate returned error: %v", err)
+	}
+	manifestPath := filepath.Join(tempDir, "manifest.json")
+	if err := SaveManifest(manifestPath, manifest); err != nil {
+		t.Fatalf("SaveManifest returned error: %v", err)
+	}
+
+	processErrs := make(chan error, len(manifest.Nodes)+1)
+	var wg sync.WaitGroup
+
+	coordCtx, stopCoordinator := context.WithCancel(ctx)
+	defer stopCoordinator()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		processErrs <- RunCoordinatorProcess(coordCtx, CoordinatorProcessConfig{
+			ManifestPath: manifestPath,
+			DataDir:      filepath.Join(tempDir, "coordinator"),
+			Liveness: coordserver.LivenessPolicy{
+				SuspectAfter:  100 * time.Millisecond,
+				DeadAfter:     200 * time.Millisecond,
+				FlapWindow:    time.Second,
+				FlapThreshold: 8,
+			},
+			Reconfiguration: coordinator.ReconfigurationPolicy{MaxChangedChains: manifest.Coordinator.SlotCount},
+			TickInterval:    25 * time.Millisecond,
+			RPCDeadline:     250 * time.Millisecond,
+		})
+	}()
+
+	nodeConfigByID := map[string]quickstart.Node{}
+	for _, node := range manifest.Nodes {
+		nodeConfigByID[node.ID] = node
+	}
+	nodeStops := map[string]context.CancelFunc{}
+	startNode := func(nodeID string) {
+		t.Helper()
+		node, ok := nodeConfigByID[nodeID]
+		if !ok {
+			t.Fatalf("unknown node %q", nodeID)
+		}
+		if _, started := nodeStops[nodeID]; started {
+			return
+		}
+		nodeCtx, stopNode := context.WithCancel(ctx)
+		nodeStops[nodeID] = stopNode
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			processErrs <- RunStorageProcess(nodeCtx, StorageProcessConfig{
+				ManifestPath:       manifestPath,
+				NodeID:             node.ID,
+				DataDir:            filepath.Join(tempDir, "storage-"+node.ID),
+				HeartbeatInterval:  25 * time.Millisecond,
+				ActivationInterval: 10 * time.Millisecond,
+				RPCDeadline:        250 * time.Millisecond,
+			})
+		}()
+	}
+	for _, nodeID := range []string{"a", "b", "c"} {
+		startNode(nodeID)
+	}
+
+	pool := grpcx.NewConnPool()
+	t.Cleanup(func() { _ = pool.Close() })
+	admin := grpcx.NewCoordinatorAdminClient(manifest.Coordinator.RPCAddress, pool)
+	router, err := client.NewRouter(admin, grpcx.NewClientTransport(pool))
+	if err != nil {
+		t.Fatalf("client.NewRouter returned error: %v", err)
+	}
+
+	pollCtx, stopPoll := context.WithCancel(ctx)
+	defer stopPoll()
+	pollErrs := make(chan error, 2)
+	var pollWG sync.WaitGroup
+	startConcurrentAdminPoller(&pollWG, pollCtx, pollErrs, func(pollCtx context.Context) error {
+		snapCtx, cancel := context.WithTimeout(pollCtx, 250*time.Millisecond)
+		defer cancel()
+		_, err := admin.RoutingSnapshot(snapCtx)
+		return err
+	})
+	startConcurrentAdminPoller(&pollWG, pollCtx, pollErrs, func(pollCtx context.Context) error {
+		refreshCtx, cancel := context.WithTimeout(pollCtx, 250*time.Millisecond)
+		defer cancel()
+		return router.Refresh(refreshCtx)
+	})
+
+	snapshot, err := waitForWritableRouting(ctx, admin)
+	if err != nil {
+		t.Fatalf("initial waitForWritableRouting returned error: %v", err)
+	}
+	for _, route := range snapshot.Slots {
+		if !route.Readable || !route.Writable {
+			t.Fatalf("initial route %#v is not fully readable+writable", route)
+		}
+	}
+
+	verifyRouting := func(included ...string) {
+		t.Helper()
+		snapshot, err := waitForWritableRoutingIncluding(ctx, admin, included...)
+		if err != nil {
+			t.Fatalf("waitForWritableRoutingIncluding(%v) returned error: %v", included, err)
+		}
+		for _, route := range snapshot.Slots {
+			if !route.Readable || !route.Writable {
+				t.Fatalf("route %#v is not fully readable+writable", route)
+			}
+		}
+		opCtx, opCancel := context.WithTimeout(ctx, 2*time.Second)
+		defer opCancel()
+		if err := router.Refresh(opCtx); err != nil {
+			t.Fatalf("router.Refresh returned error: %v", err)
+		}
+		key := fmt.Sprintf("repair-cycle-%d", len(included))
+		value := fmt.Sprintf("value-%d", len(included))
+		if _, err := router.Put(opCtx, key, value); err != nil {
+			t.Fatalf("router.Put(%q) returned error: %v", key, err)
+		}
+		read, err := router.Get(opCtx, key)
+		if err != nil {
+			t.Fatalf("router.Get(%q) returned error: %v", key, err)
+		}
+		if !read.Found || read.Value != value {
+			t.Fatalf("router.Get(%q) = %#v, want value %q", key, read, value)
+		}
+	}
+
+	verifyRouting()
+
+	startNode("d")
+	verifyRouting("d")
+
+	startNode("e")
+	verifyRouting()
+
+	stopPoll()
+	pollWG.Wait()
+	stopCoordinator()
+	for _, stopNode := range nodeStops {
+		stopNode()
+	}
+	wg.Wait()
+	close(processErrs)
+	close(pollErrs)
+	for err := range processErrs {
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("runtime process returned error: %v", err)
+		}
+	}
+	for err := range pollErrs {
+		if err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "connection refused") {
+			t.Fatalf("admin poller returned error: %v", err)
+		}
+	}
+}
+
+func startConcurrentAdminPoller(wg *sync.WaitGroup, ctx context.Context, errCh chan<- error, poll func(context.Context) error) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				errCh <- nil
+				return
+			case <-ticker.C:
+				if err := poll(ctx); err != nil {
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						continue
+					}
+					if strings.Contains(err.Error(), "connection refused") {
+						continue
+					}
+					errCh <- err
+					return
+				}
+			}
+		}
+	}()
+}
+
+func waitForWritableRouting(ctx context.Context, admin *grpcx.CoordinatorAdminClient) (coordserver.RoutingSnapshot, error) {
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return coordserver.RoutingSnapshot{}, ctx.Err()
+		case <-ticker.C:
+			snapCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+			snapshot, err := admin.RoutingSnapshot(snapCtx)
+			cancel()
+			if err != nil {
+				continue
+			}
+			if snapshot.SlotCount == 0 || len(snapshot.Slots) != snapshot.SlotCount {
+				continue
+			}
+			writable := true
+			for _, route := range snapshot.Slots {
+				if !route.Readable || !route.Writable {
+					writable = false
+					break
+				}
+			}
+			if writable {
+				return snapshot, nil
+			}
+		}
+	}
+}
+
+func waitForWritableRoutingIncluding(
+	ctx context.Context,
+	admin *grpcx.CoordinatorAdminClient,
+	includedNodeIDs ...string,
+) (coordserver.RoutingSnapshot, error) {
+	included := make(map[string]struct{}, len(includedNodeIDs))
+	for _, nodeID := range includedNodeIDs {
+		included[nodeID] = struct{}{}
+	}
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return coordserver.RoutingSnapshot{}, ctx.Err()
+		case <-ticker.C:
+			snapCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+			snapshot, err := admin.RoutingSnapshot(snapCtx)
+			cancel()
+			if err != nil {
+				continue
+			}
+			if snapshot.SlotCount == 0 || len(snapshot.Slots) != snapshot.SlotCount {
+				continue
+			}
+			healthy := true
+			seen := make(map[string]bool, len(included))
+			for _, route := range snapshot.Slots {
+				if !route.Readable || !route.Writable {
+					healthy = false
+					break
+				}
+				if _, tracked := included[route.HeadNodeID]; tracked {
+					seen[route.HeadNodeID] = true
+				}
+				if _, tracked := included[route.TailNodeID]; tracked {
+					seen[route.TailNodeID] = true
+				}
+				for _, replica := range route.ReadReplicas {
+					if _, tracked := included[replica.NodeID]; tracked {
+						seen[replica.NodeID] = true
+					}
+				}
+			}
+			if healthy {
+				for nodeID := range included {
+					if !seen[nodeID] {
+						healthy = false
+						break
+					}
+				}
+			}
+			if healthy {
+				return snapshot, nil
+			}
+		}
 	}
 }
 

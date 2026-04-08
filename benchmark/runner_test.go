@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/danthegoodman1/craq/coordinator"
 )
 
 func TestRenderTerraformVarsGCP(t *testing.T) {
@@ -69,6 +71,13 @@ func TestDecodeTerraformOutputsGCP(t *testing.T) {
 			"storage-b":   "storage-b",
 			"storage-c":   "storage-c",
 		}},
+		"node_zones": map[string]any{"value": map[string]string{
+			"client":      "us-central1-a",
+			"coordinator": "us-central1-a",
+			"storage-a":   "us-central1-a",
+			"storage-b":   "us-central1-b",
+			"storage-c":   "us-central1-c",
+		}},
 	})
 	if err != nil {
 		t.Fatalf("Marshal returned error: %v", err)
@@ -83,6 +92,9 @@ func TestDecodeTerraformOutputsGCP(t *testing.T) {
 	}
 	if got, want := outputs.InstanceNames["storage-c"], "storage-c"; got != want {
 		t.Fatalf("InstanceNames[storage-c] = %q, want %q", got, want)
+	}
+	if got, want := outputs.NodeZones["storage-b"], "us-central1-b"; got != want {
+		t.Fatalf("NodeZones[storage-b] = %q, want %q", got, want)
 	}
 }
 
@@ -135,5 +147,25 @@ telemetry:
 	}
 	if got := err.Error(); got != "gcp.project must be replaced with a real GCP project before running a benchmark" {
 		t.Fatalf("RunBenchmark error = %q", got)
+	}
+}
+
+func TestCoordinatorProcessConfigIncludesReconfigurationBudget(t *testing.T) {
+	cfg := CoordinatorProcessConfig{
+		ManifestPath: "/etc/craq-bench/manifest.json",
+		DataDir:      "/var/lib/craq-bench/coordinator",
+		Reconfiguration: coordinator.ReconfigurationPolicy{
+			MaxChangedChains: 32,
+		},
+	}
+
+	data := mustJSON(cfg)
+
+	var decoded CoordinatorProcessConfig
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal returned error: %v", err)
+	}
+	if got, want := decoded.Reconfiguration.MaxChangedChains, 32; got != want {
+		t.Fatalf("decoded reconfiguration max_changed_chains = %d, want %d", got, want)
 	}
 }

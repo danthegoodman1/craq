@@ -13,63 +13,41 @@ locals {
   multi_zone = var.topology == "multi-zone"
   zones      = slice(data.google_compute_zones.available.names, 0, local.multi_zone ? 3 : 1)
 
-  storage_local_ssd_counts = {
-    "c4a-standard-4-lssd"  = 1
-    "c4a-standard-8-lssd"  = 2
-    "c4a-standard-16-lssd" = 4
-    "c4a-standard-32-lssd" = 6
-    "c4a-standard-48-lssd" = 10
-    "c4a-standard-64-lssd" = 14
-    "c4a-standard-72-lssd" = 16
-    "c4a-highmem-4-lssd"   = 1
-    "c4a-highmem-8-lssd"   = 2
-    "c4a-highmem-16-lssd"  = 4
-    "c4a-highmem-32-lssd"  = 6
-    "c4a-highmem-48-lssd"  = 10
-    "c4a-highmem-64-lssd"  = 14
-    "c4a-highmem-72-lssd"  = 16
-  }
-
   roles = {
     client = {
-      machine_type    = var.client_machine_type
-      role            = "client"
-      subnet_index    = local.multi_zone && var.client_placement == "remote-zone" ? 1 : 0
-      public_ip       = true
-      boot_disk_gib   = 50
-      local_ssd_count = 0
+      machine_type  = var.client_machine_type
+      role          = "client"
+      subnet_index  = local.multi_zone && var.client_placement == "remote-zone" ? 1 : 0
+      public_ip     = true
+      boot_disk_gib = 50
     }
     coordinator = {
-      machine_type    = var.coordinator_machine_type
-      role            = "coordinator"
-      subnet_index    = 0
-      public_ip       = false
-      boot_disk_gib   = var.coordinator_boot_disk_gib
-      local_ssd_count = 0
+      machine_type  = var.coordinator_machine_type
+      role          = "coordinator"
+      subnet_index  = 0
+      public_ip     = false
+      boot_disk_gib = var.coordinator_boot_disk_gib
     }
     storage-a = {
-      machine_type    = var.storage_machine_type
-      role            = "storage"
-      subnet_index    = 0
-      public_ip       = false
-      boot_disk_gib   = 80
-      local_ssd_count = local.storage_local_ssd_counts[var.storage_machine_type]
+      machine_type  = var.storage_machine_type
+      role          = "storage"
+      subnet_index  = 0
+      public_ip     = false
+      boot_disk_gib = 80
     }
     storage-b = {
-      machine_type    = var.storage_machine_type
-      role            = "storage"
-      subnet_index    = local.multi_zone ? 1 : 0
-      public_ip       = false
-      boot_disk_gib   = 80
-      local_ssd_count = local.storage_local_ssd_counts[var.storage_machine_type]
+      machine_type  = var.storage_machine_type
+      role          = "storage"
+      subnet_index  = local.multi_zone ? 1 : 0
+      public_ip     = false
+      boot_disk_gib = 80
     }
     storage-c = {
-      machine_type    = var.storage_machine_type
-      role            = "storage"
-      subnet_index    = local.multi_zone ? 2 : 0
-      public_ip       = false
-      boot_disk_gib   = 80
-      local_ssd_count = local.storage_local_ssd_counts[var.storage_machine_type]
+      machine_type  = var.storage_machine_type
+      role          = "storage"
+      subnet_index  = local.multi_zone ? 2 : 0
+      public_ip     = false
+      boot_disk_gib = 80
     }
   }
 }
@@ -131,7 +109,8 @@ resource "google_compute_instance" "node" {
     initialize_params {
       image = data.google_compute_image.ubuntu_arm64.self_link
       size  = each.value.boot_disk_gib
-      type  = "pd-ssd"
+      # C4A instances don't support pd-ssd boot disks.
+      type = "hyperdisk-balanced"
     }
   }
 
@@ -150,12 +129,5 @@ resource "google_compute_instance" "node" {
       role     = each.value.role
       ssh_user = var.ssh_user
     })
-  }
-
-  dynamic "scratch_disk" {
-    for_each = range(each.value.local_ssd_count)
-    content {
-      interface = "NVME"
-    }
   }
 }

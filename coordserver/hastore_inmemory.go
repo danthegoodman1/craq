@@ -2,14 +2,16 @@ package coordserver
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
 type InMemoryHAStore struct {
-	lease         LeaderLease
-	hasLease      bool
-	snapshot      HASnapshot
-	snapshotSet   bool
+	mu          sync.RWMutex
+	lease       LeaderLease
+	hasLease    bool
+	snapshot    HASnapshot
+	snapshotSet bool
 }
 
 func NewInMemoryHAStore() *InMemoryHAStore {
@@ -17,10 +19,14 @@ func NewInMemoryHAStore() *InMemoryHAStore {
 }
 
 func (s *InMemoryHAStore) CurrentLease(_ context.Context) (LeaderLease, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return cloneLeaderLease(s.lease), s.hasLease, nil
 }
 
 func (s *InMemoryHAStore) AcquireOrRenew(_ context.Context, holderID string, holderEndpoint string, now time.Time, ttl time.Duration) (LeaderLease, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.hasLease {
 		s.lease = LeaderLease{
 			HolderID:          holderID,
@@ -52,6 +58,8 @@ func (s *InMemoryHAStore) AcquireOrRenew(_ context.Context, holderID string, hol
 }
 
 func (s *InMemoryHAStore) LoadSnapshot(_ context.Context) (HASnapshot, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if !s.snapshotSet {
 		return zeroHASnapshot(), nil
 	}
@@ -59,6 +67,8 @@ func (s *InMemoryHAStore) LoadSnapshot(_ context.Context) (HASnapshot, error) {
 }
 
 func (s *InMemoryHAStore) SaveSnapshot(_ context.Context, lease LeaderLease, now time.Time, expectedSnapshotVersion uint64, snapshot HASnapshot) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.hasLease || s.lease.HolderID != lease.HolderID || s.lease.Epoch != lease.Epoch || now.UnixNano() >= s.lease.ExpiresAtUnixNano {
 		return 0, ErrNotLeader
 	}

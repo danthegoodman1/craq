@@ -194,10 +194,10 @@ func TestHAFlapHistorySurvivesFailoverAndEvictsNode(t *testing.T) {
 
 	h.mustStepLeader(t)
 	h.mustBind(t, h.leader)
-	if _, err := h.leader.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 1, 3, "a", "b", "c")); err != nil {
+	if _, err := h.leader.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 8, 3, "a", "b", "c")); err != nil {
 		t.Fatalf("Bootstrap returned error: %v", err)
 	}
-	h.seedBootstrap(t, h.leader, 1, 3, []string{"a", "b", "c"})
+	h.seedBootstrap(t, h.leader, 8, 3, []string{"a", "b", "c"})
 	if err := h.adapters["d"].Node().ReportHeartbeat(ctx); err != nil {
 		t.Fatalf("ReportHeartbeat(d) returned error: %v", err)
 	}
@@ -1000,6 +1000,148 @@ func TestHANoopStepDoesNotChurnSettledState(t *testing.T) {
 	}
 	if !reflect.DeepEqual(afterRouting, beforeRouting) {
 		t.Fatalf("routing changed on no-op StepHA\nafter=%#v\nbefore=%#v", afterRouting, beforeRouting)
+	}
+}
+
+func TestHAConcurrentHeartbeatsAndStepHandoffsConvergeAfterFailover(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	h := newHAInMemoryHarness(t, []string{"a", "b", "c", "d"})
+	h.adapters["c"].EnableQueuedProgress()
+	h.adapters["d"].EnableQueuedProgress()
+
+	startTraffic := func(t *testing.T, server *Server) func() {
+		t.Helper()
+		done := make(chan struct{})
+		errCh := make(chan error, 16)
+		var wg sync.WaitGroup
+		for _, nodeID := range []string{"a", "b"} {
+			nodeID := nodeID
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				ticker := time.NewTicker(250 * time.Microsecond)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-done:
+						return
+					case <-ticker.C:
+						if err := h.adapters[nodeID].Node().ReportHeartbeat(ctx); err != nil &&
+							!errors.Is(err, context.Canceled) &&
+							!errors.Is(err, context.DeadlineExceeded) &&
+							!errors.Is(err, ErrHASnapshotConflict) &&
+							!errors.Is(err, ErrNotLeader) {
+							errCh <- err
+							return
+						}
+					}
+				}
+			}()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ticker := time.NewTicker(250 * time.Microsecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-ticker.C:
+					if _, err := server.RoutingSnapshot(ctx); err != nil &&
+						!errors.Is(err, context.Canceled) &&
+						!errors.Is(err, context.DeadlineExceeded) &&
+						!errors.Is(err, ErrNotLeader) {
+						errCh <- err
+						return
+					}
+				}
+			}
+		}()
+		return func() {
+			close(done)
+			wg.Wait()
+			close(errCh)
+			for err := range errCh {
+				if err != nil {
+					t.Fatalf("background HA traffic returned error: %v", err)
+				}
+			}
+		}
+	}
+
+	deliverEventually := func(t *testing.T, nodeID string) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			err := h.adapters[nodeID].DeliverNextProgress(ctx)
+			if err == nil {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("DeliverNextProgress(%s) returned error: %v", nodeID, err)
+			}
+			if errors.Is(err, ErrHASnapshotConflict) || errors.Is(err, ErrNotLeader) {
+				time.Sleep(250 * time.Microsecond)
+				continue
+			}
+			t.Fatalf("DeliverNextProgress(%s) returned error: %v", nodeID, err)
+		}
+	}
+
+	h.mustStepLeader(t)
+	h.mustBind(t, h.leader)
+	if _, err := h.standby.StepHA(ctx); err != nil {
+		t.Fatalf("standby initial StepHA returned error: %v", err)
+	}
+	if _, err := h.leader.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 8, 3, "a", "b", "c")); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	h.seedBootstrap(t, h.leader, 8, 3, []string{"a", "b", "c"})
+	if _, err := h.leader.AddNode(ctx, reconfigureCommand("add-d", 1, uniqueAddNodeEvent("d"), noBudgetPolicy())); err != nil {
+		t.Fatalf("AddNode returned error: %v", err)
+	}
+	slot := mustPendingSlotForNode(t, h.leader.Pending(), "d", pendingKindReady)
+
+	stopLeaderTraffic := startTraffic(t, h.leader)
+	h.mustStepLeader(t)
+	if err := h.adapters["d"].ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: slot}); err != nil {
+		stopLeaderTraffic()
+		t.Fatalf("ActivateReplica(d) returned error: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for h.adapters["d"].PendingProgress() == 0 && time.Now().Before(deadline) {
+		time.Sleep(250 * time.Microsecond)
+	}
+	stopLeaderTraffic()
+	if got, want := h.adapters["d"].PendingProgress(), 1; got != want {
+		t.Fatalf("queued ready progress = %d, want %d", got, want)
+	}
+
+	h.clock.Advance(3 * time.Second)
+	h.mustStepStandby(t)
+	h.mustBind(t, h.standby)
+	stopStandbyTraffic := startTraffic(t, h.standby)
+	deliverEventually(t, "d")
+	h.mustStepStandby(t)
+	stopStandbyTraffic()
+	h.mustStepStandby(t)
+
+	snapshot, err := h.standby.RoutingSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("RoutingSnapshot returned error: %v", err)
+	}
+	route := snapshot.Slots[slot]
+	if !route.Readable {
+		t.Fatalf("route after failover churn = %#v, want readable", route)
+	}
+	if got := h.adapters["d"].PendingProgress(); got != 0 {
+		t.Fatalf("queued ready progress after standby handoff = %d, want 0", got)
+	}
+	if got := h.standby.Current().Version; got <= 1 {
+		t.Fatalf("standby version after ready progress = %d, want > 1", got)
 	}
 }
 
