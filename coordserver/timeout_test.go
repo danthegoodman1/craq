@@ -3,6 +3,7 @@ package coordserver
 import (
 	"context"
 	"errors"
+	"os"
 	"reflect"
 	"testing"
 	"time"
@@ -43,6 +44,205 @@ func TestAddNodeDispatchTimeoutReturnsBoundedErrorAndNoPendingWork(t *testing.T)
 		SlotVersion: server.Current().SlotVersions[1],
 	}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("pending work = %#v, want %#v", got, want)
+	}
+}
+
+func TestReportNodeHeartbeatDoesNotInlineDispatchLargeOutbox(t *testing.T) {
+	ctx := context.Background()
+	h := newInMemoryHarnessWithConfig(t, []string{"a", "b", "c", "d"}, ServerConfig{
+		AsyncHotPathDispatch:  true,
+		DispatchRetryInterval: time.Hour,
+	})
+	if _, err := h.server.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 64, 3, "a", "b", "c")); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	h.seedBootstrap(t, 64, 3, []string{"a", "b", "c"})
+
+	timeoutWrapper := newFaultInjectingNodeClient(h.adapters["d"])
+	timeoutWrapper.addTailTimeouts = 1
+	h.server.nodes["d"] = timeoutWrapper
+
+	_, err := h.server.AddNode(ctx, reconfigureCommand("add-d", 1, coordinator.Event{
+		Kind: coordinator.EventKindAddNode,
+		Node: uniqueNode("d"),
+	}, coordinator.ReconfigurationPolicy{MaxChangedChains: 16}))
+	if err == nil {
+		t.Fatal("AddNode unexpectedly succeeded")
+	}
+	if !errors.Is(err, ErrDispatchTimeout) {
+		t.Fatalf("error = %v, want dispatch timeout", err)
+	}
+
+	for _, nodeID := range []string{"a", "b", "c", "d"} {
+		h.server.nodes[nodeID] = &slowNodeClient{
+			delegate: h.adapters[nodeID],
+			delay:    25 * time.Millisecond,
+		}
+	}
+
+	hbCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	if err := h.server.ReportNodeHeartbeat(hbCtx, storage.NodeStatus{
+		NodeID:          "a",
+		ReplicaCount:    64,
+		ActiveCount:     64,
+		CatchingUpCount: 0,
+	}); err != nil {
+		t.Fatalf("ReportNodeHeartbeat returned error under large pending outbox: %v", err)
+	}
+}
+
+func TestReportReplicaReadyDoesNotInlineDispatchLargeOutbox(t *testing.T) {
+	ctx := context.Background()
+	h := newInMemoryHarnessWithConfig(t, []string{"a", "b", "c", "d"}, ServerConfig{
+		AsyncHotPathDispatch:  true,
+		DispatchRetryInterval: time.Hour,
+	})
+	if _, err := h.server.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 64, 3, "a", "b", "c")); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	h.seedBootstrap(t, 64, 3, []string{"a", "b", "c"})
+
+	timeoutWrapper := newFaultInjectingNodeClient(h.adapters["d"])
+	timeoutWrapper.addTailTimeouts = 1
+	h.server.nodes["d"] = timeoutWrapper
+
+	_, err := h.server.AddNode(ctx, reconfigureCommand("add-d", 1, coordinator.Event{
+		Kind: coordinator.EventKindAddNode,
+		Node: uniqueNode("d"),
+	}, coordinator.ReconfigurationPolicy{MaxChangedChains: 16}))
+	if err == nil {
+		t.Fatal("AddNode unexpectedly succeeded")
+	}
+	if !errors.Is(err, ErrDispatchTimeout) {
+		t.Fatalf("error = %v, want dispatch timeout", err)
+	}
+
+	slot := mustPendingSlotForNode(t, h.server.Pending(), "d", pendingKindReady)
+	for _, nodeID := range []string{"a", "b", "c", "d"} {
+		h.server.nodes[nodeID] = &slowNodeClient{
+			delegate: h.adapters[nodeID],
+			delay:    25 * time.Millisecond,
+		}
+	}
+
+	readyCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	if _, err := h.server.ReportReplicaReady(readyCtx, "d", slot, 0, ""); err != nil {
+		t.Fatalf("ReportReplicaReady returned error under large pending outbox: %v", err)
+	}
+}
+
+func TestStartupScaleProgressAndHeartbeatStayBoundedUnderLargeOutbox(t *testing.T) {
+	ctx := context.Background()
+	h := newInMemoryHarnessWithConfig(t, []string{"a", "b", "c", "d"}, ServerConfig{
+		AsyncHotPathDispatch:  true,
+		DispatchRetryInterval: time.Hour,
+	})
+	if _, err := h.server.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 256, 3, "a", "b", "c")); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	h.seedBootstrap(t, 256, 3, []string{"a", "b", "c"})
+
+	timeoutWrapper := newFaultInjectingNodeClient(h.adapters["d"])
+	timeoutWrapper.addTailTimeouts = 1
+	h.server.nodes["d"] = timeoutWrapper
+
+	_, err := h.server.AddNode(ctx, reconfigureCommand("add-d", 1, coordinator.Event{
+		Kind: coordinator.EventKindAddNode,
+		Node: uniqueNode("d"),
+	}, coordinator.ReconfigurationPolicy{MaxChangedChains: 32}))
+	if err == nil {
+		t.Fatal("AddNode unexpectedly succeeded")
+	}
+	if !errors.Is(err, ErrDispatchTimeout) {
+		t.Fatalf("error = %v, want dispatch timeout", err)
+	}
+
+	slot := mustPendingSlotForNode(t, h.server.Pending(), "d", pendingKindReady)
+	for _, nodeID := range []string{"a", "b", "c", "d"} {
+		h.server.nodes[nodeID] = &slowNodeClient{
+			delegate: h.adapters[nodeID],
+			delay:    10 * time.Millisecond,
+		}
+	}
+
+	heartbeatCtx, heartbeatCancel := context.WithTimeout(ctx, 150*time.Millisecond)
+	defer heartbeatCancel()
+	if err := h.server.ReportNodeHeartbeat(heartbeatCtx, storage.NodeStatus{
+		NodeID:          "a",
+		ReplicaCount:    256,
+		ActiveCount:     256,
+		CatchingUpCount: 0,
+	}); err != nil {
+		t.Fatalf("ReportNodeHeartbeat returned error at startup scale: %v", err)
+	}
+
+	readyCtx, readyCancel := context.WithTimeout(ctx, 150*time.Millisecond)
+	defer readyCancel()
+	if _, err := h.server.ReportReplicaReady(readyCtx, "d", slot, 0, ""); err != nil {
+		t.Fatalf("ReportReplicaReady returned error at startup scale: %v", err)
+	}
+}
+
+func TestCloudShapeStartupScaleProgressAndHeartbeatStayBoundedUnderLargeOutbox(t *testing.T) {
+	requireBenchmarkCloudShapeSoak(t)
+
+	ctx := context.Background()
+	h := newInMemoryHarnessWithConfig(t, []string{"a", "b", "c", "d"}, ServerConfig{
+		AsyncHotPathDispatch:  true,
+		DispatchRetryInterval: time.Hour,
+	})
+	if _, err := h.server.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 1024, 3, "a", "b", "c")); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	h.seedBootstrap(t, 1024, 3, []string{"a", "b", "c"})
+
+	timeoutWrapper := newFaultInjectingNodeClient(h.adapters["d"])
+	timeoutWrapper.addTailTimeouts = 1
+	h.server.nodes["d"] = timeoutWrapper
+
+	_, err := h.server.AddNode(ctx, reconfigureCommand("add-d", 1, coordinator.Event{
+		Kind: coordinator.EventKindAddNode,
+		Node: uniqueNode("d"),
+	}, coordinator.ReconfigurationPolicy{MaxChangedChains: 32}))
+	if err == nil {
+		t.Fatal("AddNode unexpectedly succeeded")
+	}
+	if !errors.Is(err, ErrDispatchTimeout) {
+		t.Fatalf("error = %v, want dispatch timeout", err)
+	}
+
+	slot := mustPendingSlotForNode(t, h.server.Pending(), "d", pendingKindReady)
+	for _, nodeID := range []string{"a", "b", "c", "d"} {
+		h.server.nodes[nodeID] = &slowNodeClient{
+			delegate: h.adapters[nodeID],
+			delay:    10 * time.Millisecond,
+		}
+	}
+
+	heartbeatCtx, heartbeatCancel := context.WithTimeout(ctx, 150*time.Millisecond)
+	defer heartbeatCancel()
+	if err := h.server.ReportNodeHeartbeat(heartbeatCtx, storage.NodeStatus{
+		NodeID:          "a",
+		ReplicaCount:    1024,
+		ActiveCount:     1024,
+		CatchingUpCount: 0,
+	}); err != nil {
+		t.Fatalf("ReportNodeHeartbeat returned error at cloud startup scale: %v", err)
+	}
+
+	readyCtx, readyCancel := context.WithTimeout(ctx, 150*time.Millisecond)
+	defer readyCancel()
+	if _, err := h.server.ReportReplicaReady(readyCtx, "d", slot, 0, ""); err != nil {
+		t.Fatalf("ReportReplicaReady returned error at cloud startup scale: %v", err)
+	}
+}
+
+func requireBenchmarkCloudShapeSoak(t *testing.T) {
+	t.Helper()
+	if os.Getenv("CRAQ_RUN_BENCHMARK_SOAK_LOCAL") == "" {
+		t.Skip("set CRAQ_RUN_BENCHMARK_SOAK_LOCAL=1 to run the local cloud-shape benchmark soak")
 	}
 }
 

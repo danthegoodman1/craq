@@ -18,11 +18,13 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: craq-bench <run|destroy|analyze|daemon|loadgen|probe|collect> [flags]")
+		return fmt.Errorf("usage: craq-bench <run|smoke-local|destroy|analyze|daemon|loadgen|probe|collect> [flags]")
 	}
 	switch args[0] {
 	case "run":
 		return runCommand(args[1:])
+	case "smoke-local":
+		return smokeLocalCommand(args[1:])
 	case "destroy":
 		return destroyCommand(args[1:])
 	case "analyze":
@@ -59,6 +61,29 @@ func runCommand(args []string) error {
 			RunName:         *runName,
 		})
 		if err != nil {
+			return err
+		}
+		fmt.Println(runDir)
+		return nil
+	})
+}
+
+func smokeLocalCommand(args []string) error {
+	fs := flag.NewFlagSet("smoke-local", flag.ContinueOnError)
+	profile := fs.String("profile", "profiles/bench/local_smoke.yaml", "benchmark profile yaml")
+	runName := fs.String("run-name", "smoke-local", "human readable run name")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	return benchmark.RunSignalContext(func(ctx context.Context) error {
+		runDir, err := benchmark.SmokeLocal(ctx, benchmark.SmokeLocalOptions{
+			ProfilePath: *profile,
+			RunName:     *runName,
+		})
+		if err != nil {
+			if runDir != "" {
+				return fmt.Errorf("%w\nrun dir: %s", err, runDir)
+			}
 			return err
 		}
 		fmt.Println(runDir)

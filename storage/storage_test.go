@@ -309,6 +309,24 @@ func TestNodeReportHeartbeatSummarizesReplicas(t *testing.T) {
 	}
 }
 
+func TestNodeReportHeartbeatOnlyDoesNotRegister(t *testing.T) {
+	ctx := context.Background()
+	transport := NewInMemoryReplicationTransport()
+	backend := NewInMemoryBackend()
+	coord := &countingCoordinatorClient{inner: NewInMemoryCoordinatorClient()}
+	node := mustNewNode(t, ctx, Config{NodeID: "node-a"}, backend, coord, transport)
+
+	if err := node.ReportHeartbeatOnly(ctx); err != nil {
+		t.Fatalf("ReportHeartbeatOnly returned error: %v", err)
+	}
+	if got, want := coord.registerCalls, 0; got != want {
+		t.Fatalf("registerCalls = %d, want %d", got, want)
+	}
+	if got, want := len(coord.inner.Heartbeats), 1; got != want {
+		t.Fatalf("heartbeat count = %d, want %d", got, want)
+	}
+}
+
 func TestNodeCatchingUpSlotsReturnsSortedSnapshot(t *testing.T) {
 	ctx := context.Background()
 	transport := NewInMemoryReplicationTransport()
@@ -663,6 +681,32 @@ func TestNodeConcurrentRecoveryLifecycleAndStateInspection(t *testing.T) {
 
 type updatingCoordinatorClient struct {
 	node *Node
+}
+
+type countingCoordinatorClient struct {
+	inner         *InMemoryCoordinatorClient
+	registerCalls int
+}
+
+func (c *countingCoordinatorClient) RegisterNode(ctx context.Context, reg NodeRegistration) error {
+	c.registerCalls++
+	return c.inner.RegisterNode(ctx, reg)
+}
+
+func (c *countingCoordinatorClient) ReportReplicaReady(ctx context.Context, slot int, epoch uint64) error {
+	return c.inner.ReportReplicaReady(ctx, slot, epoch)
+}
+
+func (c *countingCoordinatorClient) ReportReplicaRemoved(ctx context.Context, slot int, epoch uint64) error {
+	return c.inner.ReportReplicaRemoved(ctx, slot, epoch)
+}
+
+func (c *countingCoordinatorClient) ReportNodeRecovered(ctx context.Context, report NodeRecoveryReport) error {
+	return c.inner.ReportNodeRecovered(ctx, report)
+}
+
+func (c *countingCoordinatorClient) ReportNodeHeartbeat(ctx context.Context, status NodeStatus) error {
+	return c.inner.ReportNodeHeartbeat(ctx, status)
 }
 
 func (c *updatingCoordinatorClient) RegisterNode(context.Context, NodeRegistration) error {

@@ -2,6 +2,7 @@ package benchmark
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -22,12 +23,12 @@ import (
 )
 
 type CoordinatorProcessConfig struct {
-	ManifestPath    string                               `json:"manifest_path"`
-	DataDir         string                               `json:"data_dir"`
-	Liveness        coordserver.LivenessPolicy           `json:"liveness"`
-	Reconfiguration coordinator.ReconfigurationPolicy    `json:"reconfiguration"`
-	TickInterval    time.Duration                        `json:"tick_interval"`
-	RPCDeadline     time.Duration                        `json:"rpc_deadline"`
+	ManifestPath    string                            `json:"manifest_path"`
+	DataDir         string                            `json:"data_dir"`
+	Liveness        coordserver.LivenessPolicy        `json:"liveness"`
+	Reconfiguration coordinator.ReconfigurationPolicy `json:"reconfiguration"`
+	TickInterval    time.Duration                     `json:"tick_interval"`
+	RPCDeadline     time.Duration                     `json:"rpc_deadline"`
 }
 
 type StorageProcessConfig struct {
@@ -72,6 +73,7 @@ func RunCoordinatorProcess(ctx context.Context, cfg CoordinatorProcessConfig) er
 	server, err := coordserver.OpenWithConfig(ctx, store, nil, coordserver.ServerConfig{
 		LivenessPolicy:        cfg.Liveness,
 		ReconfigurationPolicy: cfg.Reconfiguration,
+		AsyncHotPathDispatch:  true,
 		NodeClientFactory:     grpcx.NewDynamicNodeClientFactory(pool),
 		DispatchRetryInterval: 200 * time.Millisecond,
 	})
@@ -212,20 +214,31 @@ func RunStorageProcess(ctx context.Context, cfg StorageProcessConfig) error {
 
 	registered := false
 	go runTicker(ctx, cfg.HeartbeatInterval, func() {
-		hbCtx, cancel := context.WithTimeout(context.Background(), cfg.RPCDeadline)
-		defer cancel()
 		if !registered {
-			if err := node.Register(hbCtx); err != nil {
+			registerCtx, cancel := context.WithTimeout(ctx, cfg.RPCDeadline)
+			err := node.Register(registerCtx)
+			cancel()
+			if err != nil {
+				if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+					return
+				}
+				fmt.Fprintf(os.Stderr, "storage register failed node=%s error=%v\n", cfg.NodeID, err)
 				return
 			}
 			registered = true
 		}
-		_ = node.ReportHeartbeat(hbCtx)
+		hbCtx, cancel := context.WithTimeout(ctx, cfg.RPCDeadline)
+		err := node.ReportHeartbeatOnly(hbCtx)
+		cancel()
+		if err != nil {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "storage heartbeat failed node=%s error=%v\n", cfg.NodeID, err)
+		}
 	})
 	go runTicker(ctx, cfg.ActivationInterval, func() {
-		actCtx, cancel := context.WithTimeout(context.Background(), cfg.RPCDeadline)
-		defer cancel()
-		activateCatchingUpReplicas(actCtx, node)
+		activateCatchingUpReplicas(ctx, node, cfg.NodeID, cfg.RPCDeadline)
 	})
 
 	<-ctx.Done()
@@ -245,7 +258,9 @@ func serveGRPC(server interface{ Serve(net.Listener) error }, lis net.Listener) 
 }
 
 func serveAdmin(server *adminhttp.Server) {
-	if err := server.ListenAndServe(); err != nil && !strings.Contains(err.Error(), "closed network connection") {
+	if err := server.ListenAndServe(); err != nil &&
+		!strings.Contains(err.Error(), "closed network connection") &&
+		!strings.Contains(err.Error(), "Server closed") {
 		fmt.Fprintf(os.Stderr, "admin serve error: %v\n", err)
 	}
 }
@@ -264,8 +279,21 @@ func runTicker(ctx context.Context, interval time.Duration, fn func()) {
 	}
 }
 
-func activateCatchingUpReplicas(ctx context.Context, node *storage.Node) {
+func activateCatchingUpReplicas(ctx context.Context, node *storage.Node, nodeID string, rpcDeadline time.Duration) {
 	for _, slot := range node.CatchingUpSlots() {
-		_ = node.ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: slot})
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		slotCtx, cancel := context.WithTimeout(ctx, rpcDeadline)
+		err := node.ActivateReplica(slotCtx, storage.ActivateReplicaCommand{Slot: slot})
+		cancel()
+		if err != nil {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "storage activate failed node=%s slot=%d error=%v\n", nodeID, slot, err)
+		}
 	}
 }

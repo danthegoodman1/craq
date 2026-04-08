@@ -111,6 +111,7 @@ type ServerConfig struct {
 	LivenessPolicy         LivenessPolicy
 	ReconfigurationPolicy  coordinator.ReconfigurationPolicy
 	Clock                  Clock
+	AsyncHotPathDispatch   bool
 	DispatchTimeout        time.Duration
 	DispatchRetryInterval  time.Duration
 	RecoveryCommandTimeout time.Duration
@@ -141,6 +142,9 @@ type Server struct {
 	lastRecoveryReports    map[string]storage.NodeRecoveryReport
 	livenessPolicy         LivenessPolicy
 	clock                  Clock
+	asyncHotPathDispatch   bool
+	activePeerRefresh      map[int]struct{}
+	activePeerRefreshMu    sync.Mutex
 	dispatchTimeout        time.Duration
 	dispatchRetryInterval  time.Duration
 	recoveryCommandTimeout time.Duration
@@ -149,6 +153,7 @@ type Server struct {
 	metrics                *serverMetrics
 	events                 *serverEventRecorder
 	ha                     *haController
+	dispatchNotify         chan struct{}
 	closeOnce              sync.Once
 	closeCh                chan struct{}
 }
@@ -195,6 +200,8 @@ func OpenWithConfig(
 		unavailableReplicas:    map[string]map[int]bool{},
 		lastRecoveryReports:    map[string]storage.NodeRecoveryReport{},
 		livenessPolicy:         normalizeLivenessPolicy(cfg.LivenessPolicy),
+		asyncHotPathDispatch:   cfg.AsyncHotPathDispatch,
+		activePeerRefresh:      map[int]struct{}{},
 		lastPolicy:             cfg.ReconfigurationPolicy,
 		clock:                  cfg.Clock,
 		dispatchTimeout:        cfg.DispatchTimeout,
@@ -204,6 +211,7 @@ func OpenWithConfig(
 		logger:                 coordLoggerFromConfig(cfg.Logger),
 		metrics:                newServerMetrics(cfg.MetricsRegistry),
 		events:                 newServerEventRecorder(),
+		dispatchNotify:         make(chan struct{}, 1),
 		closeCh:                make(chan struct{}),
 	}
 	if server.clock == nil {
@@ -405,84 +413,88 @@ func (s *Server) ReportReplicaReady(ctx context.Context, nodeID string, slot int
 		})
 	}
 	defer s.refreshMetricGauges()
-	state := s.currentState()
-	slotVersion := state.SlotVersions[slot]
-	pending, ok := s.pendingWork(slot)
-	if !ok || pending.Kind != pendingKindReady || pending.NodeID != nodeID {
-		if s.matchesCompleted(slot, nodeID, pendingKindReady, slotVersion, commandID) {
-			return state, nil
-		}
-		return coordruntime.State{}, fmt.Errorf(
-			"%w: unexpected ready report for node %q slot %d",
-			ErrUnexpectedProgress,
-			nodeID,
-			slot,
-		)
-	}
-	if commandID != "" && pending.CommandID != "" && pending.CommandID != commandID {
-		return coordruntime.State{}, fmt.Errorf(
-			"%w: ready report command %q does not match pending %q",
-			ErrUnexpectedProgress,
-			commandID,
-			pending.CommandID,
-		)
-	}
-
-	if pending.SlotVersion != slotVersion {
-		return coordruntime.State{}, fmt.Errorf(
-			"%w: ready report slot version %d does not match pending version %d",
-			ErrUnexpectedProgress,
-			slotVersion,
-			pending.SlotVersion,
-		)
-	}
-	if pending.Epoch != 0 && epoch != 0 && pending.Epoch != epoch {
-		return coordruntime.State{}, fmt.Errorf(
-			"%w: ready report epoch %d does not match pending epoch %d",
-			ErrUnexpectedProgress,
-			epoch,
-			pending.Epoch,
-		)
-	}
-	if !slotContainsReplicaInState(state.Cluster, slot, nodeID, coordinator.ReplicaStateJoining) {
-		return coordruntime.State{}, fmt.Errorf(
-			"%w: node %q slot %d is not joining in current coordinator state",
-			ErrStateMismatch,
-			nodeID,
-			slot,
-		)
-	}
-
-	progressID := commandID
-	if progressID == "" {
-		progressID = fmt.Sprintf("server-progress-ready-%s-%d-v%d", nodeID, slot, state.Version)
-	}
 	rt := s.runtimeRef()
-	if _, err := rt.ApplyProgress(ctx, coordruntime.Command{
-		ID:              progressID,
-		ExpectedVersion: state.Version,
-		Kind:            coordruntime.CommandKindProgress,
-		Progress: &coordruntime.ProgressCommand{
-			Event: coordinator.Event{
-				Kind:   coordinator.EventKindReplicaBecameActive,
-				NodeID: nodeID,
-				Slot:   slot,
+	duplicateCompleted := false
+	updated, err := retryOnRuntimeVersionMismatch(ctx, rt, func(current coordruntime.State, attempt int) (coordruntime.State, error) {
+		slotVersion := current.SlotVersions[slot]
+		pending, ok := current.PendingBySlot[slot]
+		if !ok || pending.Kind != coordruntime.PendingKindReady || pending.NodeID != nodeID {
+			if matchesCompletedRecords(current.CompletedProgressBySlot, slot, nodeID, pendingKindReady, slotVersion) {
+				duplicateCompleted = true
+				return current, nil
+			}
+			return coordruntime.State{}, fmt.Errorf(
+				"%w: unexpected ready report for node %q slot %d",
+				ErrUnexpectedProgress,
+				nodeID,
+				slot,
+			)
+		}
+		if commandID != "" && pending.CommandID != "" && pending.CommandID != commandID {
+			return coordruntime.State{}, fmt.Errorf(
+				"%w: ready report command %q does not match pending %q",
+				ErrUnexpectedProgress,
+				commandID,
+				pending.CommandID,
+			)
+		}
+		if pending.SlotVersion != slotVersion {
+			return coordruntime.State{}, fmt.Errorf(
+				"%w: ready report slot version %d does not match pending version %d",
+				ErrUnexpectedProgress,
+				slotVersion,
+				pending.SlotVersion,
+			)
+		}
+		if !slotContainsReplicaInState(current.Cluster, slot, nodeID, coordinator.ReplicaStateJoining) {
+			return coordruntime.State{}, fmt.Errorf(
+				"%w: node %q slot %d is not joining in current coordinator state",
+				ErrStateMismatch,
+				nodeID,
+				slot,
+			)
+		}
+		progressID := commandID
+		if progressID == "" {
+			progressID = fmt.Sprintf("server-progress-ready-%s-%d-r%d-v%d", nodeID, slot, attempt, current.Version)
+		}
+		return rt.ApplyProgress(ctx, coordruntime.Command{
+			ID:              progressID,
+			ExpectedVersion: current.Version,
+			Kind:            coordruntime.CommandKindProgress,
+			Progress: &coordruntime.ProgressCommand{
+				Event: coordinator.Event{
+					Kind:   coordinator.EventKindReplicaBecameActive,
+					NodeID: nodeID,
+					Slot:   slot,
+				},
 			},
-		},
-	}); err != nil {
+		})
+	})
+	if err != nil {
 		return coordruntime.State{}, fmt.Errorf("err in rt.ApplyProgress: %w", err)
+	}
+	if duplicateCompleted {
+		return updated, nil
 	}
 	s.syncViewsFromRuntime()
 	s.rebuildRoutingSnapshot()
-
-	if err := s.reconcileAndDispatch(ctx); err != nil {
-		return coordruntime.State{}, err
-	}
-	if s.shouldDispatchActivePeerRefresh(slot) {
-		if err := s.dispatchActivePeerUpdates(ctx, slot); err != nil {
+	if s.asyncHotPathDispatch {
+		if s.shouldDispatchActivePeerRefresh(slot) {
+			s.enqueueActivePeerRefresh(slot)
+		}
+		s.notifyDispatchLoop()
+	} else {
+		if err := s.reconcileAndDispatch(ctx); err != nil {
 			return coordruntime.State{}, err
 		}
+		if s.shouldDispatchActivePeerRefresh(slot) {
+			if err := s.dispatchActivePeerUpdates(ctx, slot); err != nil {
+				return coordruntime.State{}, err
+			}
+		}
 	}
+	slotVersion := updated.SlotVersions[slot]
 	s.events.record(s.logger, zerolog.InfoLevel, "replica_ready", "coordinator accepted replica ready progress", nodeID, ops.IntPtr(slot), ops.Uint64Ptr(slotVersion), "", commandID, nil)
 	return s.currentState(), nil
 }
@@ -494,85 +506,88 @@ func (s *Server) ReportReplicaRemoved(ctx context.Context, nodeID string, slot i
 		})
 	}
 	defer s.refreshMetricGauges()
-	state := s.currentState()
-	slotVersion := state.SlotVersions[slot]
-	pending, ok := s.pendingWork(slot)
-	if !ok || pending.Kind != pendingKindRemoved || pending.NodeID != nodeID {
-		if s.matchesCompleted(slot, nodeID, pendingKindRemoved, slotVersion, commandID) {
-			return state, nil
-		}
-		return coordruntime.State{}, fmt.Errorf(
-			"%w: unexpected removed report for node %q slot %d",
-			ErrUnexpectedProgress,
-			nodeID,
-			slot,
-		)
-	}
-	if commandID != "" && pending.CommandID != "" && pending.CommandID != commandID {
-		return coordruntime.State{}, fmt.Errorf(
-			"%w: removed report command %q does not match pending %q",
-			ErrUnexpectedProgress,
-			commandID,
-			pending.CommandID,
-		)
-	}
-
-	if pending.SlotVersion != slotVersion {
-		return coordruntime.State{}, fmt.Errorf(
-			"%w: removed report slot version %d does not match pending version %d",
-			ErrUnexpectedProgress,
-			slotVersion,
-			pending.SlotVersion,
-		)
-	}
-	if pending.Epoch != 0 && epoch != 0 && pending.Epoch != epoch {
-		return coordruntime.State{}, fmt.Errorf(
-			"%w: removed report epoch %d does not match pending epoch %d",
-			ErrUnexpectedProgress,
-			epoch,
-			pending.Epoch,
-		)
-	}
-	if !slotContainsReplicaInState(state.Cluster, slot, nodeID, coordinator.ReplicaStateLeaving) {
-		return coordruntime.State{}, fmt.Errorf(
-			"%w: node %q slot %d is not leaving in current coordinator state",
-			ErrStateMismatch,
-			nodeID,
-			slot,
-		)
-	}
-
-	progressID := commandID
-	if progressID == "" {
-		progressID = fmt.Sprintf("server-progress-removed-%s-%d-v%d", nodeID, slot, state.Version)
-	}
 	rt := s.runtimeRef()
-	updated, err := rt.ApplyProgress(ctx, coordruntime.Command{
-		ID:              progressID,
-		ExpectedVersion: state.Version,
-		Kind:            coordruntime.CommandKindProgress,
-		Progress: &coordruntime.ProgressCommand{
-			Event: coordinator.Event{
-				Kind:   coordinator.EventKindReplicaRemoved,
-				NodeID: nodeID,
-				Slot:   slot,
+	duplicateCompleted := false
+	updated, err := retryOnRuntimeVersionMismatch(ctx, rt, func(current coordruntime.State, attempt int) (coordruntime.State, error) {
+		slotVersion := current.SlotVersions[slot]
+		pending, ok := current.PendingBySlot[slot]
+		if !ok || pending.Kind != coordruntime.PendingKindRemoved || pending.NodeID != nodeID {
+			if matchesCompletedRecords(current.CompletedProgressBySlot, slot, nodeID, pendingKindRemoved, slotVersion) {
+				duplicateCompleted = true
+				return current, nil
+			}
+			return coordruntime.State{}, fmt.Errorf(
+				"%w: unexpected removed report for node %q slot %d",
+				ErrUnexpectedProgress,
+				nodeID,
+				slot,
+			)
+		}
+		if commandID != "" && pending.CommandID != "" && pending.CommandID != commandID {
+			return coordruntime.State{}, fmt.Errorf(
+				"%w: removed report command %q does not match pending %q",
+				ErrUnexpectedProgress,
+				commandID,
+				pending.CommandID,
+			)
+		}
+		if pending.SlotVersion != slotVersion {
+			return coordruntime.State{}, fmt.Errorf(
+				"%w: removed report slot version %d does not match pending version %d",
+				ErrUnexpectedProgress,
+				slotVersion,
+				pending.SlotVersion,
+			)
+		}
+		if !slotContainsReplicaInState(current.Cluster, slot, nodeID, coordinator.ReplicaStateLeaving) {
+			return coordruntime.State{}, fmt.Errorf(
+				"%w: node %q slot %d is not leaving in current coordinator state",
+				ErrStateMismatch,
+				nodeID,
+				slot,
+			)
+		}
+		progressID := commandID
+		if progressID == "" {
+			progressID = fmt.Sprintf("server-progress-removed-%s-%d-r%d-v%d", nodeID, slot, attempt, current.Version)
+		}
+		return rt.ApplyProgress(ctx, coordruntime.Command{
+			ID:              progressID,
+			ExpectedVersion: current.Version,
+			Kind:            coordruntime.CommandKindProgress,
+			Progress: &coordruntime.ProgressCommand{
+				Event: coordinator.Event{
+					Kind:   coordinator.EventKindReplicaRemoved,
+					NodeID: nodeID,
+					Slot:   slot,
+				},
 			},
-		},
+		})
 	})
 	if err != nil {
 		return coordruntime.State{}, fmt.Errorf("err in rt.ApplyProgress: %w", err)
 	}
+	if duplicateCompleted {
+		return updated, nil
+	}
 	s.syncViewsFromRuntime()
 	s.rebuildRoutingSnapshot()
-
-	if err := s.reconcileAndDispatch(ctx); err != nil {
-		return coordruntime.State{}, err
-	}
-	if s.shouldDispatchActivePeerRefresh(slot) {
-		if err := s.dispatchActivePeerUpdates(ctx, slot); err != nil {
+	if s.asyncHotPathDispatch {
+		if s.shouldDispatchActivePeerRefresh(slot) {
+			s.enqueueActivePeerRefresh(slot)
+		}
+		s.notifyDispatchLoop()
+	} else {
+		if err := s.reconcileAndDispatch(ctx); err != nil {
 			return coordruntime.State{}, err
 		}
+		if s.shouldDispatchActivePeerRefresh(slot) {
+			if err := s.dispatchActivePeerUpdates(ctx, slot); err != nil {
+				return coordruntime.State{}, err
+			}
+		}
 	}
+	slotVersion := updated.SlotVersions[slot]
 	s.events.record(s.logger, zerolog.InfoLevel, "replica_removed", "coordinator accepted replica removed progress", nodeID, ops.IntPtr(slot), ops.Uint64Ptr(slotVersion), "", commandID, nil)
 	return updated, nil
 }
@@ -621,11 +636,15 @@ func (s *Server) ReportNodeHeartbeat(ctx context.Context, status storage.NodeSta
 	}
 	s.syncViewsFromRuntime()
 	s.rebuildRoutingSnapshot()
-	if err := s.reconcileAndDispatch(ctx); err != nil {
-		if errors.Is(err, ErrDispatchFailed) || errors.Is(err, ErrDispatchTimeout) {
-			s.logger.Warn().Err(err).Str("component", "coordserver").Str("node_id", status.NodeID).Msg("coordinator heartbeat triggered durable repair work that will retry later")
-		} else {
-			return err
+	if s.asyncHotPathDispatch {
+		s.notifyDispatchLoop()
+	} else {
+		if err := s.reconcileAndDispatch(ctx); err != nil {
+			if errors.Is(err, ErrDispatchFailed) || errors.Is(err, ErrDispatchTimeout) {
+				s.logger.Warn().Err(err).Str("component", "coordserver").Str("node_id", status.NodeID).Msg("coordinator heartbeat triggered durable repair work that will retry later")
+			} else {
+				return err
+			}
 		}
 	}
 	if currentLiveness, ok := s.livenessRecord(status.NodeID); wasDead && ok && currentLiveness.State != coordruntime.NodeLivenessStateDead {
@@ -904,6 +923,16 @@ func (s *Server) applyMembershipMutation(
 }
 
 func (s *Server) reconcileAndDispatch(ctx context.Context) error {
+	if err := s.reconcileState(ctx); err != nil {
+		return err
+	}
+	if err := s.dispatchRuntimeOutbox(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Server) reconcileState(ctx context.Context) error {
 	rt := s.runtimeRef()
 	_, err := retryOnRuntimeVersionMismatch(ctx, rt, func(current coordruntime.State, attempt int) (coordruntime.State, error) {
 		preview, err := coordinator.PlanReconfiguration(current.Cluster, nil, s.reconfigurationPolicy())
@@ -933,9 +962,6 @@ func (s *Server) reconcileAndDispatch(ctx context.Context) error {
 	}
 	s.syncViewsFromRuntime()
 	s.rebuildRoutingSnapshot()
-	if err := s.dispatchRuntimeOutbox(ctx); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -948,12 +974,34 @@ func (s *Server) startDispatchLoop() {
 			case <-s.closeCh:
 				return
 			case <-ticker.C:
-				if err := s.dispatchRuntimeOutbox(context.Background()); err != nil && !errors.Is(err, ErrDispatchFailed) && !errors.Is(err, ErrDispatchTimeout) {
-					s.logger.Warn().Err(err).Str("component", "coordserver").Msg("non-ha dispatch loop observed error")
-				}
+				s.runBackgroundDispatchOnce()
+			case <-s.dispatchNotify:
+				s.runBackgroundDispatchOnce()
 			}
 		}
 	}()
+}
+
+func (s *Server) notifyDispatchLoop() {
+	select {
+	case s.dispatchNotify <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Server) runBackgroundDispatchOnce() {
+	var err error
+	if s.asyncHotPathDispatch {
+		err = s.reconcileAndDispatch(context.Background())
+		if err == nil {
+			err = s.dispatchQueuedActivePeerRefreshes(context.Background())
+		}
+	} else {
+		err = s.dispatchRuntimeOutbox(context.Background())
+	}
+	if err != nil && !errors.Is(err, ErrDispatchFailed) && !errors.Is(err, ErrDispatchTimeout) {
+		s.logger.Warn().Err(err).Str("component", "coordserver").Msg("non-ha dispatch loop observed error")
+	}
 }
 
 func (s *Server) dispatchRuntimeOutbox(ctx context.Context) error {
@@ -1048,6 +1096,43 @@ func (s *Server) shouldDispatchActivePeerRefresh(slot int) bool {
 		return false
 	}
 	return !runtimeOutboxHasSlot(s.currentState().Outbox, slot)
+}
+
+func (s *Server) enqueueActivePeerRefresh(slot int) {
+	s.activePeerRefreshMu.Lock()
+	s.activePeerRefresh[slot] = struct{}{}
+	s.activePeerRefreshMu.Unlock()
+}
+
+func (s *Server) clearActivePeerRefresh(slot int) {
+	s.activePeerRefreshMu.Lock()
+	delete(s.activePeerRefresh, slot)
+	s.activePeerRefreshMu.Unlock()
+}
+
+func (s *Server) snapshotActivePeerRefreshSlots() []int {
+	s.activePeerRefreshMu.Lock()
+	defer s.activePeerRefreshMu.Unlock()
+	slots := make([]int, 0, len(s.activePeerRefresh))
+	for slot := range s.activePeerRefresh {
+		slots = append(slots, slot)
+	}
+	sort.Ints(slots)
+	return slots
+}
+
+func (s *Server) dispatchQueuedActivePeerRefreshes(ctx context.Context) error {
+	for _, slot := range s.snapshotActivePeerRefreshSlots() {
+		if !s.shouldDispatchActivePeerRefresh(slot) {
+			s.clearActivePeerRefresh(slot)
+			continue
+		}
+		if err := s.dispatchActivePeerUpdates(ctx, slot); err != nil {
+			return err
+		}
+		s.clearActivePeerRefresh(slot)
+	}
+	return nil
 }
 
 func (s *Server) resumeRecoveredReplica(
@@ -1324,7 +1409,14 @@ func cloneRoutingSnapshot(snapshot RoutingSnapshot) RoutingSnapshot {
 }
 
 func (s *Server) matchesCompleted(slot int, nodeID string, kind pendingKind, slotVersion uint64, _ string) bool {
-	records := s.completedRecords(slot)
+	return matchesCompletedSlice(s.completedRecords(slot), nodeID, kind, slotVersion)
+}
+
+func matchesCompletedRecords(recordsBySlot map[int][]coordruntime.CompletedProgressRecord, slot int, nodeID string, kind pendingKind, slotVersion uint64) bool {
+	return matchesCompletedSlice(recordsBySlot[slot], nodeID, kind, slotVersion)
+}
+
+func matchesCompletedSlice(records []coordruntime.CompletedProgressRecord, nodeID string, kind pendingKind, slotVersion uint64) bool {
 	if len(records) == 0 {
 		return false
 	}

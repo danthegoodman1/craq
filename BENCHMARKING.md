@@ -1,17 +1,15 @@
 # Benchmarking
 
-`chainrep` includes a separate benchmark operator CLI:
+`craq` includes a separate benchmark operator CLI:
 
 - binary: `craq-bench`
 - entrypoint: [`cmd/craq-bench/main.go`](./cmd/craq-bench/main.go)
 - default profile: [`profiles/bench/gcp_c4a_steady.yaml`](./profiles/bench/gcp_c4a_steady.yaml)
+- local smoke profile: [`profiles/bench/local_smoke.yaml`](./profiles/bench/local_smoke.yaml)
+- local cloud-shape smoke profile: [`profiles/bench/local_smoke_cloud_shape.yaml`](./profiles/bench/local_smoke_cloud_shape.yaml)
 
 This is the tool that prepares Terraform-managed GCP infrastructure, runs the
 benchmark, pulls artifacts locally, analyzes the run, and tears the stack down.
-
-The current repo state is intentionally not runnable against real cloud infra
-out of the box: the default profile contains a placeholder `gcp.project`
-setting that you must replace before attempting a live run.
 
 ## Build
 
@@ -29,10 +27,73 @@ Install locally:
 - `scp`
 
 For future live runs against GCP, authenticate locally using your normal GCP
-tooling and set a real `gcp.project` value in your profile before running
+tooling and make sure `gcp.project` in your cloud profile points at the project
+you actually intend to benchmark before running
 `craq-bench run`.
 
-## Main Commands
+## Recommended Workflow
+
+Do the local-only preflight before spending money on a cloud run:
+
+```bash
+scripts/test-race-core.sh
+scripts/test-benchmark-preflight.sh
+./bin/craq-bench smoke-local
+```
+
+For the heavier local-only startup soak that mirrors the real cloud benchmark
+shape more closely, run:
+
+```bash
+scripts/test-benchmark-soak-local.sh
+./bin/craq-bench smoke-local \
+  --profile profiles/bench/local_smoke_cloud_shape.yaml \
+  --run-name cloud-shape
+```
+
+Then do the real GCP run:
+
+```bash
+./bin/craq-bench run \
+  --profile profiles/bench/gcp_c4a_steady.yaml \
+  --run-name my-bench
+```
+
+## Local Smoke
+
+`smoke-local` exercises the real benchmark runtime entirely on localhost:
+
+- one coordinator process
+- three storage processes
+- real gRPC transport
+- real client router sanity traffic
+- progress-aware routing convergence checks
+
+It does not use Terraform, SSH, or any cloud APIs.
+
+```bash
+./bin/craq-bench smoke-local \
+  --profile profiles/bench/local_smoke.yaml \
+  --run-name local-preflight
+```
+
+`smoke-local` ignores the cloud/Terraform parts of the shared profile schema and
+uses the local runtime only. Its artifacts go under the normal benchmark run
+directory root at `artifacts/benchmarks/<run-id>/`.
+
+For the heavier local cloud-shape startup soak, use:
+
+```bash
+./bin/craq-bench smoke-local \
+  --profile profiles/bench/local_smoke_cloud_shape.yaml \
+  --run-name cloud-shape
+```
+
+That profile uses the same `1024`-slot, RF `3`, `max_changed_chains: 32`
+startup shape as the real GCP benchmark path, but still runs entirely on
+localhost.
+
+## Cloud Run
 
 Create infra from scratch, run the benchmark, pull artifacts, and destroy on
 success:
@@ -136,12 +197,14 @@ The most important files are:
 
 ## Current Scope
 
-The current benchmark implementation is:
+The benchmark implementation is:
 
 - GCP only
 - steady-state only
 - designed around `c4a-standard-48-lssd` storage nodes
 - one coordinator, three storage nodes, one client
 - storage-node data directories live on RAID0-mounted Local SSD under `/var/lib/craq-bench/storage-data`
+- local-only smoke preflight through `craq-bench smoke-local`
+- local-only cloud-shape soak through `scripts/test-benchmark-soak-local.sh` and `craq-bench smoke-local --profile profiles/bench/local_smoke_cloud_shape.yaml`
 
 It is not currently a failure-injection benchmark.

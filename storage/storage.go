@@ -903,6 +903,10 @@ func (n *Node) ReportHeartbeat(ctx context.Context) error {
 	if err := n.Register(ctx); err != nil {
 		return fmt.Errorf("err in n.Register: %w", err)
 	}
+	return n.ReportHeartbeatOnly(ctx)
+}
+
+func (n *Node) ReportHeartbeatOnly(ctx context.Context) error {
 	status := n.snapshotNodeStatus()
 	if err := n.coord.ReportNodeHeartbeat(ctx, status); err != nil {
 		return fmt.Errorf("err in n.coord.ReportNodeHeartbeat: %w", err)

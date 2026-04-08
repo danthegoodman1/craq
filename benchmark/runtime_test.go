@@ -237,7 +237,10 @@ func TestActivateCatchingUpReplicasActivatesAllCurrentSlots(t *testing.T) {
 	ctx := context.Background()
 	transport := storage.NewInMemoryReplicationTransport()
 	backend := storage.NewInMemoryBackend()
-	coord := storage.NewInMemoryCoordinatorClient()
+	coord := &slowReadyCoordinatorClient{
+		inner:      storage.NewInMemoryCoordinatorClient(),
+		readyDelay: 15 * time.Millisecond,
+	}
 	node, err := storage.NewNode(ctx, storage.Config{NodeID: "node-a"}, backend, coord, transport)
 	if err != nil {
 		t.Fatalf("storage.NewNode returned error: %v", err)
@@ -252,14 +255,14 @@ func TestActivateCatchingUpReplicasActivatesAllCurrentSlots(t *testing.T) {
 		}
 	}
 
-	activateCatchingUpReplicas(ctx, node)
+	activateCatchingUpReplicas(ctx, node, "node-a", 20*time.Millisecond)
 
 	for _, slot := range []int{1, 2, 3} {
 		if got, want := node.State().Replicas[slot].State, storage.ReplicaStateActive; got != want {
 			t.Fatalf("slot %d state = %q, want %q", slot, got, want)
 		}
 	}
-	if got, want := coord.ReadySlots, []int{1, 2, 3}; !reflect.DeepEqual(got, want) {
+	if got, want := coord.inner.ReadySlots, []int{1, 2, 3}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("ready slots = %v, want %v", got, want)
 	}
 }
@@ -569,6 +572,172 @@ func TestRuntimeProcessesStayWritableAcrossSequentialAutoJoinRepairs(t *testing.
 			t.Fatalf("admin poller returned error: %v", err)
 		}
 	}
+}
+
+func TestRuntimeProcessesBecomeWritableWithBudgetedBenchmarkStartup(t *testing.T) {
+	testTimeout := 90 * time.Second
+	slotCount := 64
+	maxChangedChains := 32
+	tickInterval := 250 * time.Millisecond
+	heartbeatInterval := 250 * time.Millisecond
+	activationInterval := 50 * time.Millisecond
+	rpcDeadline := 5 * time.Second
+	if benchmarkRaceEnabled {
+		testTimeout = 75 * time.Second
+		slotCount = 24
+		maxChangedChains = 12
+		tickInterval = 300 * time.Millisecond
+		heartbeatInterval = 300 * time.Millisecond
+		activationInterval = 50 * time.Millisecond
+		rpcDeadline = 3 * time.Second
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	tempDir := t.TempDir()
+	manifest := quickstart.Config{
+		Coordinator: quickstart.Coordinator{
+			RPCAddress:        reserveAddress(t),
+			AdminAddress:      reserveAddress(t),
+			SlotCount:         slotCount,
+			ReplicationFactor: 3,
+		},
+		Nodes: []quickstart.Node{
+			{ID: "a", RPCAddress: reserveAddress(t), AdminAddress: reserveAddress(t), FailureDomains: map[string]string{"host": "a", "rack": "a"}},
+			{ID: "b", RPCAddress: reserveAddress(t), AdminAddress: reserveAddress(t), FailureDomains: map[string]string{"host": "b", "rack": "b"}},
+			{ID: "c", RPCAddress: reserveAddress(t), AdminAddress: reserveAddress(t), FailureDomains: map[string]string{"host": "c", "rack": "c"}},
+		},
+	}
+	if err := manifest.Validate(); err != nil {
+		t.Fatalf("manifest.Validate returned error: %v", err)
+	}
+	manifestPath := filepath.Join(tempDir, "manifest.json")
+	if err := SaveManifest(manifestPath, manifest); err != nil {
+		t.Fatalf("SaveManifest returned error: %v", err)
+	}
+
+	processCtx, stopProcesses := context.WithCancel(ctx)
+	defer stopProcesses()
+
+	processErrs := make(chan error, len(manifest.Nodes)+1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		processErrs <- RunCoordinatorProcess(processCtx, CoordinatorProcessConfig{
+			ManifestPath: manifestPath,
+			DataDir:      filepath.Join(tempDir, "coordinator"),
+			Liveness: coordserver.LivenessPolicy{
+				SuspectAfter:  2 * time.Second,
+				DeadAfter:     5 * time.Second,
+				FlapWindow:    10 * time.Second,
+				FlapThreshold: 8,
+			},
+			Reconfiguration: coordinator.ReconfigurationPolicy{MaxChangedChains: maxChangedChains},
+			TickInterval:    tickInterval,
+			RPCDeadline:     rpcDeadline,
+		})
+	}()
+	if err := waitForHTTP200(ctx, "http://"+manifest.Coordinator.AdminAddress+"/livez", nil); err != nil {
+		t.Fatalf("wait for coordinator admin server returned error: %v", err)
+	}
+	for _, node := range manifest.Nodes {
+		node := node
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			processErrs <- RunStorageProcess(processCtx, StorageProcessConfig{
+				ManifestPath:       manifestPath,
+				NodeID:             node.ID,
+				DataDir:            filepath.Join(tempDir, "storage-"+node.ID),
+				HeartbeatInterval:  heartbeatInterval,
+				ActivationInterval: activationInterval,
+				RPCDeadline:        rpcDeadline,
+			})
+		}()
+	}
+
+	pool := grpcx.NewConnPool()
+	t.Cleanup(func() { _ = pool.Close() })
+	admin := grpcx.NewCoordinatorAdminClient(manifest.Coordinator.RPCAddress, pool)
+	router, err := client.NewRouter(admin, grpcx.NewClientTransport(pool))
+	if err != nil {
+		t.Fatalf("client.NewRouter returned error: %v", err)
+	}
+
+	var runErr error
+	snapshot, err := waitForWritableRouting(ctx, admin)
+	if err != nil {
+		runErr = fmt.Errorf("waitForWritableRouting returned error: %w", err)
+	} else {
+		for _, route := range snapshot.Slots {
+			if !route.Readable || !route.Writable {
+				runErr = fmt.Errorf("route %#v is not fully readable+writable", route)
+				break
+			}
+		}
+	}
+	if runErr == nil {
+		opCtx, opCancel := context.WithTimeout(ctx, 2*time.Second)
+		defer opCancel()
+		if err := router.Refresh(opCtx); err != nil {
+			runErr = fmt.Errorf("router.Refresh returned error: %w", err)
+		} else if _, err := router.Put(opCtx, "budgeted-startup", "ok"); err != nil {
+			runErr = fmt.Errorf("router.Put returned error: %w", err)
+		} else {
+			readResult, err := router.Get(opCtx, "budgeted-startup")
+			if err != nil {
+				runErr = fmt.Errorf("router.Get returned error: %w", err)
+			} else if !readResult.Found || readResult.Value != "ok" {
+				runErr = fmt.Errorf("router.Get result = %#v, want found value", readResult)
+			}
+		}
+	}
+
+	stopProcesses()
+	wg.Wait()
+	close(processErrs)
+	for err := range processErrs {
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("runtime process returned error: %v", err)
+		}
+	}
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+}
+
+type slowReadyCoordinatorClient struct {
+	inner      *storage.InMemoryCoordinatorClient
+	readyDelay time.Duration
+}
+
+func (c *slowReadyCoordinatorClient) RegisterNode(ctx context.Context, reg storage.NodeRegistration) error {
+	return c.inner.RegisterNode(ctx, reg)
+}
+
+func (c *slowReadyCoordinatorClient) ReportReplicaReady(ctx context.Context, slot int, epoch uint64) error {
+	timer := time.NewTimer(c.readyDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+	}
+	return c.inner.ReportReplicaReady(ctx, slot, epoch)
+}
+
+func (c *slowReadyCoordinatorClient) ReportReplicaRemoved(ctx context.Context, slot int, epoch uint64) error {
+	return c.inner.ReportReplicaRemoved(ctx, slot, epoch)
+}
+
+func (c *slowReadyCoordinatorClient) ReportNodeRecovered(ctx context.Context, report storage.NodeRecoveryReport) error {
+	return c.inner.ReportNodeRecovered(ctx, report)
+}
+
+func (c *slowReadyCoordinatorClient) ReportNodeHeartbeat(ctx context.Context, status storage.NodeStatus) error {
+	return c.inner.ReportNodeHeartbeat(ctx, status)
 }
 
 func startConcurrentAdminPoller(wg *sync.WaitGroup, ctx context.Context, errCh chan<- error, poll func(context.Context) error) {

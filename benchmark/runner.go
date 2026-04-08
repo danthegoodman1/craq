@@ -2,7 +2,6 @@ package benchmark
 
 import (
 	"archive/tar"
-	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -597,18 +596,54 @@ func waitForRoutingReady(ctx context.Context, state RunState) error {
 	logProgress("waiting for coordinator routing state to become writable")
 	clientSSH := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP, DisableJump: true}
 	command := "curl -fsS http://" + state.TerraformOutputs.PrivateIPs["coordinator"] + ":7401/admin/v1/state"
-	deadline := time.Now().Add(2 * time.Minute)
+	overallTimeout := routingReadyOverallTimeout(state.Profile)
+	stallTimeout := routingReadyStallTimeout(state.Profile)
+	deadline := time.Now().Add(overallTimeout)
+	stallDeadline := time.Now().Add(stallTimeout)
 	var lastState []byte
 	var lastErr error
+	lastProgress := routingProgress{writableSlots: -1, readableSlots: -1, pendingSlots: -1}
+	var lastLogged time.Time
 	for time.Now().Before(deadline) {
 		data, err := SSHCapture(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, command)
 		if len(data) > 0 {
 			lastState = append(lastState[:0], data...)
 		}
 		lastErr = err
-		if err == nil && bytes.Contains(data, []byte(`"writable":true`)) {
-			logProgress("coordinator routing state is writable")
-			return nil
+		if err == nil {
+			progress, progressErr := decodeRoutingProgress(data)
+			if progressErr == nil {
+				if progress.slotCount > 0 && progress.writableSlots == progress.slotCount {
+					logProgress("coordinator routing state is writable")
+					return nil
+				}
+				if routingProgressChanged(lastProgress, progress) {
+					stallDeadline = time.Now().Add(stallTimeout)
+					logProgress(
+						"routing progress: writable=%d/%d readable=%d pending=%d version=%d",
+						progress.writableSlots,
+						progress.slotCount,
+						progress.readableSlots,
+						progress.pendingSlots,
+						progress.version,
+					)
+					lastLogged = time.Now()
+					lastProgress = progress
+				} else if lastLogged.IsZero() || time.Since(lastLogged) >= 15*time.Second {
+					logProgress(
+						"still waiting for writable routing: writable=%d/%d readable=%d pending=%d version=%d",
+						progress.writableSlots,
+						progress.slotCount,
+						progress.readableSlots,
+						progress.pendingSlots,
+						progress.version,
+					)
+					lastLogged = time.Now()
+				}
+			}
+		}
+		if time.Now().After(stallDeadline) {
+			break
 		}
 		select {
 		case <-ctx.Done():
@@ -620,14 +655,86 @@ func waitForRoutingReady(ctx context.Context, state RunState) error {
 	if len(diag) > 1200 {
 		diag = diag[:1200] + "...(truncated)"
 	}
+	progressSummary := ""
+	if lastProgress.slotCount > 0 {
+		progressSummary = fmt.Sprintf(
+			"last routing progress: writable=%d/%d readable=%d pending=%d version=%d; ",
+			lastProgress.writableSlots,
+			lastProgress.slotCount,
+			lastProgress.readableSlots,
+			lastProgress.pendingSlots,
+			lastProgress.version,
+		)
+	}
 	switch {
 	case diag != "":
-		return fmt.Errorf("timed out waiting for writable routing state; last coordinator state: %s", diag)
+		return fmt.Errorf("timed out waiting for writable routing state after %s; %slast coordinator state: %s", overallTimeout, progressSummary, diag)
 	case lastErr != nil:
-		return fmt.Errorf("timed out waiting for writable routing state; last poll error: %w", lastErr)
+		return fmt.Errorf("timed out waiting for writable routing state after %s; %slast poll error: %w", overallTimeout, progressSummary, lastErr)
 	default:
-		return fmt.Errorf("timed out waiting for writable routing state")
+		return fmt.Errorf("timed out waiting for writable routing state after %s; %s", overallTimeout, progressSummary)
 	}
+}
+
+type routingProgress struct {
+	version       uint64
+	slotCount     int
+	writableSlots int
+	readableSlots int
+	pendingSlots  int
+}
+
+func decodeRoutingProgress(data []byte) (routingProgress, error) {
+	var state coordserver.AdminState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return routingProgress{}, err
+	}
+	progress := routingProgress{
+		version:      state.Current.Version,
+		slotCount:    state.RoutingSnapshot.SlotCount,
+		pendingSlots: len(state.Pending),
+	}
+	for _, route := range state.RoutingSnapshot.Slots {
+		if route.Readable {
+			progress.readableSlots++
+		}
+		if route.Readable && route.Writable {
+			progress.writableSlots++
+		}
+	}
+	return progress, nil
+}
+
+func routingProgressChanged(prev routingProgress, next routingProgress) bool {
+	return prev.version != next.version ||
+		prev.slotCount != next.slotCount ||
+		prev.writableSlots != next.writableSlots ||
+		prev.readableSlots != next.readableSlots ||
+		prev.pendingSlots != next.pendingSlots
+}
+
+func routingReadyOverallTimeout(profile Profile) time.Duration {
+	timeout := 10 * time.Minute
+	if profile.Cluster.SlotCount <= 0 {
+		return timeout
+	}
+	perReplica := 500 * time.Millisecond
+	estimated := time.Duration(profile.Cluster.SlotCount*profile.Cluster.ReplicationFactor) * perReplica
+	if estimated > timeout {
+		timeout = estimated
+	}
+	return timeout
+}
+
+func routingReadyStallTimeout(profile Profile) time.Duration {
+	timeout := 45 * time.Second
+	if profile.Cluster.RPCDeadline > 0 {
+		candidate := profile.Cluster.RPCDeadline * 6
+		if candidate > timeout {
+			timeout = candidate
+		}
+	}
+	return timeout
 }
 
 func runRemoteLoadgen(ctx context.Context, state RunState) error {

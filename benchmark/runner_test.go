@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/danthegoodman1/craq/coordinator"
 )
@@ -167,5 +168,66 @@ func TestCoordinatorProcessConfigIncludesReconfigurationBudget(t *testing.T) {
 	}
 	if got, want := decoded.Reconfiguration.MaxChangedChains, 32; got != want {
 		t.Fatalf("decoded reconfiguration max_changed_chains = %d, want %d", got, want)
+	}
+}
+
+func TestDecodeRoutingProgress(t *testing.T) {
+	data := []byte(`{
+  "current": {"Version": 17},
+  "routing_snapshot": {
+    "Version": 17,
+    "SlotCount": 3,
+    "Slots": [
+      {"Slot": 0, "Readable": true, "Writable": true},
+      {"Slot": 1, "Readable": true, "Writable": false},
+      {"Slot": 2, "Readable": false, "Writable": false}
+    ]
+  },
+  "pending": {
+    "1": {"Slot": 1, "NodeID": "c", "Kind": "ready", "SlotVersion": 3, "Epoch": 0, "CommandID": "cmd-1"}
+  }
+}`)
+
+	progress, err := decodeRoutingProgress(data)
+	if err != nil {
+		t.Fatalf("decodeRoutingProgress returned error: %v", err)
+	}
+	if got, want := progress.version, uint64(17); got != want {
+		t.Fatalf("progress.version = %d, want %d", got, want)
+	}
+	if got, want := progress.slotCount, 3; got != want {
+		t.Fatalf("progress.slotCount = %d, want %d", got, want)
+	}
+	if got, want := progress.readableSlots, 2; got != want {
+		t.Fatalf("progress.readableSlots = %d, want %d", got, want)
+	}
+	if got, want := progress.writableSlots, 1; got != want {
+		t.Fatalf("progress.writableSlots = %d, want %d", got, want)
+	}
+	if got, want := progress.pendingSlots, 1; got != want {
+		t.Fatalf("progress.pendingSlots = %d, want %d", got, want)
+	}
+}
+
+func TestRoutingReadyOverallTimeoutScalesWithClusterSize(t *testing.T) {
+	profile := Profile{
+		Cluster: ClusterProfile{
+			SlotCount:         1024,
+			ReplicationFactor: 3,
+		},
+	}
+	if got, want := routingReadyOverallTimeout(profile), 25*time.Minute+36*time.Second; got != want {
+		t.Fatalf("routingReadyOverallTimeout = %s, want %s", got, want)
+	}
+}
+
+func TestRoutingReadyStallTimeoutHonorsRPCDeadline(t *testing.T) {
+	profile := Profile{
+		Cluster: ClusterProfile{
+			RPCDeadline: 15 * time.Second,
+		},
+	}
+	if got, want := routingReadyStallTimeout(profile), 90*time.Second; got != want {
+		t.Fatalf("routingReadyStallTimeout = %s, want %s", got, want)
 	}
 }
