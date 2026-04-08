@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -233,7 +234,7 @@ func TestLocalRuntimeAndLoadGen(t *testing.T) {
 	}
 }
 
-func TestActivateCatchingUpReplicasActivatesAllCurrentSlots(t *testing.T) {
+func TestAdvanceReplicaLifecycleActivatesAndRemovesCurrentSlots(t *testing.T) {
 	ctx := context.Background()
 	transport := storage.NewInMemoryReplicationTransport()
 	backend := storage.NewInMemoryBackend()
@@ -255,7 +256,7 @@ func TestActivateCatchingUpReplicasActivatesAllCurrentSlots(t *testing.T) {
 		}
 	}
 
-	activateCatchingUpReplicas(ctx, node, "node-a", 20*time.Millisecond)
+	advanceReplicaLifecycle(ctx, node, "node-a", 20*time.Millisecond)
 
 	for _, slot := range []int{1, 2, 3} {
 		if got, want := node.State().Replicas[slot].State, storage.ReplicaStateActive; got != want {
@@ -263,7 +264,24 @@ func TestActivateCatchingUpReplicasActivatesAllCurrentSlots(t *testing.T) {
 		}
 	}
 	if got, want := coord.inner.ReadySlots, []int{1, 2, 3}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("ready slots = %v, want %v", got, want)
+		gotSorted := append([]int(nil), got...)
+		sort.Ints(gotSorted)
+		if !reflect.DeepEqual(gotSorted, want) {
+			t.Fatalf("ready slots = %v, want %v", got, want)
+		}
+	}
+
+	if err := node.MarkReplicaLeaving(ctx, storage.MarkReplicaLeavingCommand{Slot: 2}); err != nil {
+		t.Fatalf("MarkReplicaLeaving returned error: %v", err)
+	}
+
+	advanceReplicaLifecycle(ctx, node, "node-a", 20*time.Millisecond)
+
+	if _, exists := node.State().Replicas[2]; exists {
+		t.Fatal("slot 2 replica still present after lifecycle removal")
+	}
+	if got, want := coord.inner.RemovedSlots, []int{2}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("removed slots = %v, want %v", got, want)
 	}
 }
 
@@ -332,6 +350,10 @@ func TestRuntimeProcessesReachWritableRoutingUnderConcurrentAdminReads(t *testin
 	if err != nil {
 		t.Fatalf("client.NewRouter returned error: %v", err)
 	}
+	pollRouter, err := client.NewRouter(admin, grpcx.NewClientTransport(pool))
+	if err != nil {
+		t.Fatalf("client.NewRouter poller returned error: %v", err)
+	}
 
 	pollCtx, stopPoll := context.WithCancel(ctx)
 	defer stopPoll()
@@ -346,7 +368,7 @@ func TestRuntimeProcessesReachWritableRoutingUnderConcurrentAdminReads(t *testin
 	startConcurrentAdminPoller(&pollWG, pollCtx, pollErrs, func(pollCtx context.Context) error {
 		refreshCtx, cancel := context.WithTimeout(pollCtx, 250*time.Millisecond)
 		defer cancel()
-		return router.Refresh(refreshCtx)
+		return pollRouter.Refresh(refreshCtx)
 	})
 
 	snapshot, err := waitForWritableRouting(ctx, admin)
@@ -358,6 +380,8 @@ func TestRuntimeProcessesReachWritableRoutingUnderConcurrentAdminReads(t *testin
 			t.Fatalf("route %#v is not fully readable+writable", route)
 		}
 	}
+	stopPoll()
+	pollWG.Wait()
 
 	opCtx, opCancel := context.WithTimeout(ctx, 2*time.Second)
 	defer opCancel()
@@ -379,8 +403,6 @@ func TestRuntimeProcessesReachWritableRoutingUnderConcurrentAdminReads(t *testin
 		t.Fatalf("router.Get result = %#v, want found value", readResult)
 	}
 
-	stopPoll()
-	pollWG.Wait()
 	stopProcesses()
 	wg.Wait()
 	close(processErrs)
@@ -488,6 +510,10 @@ func TestRuntimeProcessesStayWritableAcrossSequentialAutoJoinRepairs(t *testing.
 	if err != nil {
 		t.Fatalf("client.NewRouter returned error: %v", err)
 	}
+	pollRouter, err := client.NewRouter(admin, grpcx.NewClientTransport(pool))
+	if err != nil {
+		t.Fatalf("client.NewRouter poller returned error: %v", err)
+	}
 
 	pollCtx, stopPoll := context.WithCancel(ctx)
 	defer stopPoll()
@@ -502,7 +528,7 @@ func TestRuntimeProcessesStayWritableAcrossSequentialAutoJoinRepairs(t *testing.
 	startConcurrentAdminPoller(&pollWG, pollCtx, pollErrs, func(pollCtx context.Context) error {
 		refreshCtx, cancel := context.WithTimeout(pollCtx, 250*time.Millisecond)
 		defer cancel()
-		return router.Refresh(refreshCtx)
+		return pollRouter.Refresh(refreshCtx)
 	})
 
 	snapshot, err := waitForWritableRouting(ctx, admin)
@@ -770,6 +796,8 @@ func startConcurrentAdminPoller(wg *sync.WaitGroup, ctx context.Context, errCh c
 func waitForWritableRouting(ctx context.Context, admin *grpcx.CoordinatorAdminClient) (coordserver.RoutingSnapshot, error) {
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
+	var stable coordserver.RoutingSnapshot
+	stableCount := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -792,8 +820,18 @@ func waitForWritableRouting(ctx context.Context, admin *grpcx.CoordinatorAdminCl
 				}
 			}
 			if writable {
-				return snapshot, nil
+				if stableCount > 0 && stable.Version == snapshot.Version {
+					stableCount++
+				} else {
+					stable = snapshot
+					stableCount = 1
+				}
+				if stableCount >= 3 {
+					return snapshot, nil
+				}
+				continue
 			}
+			stableCount = 0
 		}
 	}
 }
@@ -809,6 +847,8 @@ func waitForWritableRoutingIncluding(
 	}
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
+	var stable coordserver.RoutingSnapshot
+	stableCount := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -851,8 +891,18 @@ func waitForWritableRoutingIncluding(
 				}
 			}
 			if healthy {
-				return snapshot, nil
+				if stableCount > 0 && stable.Version == snapshot.Version {
+					stableCount++
+				} else {
+					stable = snapshot
+					stableCount = 1
+				}
+				if stableCount >= 3 {
+					return snapshot, nil
+				}
+				continue
 			}
+			stableCount = 0
 		}
 	}
 }

@@ -25,6 +25,11 @@ type AdminState struct {
 	Recent              []ops.Event                                `json:"recent_events"`
 }
 
+type RoutingStatus struct {
+	RoutingSnapshot RoutingSnapshot `json:"routing_snapshot"`
+	PendingCount    int             `json:"pending_count"`
+}
+
 type serverEventRecorder struct {
 	ring *ops.EventRing
 }
@@ -228,6 +233,18 @@ func (s *Server) AdminState(ctx context.Context) AdminState {
 		UnavailableReplicas: s.UnavailableReplicas(),
 		LastRecoveryReports: s.LastRecoveryReports(),
 		Recent:              s.RecentEvents(),
+	}
+}
+
+func (s *Server) RoutingStatus(ctx context.Context) RoutingStatus {
+	s.refreshMetricGauges()
+	snapshot, _ := s.RoutingSnapshot(ctx)
+	s.viewMu.RLock()
+	pendingCount := len(s.pending)
+	s.viewMu.RUnlock()
+	return RoutingStatus{
+		RoutingSnapshot: snapshot,
+		PendingCount:    pendingCount,
 	}
 }
 

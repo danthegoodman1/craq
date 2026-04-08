@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/danthegoodman1/craq/coordinator"
-	"github.com/danthegoodman1/craq/coordserver"
 	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
+	"github.com/danthegoodman1/craq/coordserver"
 	"github.com/danthegoodman1/craq/storage"
 )
 
@@ -125,11 +125,11 @@ func Run(t *testing.T, factory Factory) {
 		}
 		version, err := store.SaveSnapshot(context.Background(), leaseA, now.Add(100*time.Millisecond), 0, coordserver.HASnapshot{
 			Outbox: []coordserver.OutboxEntry{{
-				ID:      "outbox-1",
-				Epoch:   leaseA.Epoch,
-				NodeID:  "n1",
-				Slot:    1,
-				Kind:    coordserver.OutboxCommandMarkReplicaLeaving,
+				ID:        "outbox-1",
+				Epoch:     leaseA.Epoch,
+				NodeID:    "n1",
+				Slot:      1,
+				Kind:      coordserver.OutboxCommandMarkReplicaLeaving,
 				CommandID: "cmd-1",
 			}},
 		})
@@ -267,6 +267,12 @@ func coordserverCloneSnapshot(snapshot coordserver.HASnapshot) coordserver.HASna
 	}
 	if cloned.Pending == nil {
 		cloned.Pending = map[int]coordserver.PendingWork{}
+	}
+	if cloned.Heartbeats == nil {
+		cloned.Heartbeats = map[string]storage.NodeStatus{}
+	}
+	if cloned.Liveness == nil {
+		cloned.Liveness = map[string]coordruntime.NodeLivenessRecord{}
 	}
 	if cloned.UnavailableReplicas == nil {
 		cloned.UnavailableReplicas = map[string]map[int]bool{}

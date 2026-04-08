@@ -595,7 +595,8 @@ func startServices(ctx context.Context, state RunState) error {
 func waitForRoutingReady(ctx context.Context, state RunState) error {
 	logProgress("waiting for coordinator routing state to become writable")
 	clientSSH := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP, DisableJump: true}
-	command := "curl -fsS http://" + state.TerraformOutputs.PrivateIPs["coordinator"] + ":7401/admin/v1/state"
+	routingCommand := "curl -fsS http://" + state.TerraformOutputs.PrivateIPs["coordinator"] + ":7401/admin/v1/routing"
+	stateCommand := "curl -fsS http://" + state.TerraformOutputs.PrivateIPs["coordinator"] + ":7401/admin/v1/state"
 	overallTimeout := routingReadyOverallTimeout(state.Profile)
 	stallTimeout := routingReadyStallTimeout(state.Profile)
 	deadline := time.Now().Add(overallTimeout)
@@ -605,10 +606,7 @@ func waitForRoutingReady(ctx context.Context, state RunState) error {
 	lastProgress := routingProgress{writableSlots: -1, readableSlots: -1, pendingSlots: -1}
 	var lastLogged time.Time
 	for time.Now().Before(deadline) {
-		data, err := SSHCapture(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, command)
-		if len(data) > 0 {
-			lastState = append(lastState[:0], data...)
-		}
+		data, err := SSHCapture(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, routingCommand)
 		lastErr = err
 		if err == nil {
 			progress, progressErr := decodeRoutingProgress(data)
@@ -651,6 +649,13 @@ func waitForRoutingReady(ctx context.Context, state RunState) error {
 		case <-time.After(3 * time.Second):
 		}
 	}
+	data, err := SSHCapture(ctx, clientSSH, state.TerraformOutputs.PublicClientIP, stateCommand)
+	if len(data) > 0 {
+		lastState = append(lastState[:0], data...)
+	}
+	if err != nil {
+		lastErr = err
+	}
 	diag := strings.TrimSpace(string(lastState))
 	if len(diag) > 1200 {
 		diag = diag[:1200] + "...(truncated)"
@@ -685,16 +690,40 @@ type routingProgress struct {
 }
 
 func decodeRoutingProgress(data []byte) (routingProgress, error) {
-	var state coordserver.AdminState
-	if err := json.Unmarshal(data, &state); err != nil {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return routingProgress{}, err
+	}
+	if _, ok := envelope["current"]; ok {
+		var state coordserver.AdminState
+		if err := json.Unmarshal(data, &state); err != nil {
+			return routingProgress{}, err
+		}
+		progress := routingProgress{
+			version:      state.Current.Version,
+			slotCount:    state.RoutingSnapshot.SlotCount,
+			pendingSlots: len(state.Pending),
+		}
+		for _, route := range state.RoutingSnapshot.Slots {
+			if route.Readable {
+				progress.readableSlots++
+			}
+			if route.Readable && route.Writable {
+				progress.writableSlots++
+			}
+		}
+		return progress, nil
+	}
+	var status coordserver.RoutingStatus
+	if err := json.Unmarshal(data, &status); err != nil {
 		return routingProgress{}, err
 	}
 	progress := routingProgress{
-		version:      state.Current.Version,
-		slotCount:    state.RoutingSnapshot.SlotCount,
-		pendingSlots: len(state.Pending),
+		version:      status.RoutingSnapshot.Version,
+		slotCount:    status.RoutingSnapshot.SlotCount,
+		pendingSlots: status.PendingCount,
 	}
-	for _, route := range state.RoutingSnapshot.Slots {
+	for _, route := range status.RoutingSnapshot.Slots {
 		if route.Readable {
 			progress.readableSlots++
 		}

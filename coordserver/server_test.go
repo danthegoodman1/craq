@@ -846,19 +846,16 @@ func TestRoutingSnapshotExcludesJoiningAndLeavingReplicas(t *testing.T) {
 	if got, want := route.HeadNodeID, "b"; got != want {
 		t.Fatalf("head during join = %q, want %q", got, want)
 	}
-	if got, want := route.TailNodeID, "c"; got != want {
+	if got, want := route.TailNodeID, "a"; got != want {
 		t.Fatalf("tail during join = %q, want %q", got, want)
 	}
-	if route.Writable {
-		t.Fatalf("route during join = %#v, want not writable", route)
-	}
-	if !route.Readable {
-		t.Fatalf("route during join = %#v, want readable", route)
+	if route.Writable || !route.Readable {
+		t.Fatalf("route during join = %#v, want readable but not writable until join is ready", route)
 	}
 	if got, want := route.ReadReplicas, []ReadReplicaRoute{
 		{NodeID: "b", Role: storage.ReplicaRoleHead},
-		{NodeID: "a", Role: storage.ReplicaRoleMiddle},
-		{NodeID: "c", Role: storage.ReplicaRoleTail},
+		{NodeID: "c", Role: storage.ReplicaRoleMiddle},
+		{NodeID: "a", Role: storage.ReplicaRoleTail},
 	}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("read replicas during join = %#v, want %#v", got, want)
 	}
@@ -880,8 +877,8 @@ func TestRoutingSnapshotExcludesJoiningAndLeavingReplicas(t *testing.T) {
 	if got, want := route.TailNodeID, "a"; got != want {
 		t.Fatalf("tail after ready = %q, want %q", got, want)
 	}
-	if !route.Writable || !route.Readable {
-		t.Fatalf("route after ready = %#v, want readable and writable", route)
+	if route.Writable || route.Readable {
+		t.Fatalf("route after ready = %#v, want blocked until leaving replica removal and peer refresh complete", route)
 	}
 	if got, want := route.ReadReplicas, []ReadReplicaRoute{
 		{NodeID: "d", Role: storage.ReplicaRoleHead},
@@ -1463,6 +1460,34 @@ func replicaNodeStates(chain coordinator.Chain) []string {
 		states = append(states, fmt.Sprintf("%s:%s", replica.NodeID, replica.State))
 	}
 	return states
+}
+
+func plannedLeavingNodeAfterReady(t *testing.T, server *Server, slot int, joiningNodeID string) string {
+	t.Helper()
+	current := server.Current()
+	preview, err := coordinator.ApplyProgress(current.Cluster, coordinator.Event{
+		Kind:   coordinator.EventKindReplicaBecameActive,
+		NodeID: joiningNodeID,
+		Slot:   slot,
+	})
+	if err != nil {
+		t.Fatalf("ApplyProgress preview returned error: %v", err)
+	}
+	plan, err := coordinator.PlanReconfiguration(*preview, nil, server.reconfigurationPolicy())
+	if err != nil {
+		t.Fatalf("PlanReconfiguration preview returned error: %v", err)
+	}
+	for _, slotPlan := range plan.ChangedSlots {
+		if slotPlan.Slot != slot {
+			continue
+		}
+		for _, step := range slotPlan.Steps {
+			if step.Kind == coordinator.StepKindMarkLeaving {
+				return step.NodeID
+			}
+		}
+	}
+	return ""
 }
 
 func mapToClient(nodes map[string]*recordingNodeClient) map[string]StorageNodeClient {

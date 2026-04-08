@@ -51,6 +51,8 @@ type HASnapshot struct {
 	SnapshotVersion     uint64
 	State               coordruntime.State
 	Pending             map[int]PendingWork
+	Heartbeats          map[string]storage.NodeStatus
+	Liveness            map[string]coordruntime.NodeLivenessRecord
 	LastPolicy          coordinator.ReconfigurationPolicy
 	UnavailableReplicas map[string]map[int]bool
 	LastRecoveryReports map[string]storage.NodeRecoveryReport
@@ -69,6 +71,8 @@ func zeroHASnapshot() HASnapshot {
 	return HASnapshot{
 		State:               coordruntime.State{SlotVersions: map[int]uint64{}, CompletedProgressBySlot: map[int][]coordruntime.CompletedProgressRecord{}, NodeLivenessByID: map[string]coordruntime.NodeLivenessRecord{}, AppliedCommands: map[string]coordruntime.AppliedCommand{}},
 		Pending:             map[int]PendingWork{},
+		Heartbeats:          map[string]storage.NodeStatus{},
+		Liveness:            map[string]coordruntime.NodeLivenessRecord{},
 		UnavailableReplicas: map[string]map[int]bool{},
 		LastRecoveryReports: map[string]storage.NodeRecoveryReport{},
 		Outbox:              []OutboxEntry{},
@@ -91,6 +95,12 @@ func normalizeHASnapshot(snapshot HASnapshot) HASnapshot {
 	}
 	if normalized.Pending == nil {
 		normalized.Pending = map[int]PendingWork{}
+	}
+	if normalized.Heartbeats == nil {
+		normalized.Heartbeats = map[string]storage.NodeStatus{}
+	}
+	if normalized.Liveness == nil {
+		normalized.Liveness = map[string]coordruntime.NodeLivenessRecord{}
 	}
 	if normalized.UnavailableReplicas == nil {
 		normalized.UnavailableReplicas = map[string]map[int]bool{}
@@ -119,6 +129,8 @@ func cloneHASnapshot(snapshot HASnapshot) HASnapshot {
 		snapshot.State.NodeLivenessByID == nil &&
 		snapshot.State.AppliedCommands == nil &&
 		snapshot.Pending == nil &&
+		snapshot.Heartbeats == nil &&
+		snapshot.Liveness == nil &&
 		snapshot.UnavailableReplicas == nil &&
 		snapshot.LastRecoveryReports == nil &&
 		snapshot.Outbox == nil {
@@ -130,6 +142,8 @@ func cloneHASnapshot(snapshot HASnapshot) HASnapshot {
 		SnapshotVersion:     snapshot.SnapshotVersion,
 		State:               snapshot.State,
 		Pending:             make(map[int]PendingWork, len(snapshot.Pending)),
+		Heartbeats:          make(map[string]storage.NodeStatus, len(snapshot.Heartbeats)),
+		Liveness:            make(map[string]coordruntime.NodeLivenessRecord, len(snapshot.Liveness)),
 		LastPolicy:          snapshot.LastPolicy,
 		UnavailableReplicas: make(map[string]map[int]bool, len(snapshot.UnavailableReplicas)),
 		LastRecoveryReports: make(map[string]storage.NodeRecoveryReport, len(snapshot.LastRecoveryReports)),
@@ -138,6 +152,12 @@ func cloneHASnapshot(snapshot HASnapshot) HASnapshot {
 	cloned.State = coordruntime.OpenInMemoryFromState(snapshot.State).Current()
 	for slot, pending := range snapshot.Pending {
 		cloned.Pending[slot] = pending
+	}
+	for nodeID, status := range snapshot.Heartbeats {
+		cloned.Heartbeats[nodeID] = cloneNodeStatus(status)
+	}
+	for nodeID, record := range snapshot.Liveness {
+		cloned.Liveness[nodeID] = cloneLivenessRecord(record)
 	}
 	for nodeID, slots := range snapshot.UnavailableReplicas {
 		clonedSlots := make(map[int]bool, len(slots))

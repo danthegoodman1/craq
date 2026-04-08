@@ -412,23 +412,72 @@ func buildSteadyStateChains(
 	counts := make(map[string]assignmentCounts, len(nodes))
 	chains := make([]Chain, slotCount)
 	for slot := 0; slot < slotCount; slot++ {
-		chain := Chain{
+		tentativeCounts := cloneAssignmentCounts(counts)
+		tentative := Chain{
 			Slot:     slot,
 			Replicas: make([]Replica, 0, replicationFactor),
 		}
 		for replicaPosition := 0; replicaPosition < replicationFactor; replicaPosition++ {
-			candidate, ok := selectReplicaCandidate(nodes, chain, nodesByID, counts)
+			candidate, ok := selectReplicaCandidate(nodes, tentative, nodesByID, tentativeCounts)
 			if !ok {
 				return nil, &PlacementError{
 					Slot:            slot,
 					ReplicaPosition: replicaPosition,
 				}
 			}
-			appendReplicaWithState(&chain, candidate.ID, ReplicaStateActive, counts)
+			appendReplicaWithState(&tentative, candidate.ID, ReplicaStateActive, tentativeCounts)
 		}
+		chain := tentative
+		if len(nodes) == replicationFactor {
+			chain = rebalanceSteadyStateChain(slot, tentative)
+		}
+		recordChainAssignmentCounts(counts, chain)
 		chains[slot] = chain
 	}
 	return chains, nil
+}
+
+func cloneAssignmentCounts(current map[string]assignmentCounts) map[string]assignmentCounts {
+	cloned := make(map[string]assignmentCounts, len(current))
+	for nodeID, counts := range current {
+		cloned[nodeID] = counts
+	}
+	return cloned
+}
+
+func rebalanceSteadyStateChain(slot int, chain Chain) Chain {
+	if len(chain.Replicas) <= 1 {
+		return cloneChain(chain)
+	}
+	nodeIDs := replicaIDs(chain.Replicas)
+	sort.Strings(nodeIDs)
+	offset := slot % len(nodeIDs)
+	rotated := append(append([]string(nil), nodeIDs[offset:]...), nodeIDs[:offset]...)
+	rebalanced := Chain{
+		Slot:     chain.Slot,
+		Replicas: make([]Replica, 0, len(rotated)),
+	}
+	for _, nodeID := range rotated {
+		rebalanced.Replicas = append(rebalanced.Replicas, Replica{
+			NodeID: nodeID,
+			State:  ReplicaStateActive,
+		})
+	}
+	return rebalanced
+}
+
+func recordChainAssignmentCounts(counts map[string]assignmentCounts, chain Chain) {
+	for i, replica := range chain.Replicas {
+		nodeCounts := counts[replica.NodeID]
+		nodeCounts.replicaCount++
+		if i == 0 {
+			nodeCounts.headCount++
+		}
+		if i == len(chain.Replicas)-1 {
+			nodeCounts.tailCount++
+		}
+		counts[replica.NodeID] = nodeCounts
+	}
 }
 
 func applyEvent(state *ClusterState, event Event) error {
@@ -597,13 +646,20 @@ func reconcileState(state *ClusterState, policy ReconfigurationPolicy) ([]SlotPl
 	}
 
 	if haveDesired {
-		for slot := 0; slot < state.SlotCount; slot++ {
+		remaining := remainingChangedChainBudget(policy, len(changedSlots))
+		for _, slot := range appendPrioritySlots(*state) {
+			if remaining == 0 {
+				break
+			}
 			slotPlan, changed, err := appendMissingDesiredReplicas(state, slot, desiredChains[slot])
 			if err != nil {
 				return nil, err
 			}
 			if changed {
 				changedSlots = append(changedSlots, slotPlan)
+				if remaining > 0 {
+					remaining--
+				}
 			}
 		}
 	}
@@ -636,6 +692,33 @@ func reconcileState(state *ClusterState, policy ReconfigurationPolicy) ([]SlotPl
 	}
 
 	return changedSlots, nil
+}
+
+func remainingChangedChainBudget(policy ReconfigurationPolicy, alreadyChanged int) int {
+	if policy.MaxChangedChains <= 0 {
+		return -1
+	}
+	remaining := policy.MaxChangedChains - alreadyChanged
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+func appendPrioritySlots(state ClusterState) []int {
+	slots := make([]int, 0, len(state.Chains))
+	for _, chain := range state.Chains {
+		slots = append(slots, chain.Slot)
+	}
+	sort.Slice(slots, func(i, j int) bool {
+		left := state.Chains[slots[i]]
+		right := state.Chains[slots[j]]
+		if len(left.Replicas) != len(right.Replicas) {
+			return len(left.Replicas) < len(right.Replicas)
+		}
+		return left.Slot < right.Slot
+	})
+	return slots
 }
 
 func appendMissingDesiredReplicas(state *ClusterState, slot int, desired Chain) (SlotPlan, bool, error) {

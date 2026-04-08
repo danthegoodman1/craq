@@ -41,6 +41,7 @@ type Config struct {
 	NodeID                            string
 	RPCAddress                        string
 	FailureDomains                    map[string]string
+	AutoActivateEmptyReplicas         bool
 	MaxInFlightClientWritesPerNode    int
 	MaxInFlightClientWritesPerSlot    int
 	MaxBufferedReplicaMessagesPerNode int
@@ -533,6 +534,7 @@ type Node struct {
 	repl                              ReplicationTransport
 	registration                      NodeRegistration
 	replicas                          map[int]replicaRecord
+	activatingReplicas                map[int]struct{}
 	maxInFlightClientWritesPerNode    int
 	maxInFlightClientWritesPerSlot    int
 	maxBufferedReplicaMessagesPerNode int
@@ -548,6 +550,7 @@ type Node struct {
 	logger                            zerolog.Logger
 	metrics                           *nodeMetrics
 	events                            *eventRecorder
+	autoActivateEmptyReplicas         bool
 }
 
 const defaultWriteCommitTimeout = 5 * time.Second
@@ -625,6 +628,7 @@ func OpenNode(
 			FailureDomains: cloneFailureDomains(cfg.FailureDomains),
 		},
 		replicas:                          make(map[int]replicaRecord),
+		activatingReplicas:                make(map[int]struct{}),
 		maxInFlightClientWritesPerNode:    cfg.MaxInFlightClientWritesPerNode,
 		maxInFlightClientWritesPerSlot:    cfg.MaxInFlightClientWritesPerSlot,
 		maxBufferedReplicaMessagesPerNode: cfg.MaxBufferedReplicaMessagesPerNode,
@@ -635,6 +639,7 @@ func OpenNode(
 		logger:                            loggerFromConfig(cfg.Logger),
 		metrics:                           newNodeMetrics(cfg.MetricsRegistry),
 		events:                            newEventRecorder("storage", cfg.NodeID),
+		autoActivateEmptyReplicas:         cfg.AutoActivateEmptyReplicas,
 	}
 	if node.maxBufferedReplicaMessagesPerSlot == 0 {
 		node.maxBufferedReplicaMessagesPerSlot = 64
@@ -707,6 +712,7 @@ func (n *Node) AddReplicaAsTail(ctx context.Context, cmd AddReplicaAsTailCommand
 		return err
 	}
 	needsCatchup := cmd.Assignment.Peers.PredecessorNodeID != ""
+	autoActivate := !needsCatchup
 	if needsCatchup {
 		if err := n.admitCatchup(); err != nil {
 			n.observeBackpressure(err)
@@ -768,6 +774,7 @@ func (n *Node) AddReplicaAsTail(ctx context.Context, cmd AddReplicaAsTailCommand
 		}
 		record.highestCommittedSequence = highestCommittedSequence
 		record.nextSequence = highestCommittedSequence + 1
+		autoActivate = len(snapshot) == 0 && highestCommittedSequence == 0
 	}
 
 	record.state = ReplicaStateCatchingUp
@@ -784,6 +791,13 @@ func (n *Node) AddReplicaAsTail(ctx context.Context, cmd AddReplicaAsTailCommand
 	}
 	n.refreshMetricGauges()
 	n.events.record(n.logger, zerolog.InfoLevel, "add_replica", "storage replica added as tail", ops.IntPtr(cmd.Assignment.Slot), ops.Uint64Ptr(cmd.Assignment.ChainVersion), nil, cmd.Assignment.Peers.PredecessorNodeID, "", nil)
+	if autoActivate && n.autoActivateEmptyReplicas {
+		if err := n.activateReplicaOnce(ctx, cmd.Assignment.Slot); err != nil &&
+			!errors.Is(err, context.Canceled) &&
+			!errors.Is(err, context.DeadlineExceeded) {
+			n.events.record(n.logger, zerolog.WarnLevel, "auto_activate_failed", "storage replica auto-activation fell back to background activation", ops.IntPtr(cmd.Assignment.Slot), ops.Uint64Ptr(cmd.Assignment.ChainVersion), nil, "", "", err)
+		}
+	}
 	return nil
 }
 
@@ -791,29 +805,78 @@ func (n *Node) ActivateReplica(ctx context.Context, cmd ActivateReplicaCommand) 
 	if err := n.acceptCoordinatorEpoch(ctx, cmd.Epoch); err != nil {
 		return err
 	}
-	record, ok := n.replicaRecordSnapshot(cmd.Slot)
-	if !ok {
-		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, cmd.Slot)
-	}
-	if record.state != ReplicaStateCatchingUp {
-		return fmt.Errorf("%w: slot %d is %q", ErrInvalidTransition, cmd.Slot, record.state)
-	}
-	if err := n.coord.ReportReplicaReady(ctx, cmd.Slot, n.HighestAcceptedCoordinatorEpoch()); err != nil {
+	return n.activateReplicaOnce(ctx, cmd.Slot)
+}
+
+func (n *Node) finishReplicaActivation(ctx context.Context, slot int) error {
+	if err := n.coord.ReportReplicaReady(ctx, slot, n.HighestAcceptedCoordinatorEpoch()); err != nil {
 		return fmt.Errorf("err in n.coord.ReportReplicaReady: %w", err)
 	}
 
-	record, ok = n.replicaRecordSnapshot(cmd.Slot)
+	record, ok := n.replicaRecordSnapshot(slot)
 	if !ok {
-		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, cmd.Slot)
+		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
 	}
 	record.state = ReplicaStateActive
 	record.lastKnownState = ReplicaStateActive
-	n.setReplicaRecord(cmd.Slot, record)
+	n.setReplicaRecord(slot, record)
 	if err := n.persistReplica(ctx, record); err != nil {
 		return fmt.Errorf("err in n.persistReplica: %w", err)
 	}
-	n.events.record(n.logger, zerolog.InfoLevel, "activate_replica", "storage replica activated", ops.IntPtr(cmd.Slot), ops.Uint64Ptr(record.assignment.ChainVersion), nil, "", "", nil)
+	n.events.record(n.logger, zerolog.InfoLevel, "activate_replica", "storage replica activated", ops.IntPtr(slot), ops.Uint64Ptr(record.assignment.ChainVersion), nil, "", "", nil)
 	return nil
+}
+
+var (
+	errReplicaActivationInFlight = errors.New("storage replica activation already in flight")
+	errReplicaAlreadyActive      = errors.New("storage replica already active")
+)
+
+func (n *Node) activateReplicaOnce(ctx context.Context, slot int) error {
+	if err := n.beginReplicaActivation(slot); err != nil {
+		switch {
+		case errors.Is(err, errReplicaActivationInFlight):
+			return nil
+		case errors.Is(err, errReplicaAlreadyActive):
+			return nil
+		case errors.Is(err, ErrInvalidTransition):
+			record, ok := n.replicaRecordSnapshot(slot)
+			if ok && record.state == ReplicaStateActive {
+				return nil
+			}
+			return err
+		default:
+			return err
+		}
+	}
+	defer n.endReplicaActivation(slot)
+	return n.finishReplicaActivation(ctx, slot)
+}
+
+func (n *Node) beginReplicaActivation(slot int) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	record, ok := n.replicas[slot]
+	if !ok {
+		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
+	}
+	if record.state == ReplicaStateActive {
+		return errReplicaAlreadyActive
+	}
+	if record.state != ReplicaStateCatchingUp {
+		return fmt.Errorf("%w: slot %d is %q", ErrInvalidTransition, slot, record.state)
+	}
+	if _, exists := n.activatingReplicas[slot]; exists {
+		return errReplicaActivationInFlight
+	}
+	n.activatingReplicas[slot] = struct{}{}
+	return nil
+}
+
+func (n *Node) endReplicaActivation(slot int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	delete(n.activatingReplicas, slot)
 }
 
 func (n *Node) MarkReplicaLeaving(ctx context.Context, cmd MarkReplicaLeavingCommand) error {
@@ -1447,6 +1510,19 @@ func (n *Node) CatchingUpSlots() []int {
 	slots := make([]int, 0, len(n.replicas))
 	for slot, record := range n.replicas {
 		if record.state == ReplicaStateCatchingUp {
+			slots = append(slots, slot)
+		}
+	}
+	sort.Ints(slots)
+	return slots
+}
+
+func (n *Node) LeavingSlots() []int {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	slots := make([]int, 0, len(n.replicas))
+	for slot, record := range n.replicas {
+		if record.state == ReplicaStateLeaving {
 			slots = append(slots, slot)
 		}
 	}

@@ -43,6 +43,98 @@ func TestHeartbeatPersistsHealthyLiveness(t *testing.T) {
 	}
 }
 
+func TestRepeatedHeartbeatsDoNotAdvanceDurableStateAfterReady(t *testing.T) {
+	ctx := context.Background()
+	store := coordruntime.NewInMemoryStore()
+	repl := storage.NewInMemoryReplicationTransport()
+	backend := storage.NewInMemoryBackend()
+	repl.Register("d", backend)
+	adapter, err := NewInMemoryNodeAdapter(ctx, "d", backend, repl)
+	if err != nil {
+		t.Fatalf("NewInMemoryNodeAdapter returned error: %v", err)
+	}
+	repl.RegisterNode("d", adapter.Node())
+
+	server := mustOpenServerWithConfig(t, store, map[string]StorageNodeClient{"d": adapter}, ServerConfig{})
+	adapter.BindServer(server)
+	if _, err := server.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 1, 1)); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	if err := adapter.Node().ReportHeartbeat(ctx); err != nil {
+		t.Fatalf("initial ReportHeartbeat returned error: %v", err)
+	}
+	first := server.Current()
+	if err := adapter.Node().ReportHeartbeat(ctx); err != nil {
+		t.Fatalf("second ReportHeartbeat returned error: %v", err)
+	}
+	second := server.Current()
+	if got, want := second.Version, first.Version; got != want {
+		t.Fatalf("version after repeated heartbeat = %d, want %d", got, want)
+	}
+	if got, want := second.LastLogIndex, first.LastLogIndex; got != want {
+		t.Fatalf("last log index after repeated heartbeat = %d, want %d", got, want)
+	}
+	if got, want := len(second.AppliedCommands), len(first.AppliedCommands); got != want {
+		t.Fatalf("applied command count after repeated heartbeat = %d, want %d", got, want)
+	}
+}
+
+func TestRecoveryHeartbeatPersistsHealthyTransitionOnce(t *testing.T) {
+	ctx := context.Background()
+	clock := &fakeClock{now: time.Unix(0, 0)}
+	server := mustBootstrappedServerWithConfig(
+		t,
+		ctx,
+		mapToClient(map[string]*recordingNodeClient{
+			"a": newRecordingNodeClient("a"),
+			"b": newRecordingNodeClient("b"),
+			"c": newRecordingNodeClient("c"),
+		}),
+		ServerConfig{
+			LivenessPolicy: LivenessPolicy{SuspectAfter: 5 * time.Second, DeadAfter: 10 * time.Second},
+			Clock:          clock,
+		},
+		4,
+		3,
+		"a", "b", "c",
+	)
+	if err := server.ReportNodeHeartbeat(ctx, storage.NodeStatus{NodeID: "b", ReplicaCount: 1, ActiveCount: 1}); err != nil {
+		t.Fatalf("initial ReportNodeHeartbeat returned error: %v", err)
+	}
+	initial := server.Current()
+
+	clock.Advance(6 * time.Second)
+	if err := server.EvaluateLiveness(ctx); err != nil {
+		t.Fatalf("EvaluateLiveness returned error: %v", err)
+	}
+	suspect := server.Current()
+	if got, want := server.Liveness()["b"].State, coordruntime.NodeLivenessStateSuspect; got != want {
+		t.Fatalf("suspect state = %q, want %q", got, want)
+	}
+	if suspect.Version <= initial.Version {
+		t.Fatalf("version after suspect = %d, want > %d", suspect.Version, initial.Version)
+	}
+
+	if err := server.ReportNodeHeartbeat(ctx, storage.NodeStatus{NodeID: "b", ReplicaCount: 1, ActiveCount: 1}); err != nil {
+		t.Fatalf("recovery ReportNodeHeartbeat returned error: %v", err)
+	}
+	recovered := server.Current()
+	if got, want := server.Liveness()["b"].State, coordruntime.NodeLivenessStateHealthy; got != want {
+		t.Fatalf("recovered state = %q, want %q", got, want)
+	}
+	if got, want := recovered.Version, suspect.Version+1; got != want {
+		t.Fatalf("version after recovery heartbeat = %d, want %d", got, want)
+	}
+
+	if err := server.ReportNodeHeartbeat(ctx, storage.NodeStatus{NodeID: "b", ReplicaCount: 1, ActiveCount: 1}); err != nil {
+		t.Fatalf("steady-state ReportNodeHeartbeat returned error: %v", err)
+	}
+	steady := server.Current()
+	if got, want := steady.Version, recovered.Version; got != want {
+		t.Fatalf("version after steady-state heartbeat = %d, want %d", got, want)
+	}
+}
+
 func TestEvaluateLivenessTransitionsSuspectThenHealthyWithoutRoutingChange(t *testing.T) {
 	ctx := context.Background()
 	clock := &fakeClock{now: time.Unix(0, 0)}

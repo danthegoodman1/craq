@@ -140,6 +140,56 @@ func TestActivateReplicaPreservesAssignmentUpdatesFromReadyCallback(t *testing.T
 	}
 }
 
+func TestAutoActivateEmptyReplicaDoesNotDuplicateReadyProgressUnderConcurrentActivation(t *testing.T) {
+	ctx := context.Background()
+	transport := NewInMemoryReplicationTransport()
+	backend := NewInMemoryBackend()
+	coord := &countingCoordinatorClient{inner: NewInMemoryCoordinatorClient()}
+	node := mustNewNode(t, ctx, Config{
+		NodeID:                    "node-a",
+		AutoActivateEmptyReplicas: true,
+	}, backend, coord, transport)
+
+	const slot = 1
+	errCh := make(chan error, 2)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		errCh <- node.ActivateReplica(ctx, ActivateReplicaCommand{Slot: slot})
+	}()
+
+	close(start)
+	if err := node.AddReplicaAsTail(ctx, AddReplicaAsTailCommand{
+		Assignment: ReplicaAssignment{
+			Slot:         slot,
+			ChainVersion: 1,
+			Role:         ReplicaRoleSingle,
+		},
+	}); err != nil {
+		t.Fatalf("AddReplicaAsTail returned error: %v", err)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil && !errors.Is(err, ErrUnknownReplica) {
+			t.Fatalf("concurrent ActivateReplica returned error: %v", err)
+		}
+	}
+
+	if got, want := node.State().Replicas[slot].State, ReplicaStateActive; got != want {
+		t.Fatalf("replica state = %q, want %q", got, want)
+	}
+	if got, want := coord.readyCalls, 1; got != want {
+		t.Fatalf("ready calls = %d, want %d", got, want)
+	}
+	if got, want := coord.inner.ReadySlots, []int{slot}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("ready slots = %v, want %v", got, want)
+	}
+}
+
 func TestNodeAddReplicaAsTailFailsCleanlyWhenSourceUnavailable(t *testing.T) {
 	ctx := context.Background()
 	transport := NewInMemoryReplicationTransport()
@@ -347,6 +397,36 @@ func TestNodeCatchingUpSlotsReturnsSortedSnapshot(t *testing.T) {
 
 	if got, want := node.CatchingUpSlots(), []int{1, 3}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("CatchingUpSlots() = %v, want %v", got, want)
+	}
+}
+
+func TestNodeLeavingSlotsReturnsSortedSnapshot(t *testing.T) {
+	ctx := context.Background()
+	transport := NewInMemoryReplicationTransport()
+	backend := NewInMemoryBackend()
+	coord := NewInMemoryCoordinatorClient()
+	node := mustNewNode(t, ctx, Config{NodeID: "node-a"}, backend, coord, transport)
+
+	for _, slot := range []int{3, 1, 2} {
+		if err := node.AddReplicaAsTail(ctx, AddReplicaAsTailCommand{
+			Assignment: ReplicaAssignment{Slot: slot, ChainVersion: 1, Role: ReplicaRoleSingle},
+		}); err != nil {
+			t.Fatalf("AddReplicaAsTail(slot=%d) returned error: %v", slot, err)
+		}
+	}
+	for _, slot := range []int{1, 2, 3} {
+		if err := node.ActivateReplica(ctx, ActivateReplicaCommand{Slot: slot}); err != nil {
+			t.Fatalf("ActivateReplica(slot=%d) returned error: %v", slot, err)
+		}
+	}
+	for _, slot := range []int{3, 1} {
+		if err := node.MarkReplicaLeaving(ctx, MarkReplicaLeavingCommand{Slot: slot}); err != nil {
+			t.Fatalf("MarkReplicaLeaving(slot=%d) returned error: %v", slot, err)
+		}
+	}
+
+	if got, want := node.LeavingSlots(), []int{1, 3}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("LeavingSlots() = %v, want %v", got, want)
 	}
 }
 
@@ -685,15 +765,22 @@ type updatingCoordinatorClient struct {
 
 type countingCoordinatorClient struct {
 	inner         *InMemoryCoordinatorClient
+	mu            sync.Mutex
 	registerCalls int
+	readyCalls    int
 }
 
 func (c *countingCoordinatorClient) RegisterNode(ctx context.Context, reg NodeRegistration) error {
+	c.mu.Lock()
 	c.registerCalls++
+	c.mu.Unlock()
 	return c.inner.RegisterNode(ctx, reg)
 }
 
 func (c *countingCoordinatorClient) ReportReplicaReady(ctx context.Context, slot int, epoch uint64) error {
+	c.mu.Lock()
+	c.readyCalls++
+	c.mu.Unlock()
 	return c.inner.ReportReplicaReady(ctx, slot, epoch)
 }
 

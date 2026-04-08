@@ -33,6 +33,18 @@ type State struct {
 	AppliedCommands         map[string]AppliedCommand
 }
 
+type View struct {
+	Version                 uint64
+	LastLogIndex            uint64
+	Cluster                 coordinator.ClusterState
+	SlotVersions            map[int]uint64
+	CompletedProgressBySlot map[int][]CompletedProgressRecord
+	NodeLivenessByID        map[string]NodeLivenessRecord
+	PendingBySlot           map[int]PendingWork
+	Outbox                  []OutboxEntry
+	LastPolicy              coordinator.ReconfigurationPolicy
+}
+
 type PendingKind string
 
 const (
@@ -88,6 +100,7 @@ const (
 
 type NodeLivenessRecord struct {
 	LastHeartbeatUnixNano      int64
+	UpdatedAtUnixNano          int64
 	State                      NodeLivenessState
 	LastStatus                 storage.NodeStatus
 	DeadActionFired            bool
@@ -114,6 +127,7 @@ const (
 	CommandKindBootstrap         CommandKind = "bootstrap"
 	CommandKindReconfigure       CommandKind = "reconfigure"
 	CommandKindProgress          CommandKind = "progress"
+	CommandKindNodeReady         CommandKind = "node_ready"
 	CommandKindHeartbeat         CommandKind = "heartbeat"
 	CommandKindLiveness          CommandKind = "liveness"
 	CommandKindAcknowledgeOutbox CommandKind = "acknowledge_outbox"
@@ -126,6 +140,7 @@ type Command struct {
 	Bootstrap         *BootstrapCommand
 	Reconfigure       *ReconfigureCommand
 	Progress          *ProgressCommand
+	NodeReady         *NodeReadyCommand
 	Heartbeat         *HeartbeatCommand
 	Liveness          *LivenessCommand
 	AcknowledgeOutbox *AcknowledgeOutboxCommand
@@ -144,6 +159,12 @@ type ReconfigureCommand struct {
 
 type ProgressCommand struct {
 	Event coordinator.Event
+}
+
+type NodeReadyCommand struct {
+	Status             storage.NodeStatus
+	ObservedAtUnixNano int64
+	FlapWindowNanos    int64
 }
 
 type HeartbeatCommand struct {
@@ -265,6 +286,12 @@ func (r *Runtime) Current() State {
 	return cloneState(r.state)
 }
 
+func (r *Runtime) CurrentView() View {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return cloneView(viewFromState(r.state))
+}
+
 func (r *Runtime) Bootstrap(ctx context.Context, cmd Command) (State, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -332,6 +359,25 @@ func (r *Runtime) ApplyProgress(ctx context.Context, cmd Command) (State, error)
 	return cloneState(r.state), nil
 }
 
+func (r *Runtime) MarkNodeReady(ctx context.Context, cmd Command) (State, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, _, duplicate, err := r.executeNodeReady(cmd)
+	if err != nil {
+		return State{}, fmt.Errorf("err in r.executeNodeReady: %w", err)
+	}
+	if duplicate != nil {
+		return r.snapshotForApplied(*duplicate), nil
+	}
+
+	record, nextState := r.commitCandidate(cmd, r.state.Cluster, nil)
+	if err := r.store.AppendWAL(ctx, record); err != nil {
+		return State{}, fmt.Errorf("err in r.store.AppendWAL: %w", err)
+	}
+	r.state = nextState
+	return cloneState(r.state), nil
+}
+
 func (r *Runtime) Heartbeat(ctx context.Context, cmd Command) (State, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -373,7 +419,17 @@ func (r *Runtime) ApplyLiveness(ctx context.Context, cmd Command) (State, error)
 func (r *Runtime) AcknowledgeOutbox(ctx context.Context, cmd Command) (State, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	_, _, duplicate, err := r.executeAcknowledgeOutbox(cmd)
+	duplicate, err := r.validateCommand(cmd)
+	if err != nil {
+		return State{}, fmt.Errorf("err in r.validateCommand: %w", err)
+	}
+	if duplicate != nil {
+		return r.snapshotForApplied(*duplicate), nil
+	}
+	if cmd.AcknowledgeOutbox != nil && !outboxEntryExists(r.state.Outbox, cmd.AcknowledgeOutbox.EntryID) {
+		return cloneState(r.state), nil
+	}
+	_, _, duplicate, err = r.executeAcknowledgeOutbox(cmd)
 	if err != nil {
 		return State{}, fmt.Errorf("err in r.executeAcknowledgeOutbox: %w", err)
 	}
@@ -429,6 +485,10 @@ func (r *Runtime) executeReconfigure(cmd Command) (coordinator.ClusterState, *co
 }
 
 func (r *Runtime) executeProgress(cmd Command) (coordinator.ClusterState, *coordinator.ReconfigurationPlan, *AppliedCommand, error) {
+	return r.executeCommand(cmd)
+}
+
+func (r *Runtime) executeNodeReady(cmd Command) (coordinator.ClusterState, *coordinator.ReconfigurationPlan, *AppliedCommand, error) {
 	return r.executeCommand(cmd)
 }
 
@@ -491,6 +551,14 @@ func (r *Runtime) executeCommand(cmd Command) (coordinator.ClusterState, *coordi
 			return coordinator.ClusterState{}, nil, nil, fmt.Errorf("err in coordinator.ApplyProgress: %w", err)
 		}
 		return cloneClusterState(*cluster), nil, nil, nil
+	case CommandKindNodeReady:
+		if !isInitialized(r.state) {
+			return coordinator.ClusterState{}, nil, nil, ErrNotInitialized
+		}
+		if cmd.NodeReady.Status.NodeID == "" {
+			return coordinator.ClusterState{}, nil, nil, fmt.Errorf("%w: ready node ID must not be empty", ErrInvalidCommand)
+		}
+		return cloneClusterState(r.state.Cluster), nil, nil, nil
 	case CommandKindHeartbeat:
 		return cloneClusterState(r.state.Cluster), nil, nil, nil
 	case CommandKindLiveness:
@@ -554,11 +622,18 @@ func validateCommandPayload(cmd Command) error {
 			return fmt.Errorf("%w: reconfigure command must set only reconfigure payload", ErrInvalidCommand)
 		}
 	case CommandKindProgress:
-		if cmd.Progress == nil || cmd.Bootstrap != nil || cmd.Reconfigure != nil || cmd.Heartbeat != nil || cmd.Liveness != nil || cmd.AcknowledgeOutbox != nil {
+		if cmd.Progress == nil || cmd.Bootstrap != nil || cmd.Reconfigure != nil || cmd.NodeReady != nil || cmd.Heartbeat != nil || cmd.Liveness != nil || cmd.AcknowledgeOutbox != nil {
 			return fmt.Errorf("%w: progress command must set only progress payload", ErrInvalidCommand)
 		}
+	case CommandKindNodeReady:
+		if cmd.NodeReady == nil || cmd.Bootstrap != nil || cmd.Reconfigure != nil || cmd.Progress != nil || cmd.Heartbeat != nil || cmd.Liveness != nil || cmd.AcknowledgeOutbox != nil {
+			return fmt.Errorf("%w: node ready command must set only ready payload", ErrInvalidCommand)
+		}
+		if cmd.NodeReady.Status.NodeID == "" {
+			return fmt.Errorf("%w: ready node ID must not be empty", ErrInvalidCommand)
+		}
 	case CommandKindHeartbeat:
-		if cmd.Heartbeat == nil || cmd.Bootstrap != nil || cmd.Reconfigure != nil || cmd.Progress != nil || cmd.Liveness != nil || cmd.AcknowledgeOutbox != nil {
+		if cmd.Heartbeat == nil || cmd.Bootstrap != nil || cmd.Reconfigure != nil || cmd.Progress != nil || cmd.NodeReady != nil || cmd.Liveness != nil || cmd.AcknowledgeOutbox != nil {
 			return fmt.Errorf("%w: heartbeat command must set only heartbeat payload", ErrInvalidCommand)
 		}
 		if cmd.Heartbeat.Status.NodeID == "" {
@@ -603,7 +678,7 @@ func (r *Runtime) nextStateForApplied(
 	cluster coordinator.ClusterState,
 	plan *coordinator.ReconfigurationPlan,
 ) State {
-	next := cloneState(r.state)
+	next := cloneStateForNextApplied(r.state)
 	next.Version++
 	next.LastLogIndex = logIndex
 	next.Cluster = cloneClusterState(cluster)
@@ -635,6 +710,15 @@ func (r *Runtime) nextStateForApplied(
 
 func nextClusterState(current coordinator.ClusterState, cmd Command) coordinator.ClusterState {
 	next := cloneClusterState(current)
+	if cmd.Kind == CommandKindNodeReady && cmd.NodeReady != nil {
+		nodeID := cmd.NodeReady.Status.NodeID
+		if next.NodeHealthByID[nodeID] != coordinator.NodeHealthDead {
+			if next.ReadyNodeIDs == nil {
+				next.ReadyNodeIDs = map[string]bool{}
+			}
+			next.ReadyNodeIDs[nodeID] = true
+		}
+	}
 	if cmd.Kind == CommandKindHeartbeat && cmd.Heartbeat != nil {
 		nodeID := cmd.Heartbeat.Status.NodeID
 		if next.NodeHealthByID[nodeID] != coordinator.NodeHealthDead {
@@ -679,6 +763,34 @@ func zeroState() State {
 	}
 }
 
+func viewFromState(state State) View {
+	return View{
+		Version:                 state.Version,
+		LastLogIndex:            state.LastLogIndex,
+		Cluster:                 cloneClusterState(state.Cluster),
+		SlotVersions:            cloneSlotVersions(state.SlotVersions),
+		CompletedProgressBySlot: cloneCompletedProgressMap(state.CompletedProgressBySlot),
+		NodeLivenessByID:        cloneNodeLivenessMap(state.NodeLivenessByID),
+		PendingBySlot:           clonePendingMap(state.PendingBySlot),
+		Outbox:                  cloneOutbox(state.Outbox),
+		LastPolicy:              state.LastPolicy,
+	}
+}
+
+func cloneView(view View) View {
+	return View{
+		Version:                 view.Version,
+		LastLogIndex:            view.LastLogIndex,
+		Cluster:                 cloneClusterState(view.Cluster),
+		SlotVersions:            cloneSlotVersions(view.SlotVersions),
+		CompletedProgressBySlot: cloneCompletedProgressMap(view.CompletedProgressBySlot),
+		NodeLivenessByID:        cloneNodeLivenessMap(view.NodeLivenessByID),
+		PendingBySlot:           clonePendingMap(view.PendingBySlot),
+		Outbox:                  cloneOutbox(view.Outbox),
+		LastPolicy:              view.LastPolicy,
+	}
+}
+
 func isInitialized(state State) bool {
 	return state.Cluster.SlotCount > 0
 }
@@ -698,6 +810,25 @@ func cloneState(state State) State {
 	}
 	for id, applied := range state.AppliedCommands {
 		cloned.AppliedCommands[id] = cloneAppliedCommand(applied)
+	}
+	return cloned
+}
+
+func cloneStateForNextApplied(state State) State {
+	cloned := State{
+		Version:                 state.Version,
+		LastLogIndex:            state.LastLogIndex,
+		Cluster:                 cloneClusterState(state.Cluster),
+		SlotVersions:            cloneSlotVersions(state.SlotVersions),
+		CompletedProgressBySlot: cloneCompletedProgressMap(state.CompletedProgressBySlot),
+		NodeLivenessByID:        cloneNodeLivenessMap(state.NodeLivenessByID),
+		PendingBySlot:           clonePendingMap(state.PendingBySlot),
+		Outbox:                  cloneOutbox(state.Outbox),
+		LastPolicy:              state.LastPolicy,
+		AppliedCommands:         make(map[string]AppliedCommand, len(state.AppliedCommands)),
+	}
+	for id, applied := range state.AppliedCommands {
+		cloned.AppliedCommands[id] = applied
 	}
 	return cloned
 }
@@ -818,6 +949,13 @@ func cloneCommand(cmd Command) Command {
 			Event: cloneEvent(cmd.Progress.Event),
 		}
 	}
+	if cmd.NodeReady != nil {
+		cloned.NodeReady = &NodeReadyCommand{
+			Status:             cloneNodeStatus(cmd.NodeReady.Status),
+			ObservedAtUnixNano: cmd.NodeReady.ObservedAtUnixNano,
+			FlapWindowNanos:    cmd.NodeReady.FlapWindowNanos,
+		}
+	}
 	if cmd.Heartbeat != nil {
 		cloned.Heartbeat = &HeartbeatCommand{
 			Status:             cloneNodeStatus(cmd.Heartbeat.Status),
@@ -846,9 +984,25 @@ func nextNodeLiveness(
 ) map[string]NodeLivenessRecord {
 	next := cloneNodeLivenessMap(current)
 	switch cmd.Kind {
+	case CommandKindNodeReady:
+		record := next[cmd.NodeReady.Status.NodeID]
+		record.LastHeartbeatUnixNano = cmd.NodeReady.ObservedAtUnixNano
+		record.UpdatedAtUnixNano = cmd.NodeReady.ObservedAtUnixNano
+		record.LastStatus = cloneNodeStatus(cmd.NodeReady.Status)
+		record.SuspectTransitionsUnixNano = pruneSuspectTransitions(
+			record.SuspectTransitionsUnixNano,
+			cmd.NodeReady.ObservedAtUnixNano,
+			cmd.NodeReady.FlapWindowNanos,
+		)
+		if record.State != NodeLivenessStateDead {
+			record.State = NodeLivenessStateHealthy
+			record.DeadActionFired = false
+		}
+		next[cmd.NodeReady.Status.NodeID] = record
 	case CommandKindHeartbeat:
 		record := next[cmd.Heartbeat.Status.NodeID]
 		record.LastHeartbeatUnixNano = cmd.Heartbeat.ObservedAtUnixNano
+		record.UpdatedAtUnixNano = cmd.Heartbeat.ObservedAtUnixNano
 		record.LastStatus = cloneNodeStatus(cmd.Heartbeat.Status)
 		record.SuspectTransitionsUnixNano = pruneSuspectTransitions(
 			record.SuspectTransitionsUnixNano,
@@ -862,6 +1016,9 @@ func nextNodeLiveness(
 		next[cmd.Heartbeat.Status.NodeID] = record
 	case CommandKindLiveness:
 		record := next[cmd.Liveness.NodeID]
+		if cmd.Liveness.EvaluatedAtUnixNano != 0 {
+			record.UpdatedAtUnixNano = cmd.Liveness.EvaluatedAtUnixNano
+		}
 		record.SuspectTransitionsUnixNano = pruneSuspectTransitions(
 			record.SuspectTransitionsUnixNano,
 			cmd.Liveness.EvaluatedAtUnixNano,
@@ -890,6 +1047,7 @@ func cloneNodeLivenessMap(current map[string]NodeLivenessRecord) map[string]Node
 	for nodeID, record := range current {
 		cloned[nodeID] = NodeLivenessRecord{
 			LastHeartbeatUnixNano:      record.LastHeartbeatUnixNano,
+			UpdatedAtUnixNano:          record.UpdatedAtUnixNano,
 			State:                      record.State,
 			LastStatus:                 cloneNodeStatus(record.LastStatus),
 			DeadActionFired:            record.DeadActionFired,
@@ -975,7 +1133,7 @@ func nextPending(
 		if cmd.Progress != nil {
 			delete(next, cmd.Progress.Event.Slot)
 		}
-	case CommandKindHeartbeat, CommandKindLiveness, CommandKindAcknowledgeOutbox:
+	case CommandKindNodeReady, CommandKindHeartbeat, CommandKindLiveness, CommandKindAcknowledgeOutbox:
 		return next
 	}
 	return next

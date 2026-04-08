@@ -112,6 +112,12 @@ func (s *Server) StepHA(ctx context.Context) (bool, error) {
 			s.ha.setIsLeader(false)
 			return false, nil
 		}
+		if errors.Is(err, ErrHASnapshotConflict) {
+			if _, loadErr := s.loadCurrentHASnapshot(ctx); loadErr != nil {
+				return true, loadErr
+			}
+			return true, nil
+		}
 		return true, err
 	}
 	return true, nil
@@ -120,7 +126,26 @@ func (s *Server) StepHA(ctx context.Context) (bool, error) {
 func (s *Server) syncFromHASnapshot(snapshot HASnapshot) {
 	s.replaceRuntime(coordruntime.OpenInMemoryFromState(snapshot.State))
 	s.syncViewsFromRuntime()
+	s.activePeerRefreshMu.Lock()
+	s.activePeerRefresh = map[int]activePeerRefreshState{}
+	s.activePeerRefreshMu.Unlock()
 	s.viewMu.Lock()
+	heartbeats := make(map[string]storage.NodeStatus, len(s.heartbeats)+len(snapshot.Heartbeats))
+	for nodeID, status := range s.heartbeats {
+		heartbeats[nodeID] = cloneNodeStatus(status)
+	}
+	for nodeID, status := range snapshot.Heartbeats {
+		heartbeats[nodeID] = cloneNodeStatus(status)
+	}
+	liveness := make(map[string]coordruntime.NodeLivenessRecord, len(s.liveness)+len(snapshot.Liveness))
+	for nodeID, record := range s.liveness {
+		liveness[nodeID] = cloneLivenessRecord(record)
+	}
+	for nodeID, record := range snapshot.Liveness {
+		liveness[nodeID] = cloneLivenessRecord(record)
+	}
+	s.heartbeats = heartbeats
+	s.liveness = liveness
 	s.pending = make(map[int]PendingWork, len(snapshot.Pending))
 	for slot, pending := range snapshot.Pending {
 		s.pending[slot] = pending
@@ -150,6 +175,14 @@ func (s *Server) currentHASnapshot() HASnapshot {
 	snapshot.Pending = make(map[int]PendingWork, len(s.pending))
 	for slot, pending := range s.pending {
 		snapshot.Pending[slot] = pending
+	}
+	snapshot.Heartbeats = make(map[string]storage.NodeStatus, len(s.heartbeats))
+	for nodeID, status := range s.heartbeats {
+		snapshot.Heartbeats[nodeID] = cloneNodeStatus(status)
+	}
+	snapshot.Liveness = make(map[string]coordruntime.NodeLivenessRecord, len(s.liveness))
+	for nodeID, record := range s.liveness {
+		snapshot.Liveness[nodeID] = cloneLivenessRecord(record)
 	}
 	snapshot.LastPolicy = s.lastPolicy
 	snapshot.UnavailableReplicas = make(map[string]map[int]bool, len(s.unavailableReplicas))
@@ -252,6 +285,7 @@ func (s *Server) newPlannerServer(snapshot HASnapshot) *Server {
 		liveness:               map[string]coordruntime.NodeLivenessRecord{},
 		pending:                map[int]PendingWork{},
 		completed:              map[int][]coordruntime.CompletedProgressRecord{},
+		activePeerRefresh:      map[int]activePeerRefreshState{},
 		unavailableReplicas:    map[string]map[int]bool{},
 		lastRecoveryReports:    map[string]storage.NodeRecoveryReport{},
 		livenessPolicy:         s.livenessPolicy,
@@ -278,17 +312,37 @@ func (s *Server) newPlannerServer(snapshot HASnapshot) *Server {
 	}
 	planner.lastPolicy = snapshot.LastPolicy
 	planner.syncViewsFromRuntime()
+	planner.viewMu.Lock()
+	heartbeats := make(map[string]storage.NodeStatus, len(planner.heartbeats)+len(snapshot.Heartbeats))
+	for nodeID, status := range planner.heartbeats {
+		heartbeats[nodeID] = cloneNodeStatus(status)
+	}
+	for nodeID, status := range snapshot.Heartbeats {
+		heartbeats[nodeID] = cloneNodeStatus(status)
+	}
+	liveness := make(map[string]coordruntime.NodeLivenessRecord, len(planner.liveness)+len(snapshot.Liveness))
+	for nodeID, record := range planner.liveness {
+		liveness[nodeID] = cloneLivenessRecord(record)
+	}
+	for nodeID, record := range snapshot.Liveness {
+		liveness[nodeID] = cloneLivenessRecord(record)
+	}
+	planner.heartbeats = heartbeats
+	planner.liveness = liveness
+	planner.viewMu.Unlock()
 	planner.rebuildRoutingSnapshot()
 	return planner
 }
 
 type haPlanningNodeClient struct {
 	nodeID  string
+	mu      sync.Mutex
 	entries []OutboxEntry
 }
 
 func (c *haPlanningNodeClient) AddReplicaAsTail(_ context.Context, cmd storage.AddReplicaAsTailCommand) error {
 	assignment := cloneReplicaAssignment(cmd.Assignment)
+	c.mu.Lock()
 	c.entries = append(c.entries, OutboxEntry{
 		NodeID:      c.nodeID,
 		Slot:        cmd.Assignment.Slot,
@@ -296,6 +350,7 @@ func (c *haPlanningNodeClient) AddReplicaAsTail(_ context.Context, cmd storage.A
 		Kind:        OutboxCommandAddReplicaAsTail,
 		Assignment:  &assignment,
 	})
+	c.mu.Unlock()
 	return nil
 }
 
@@ -304,11 +359,13 @@ func (c *haPlanningNodeClient) ActivateReplica(_ context.Context, cmd storage.Ac
 }
 
 func (c *haPlanningNodeClient) MarkReplicaLeaving(_ context.Context, cmd storage.MarkReplicaLeavingCommand) error {
+	c.mu.Lock()
 	c.entries = append(c.entries, OutboxEntry{
 		NodeID: c.nodeID,
 		Slot:   cmd.Slot,
 		Kind:   OutboxCommandMarkReplicaLeaving,
 	})
+	c.mu.Unlock()
 	return nil
 }
 
@@ -318,6 +375,7 @@ func (c *haPlanningNodeClient) RemoveReplica(_ context.Context, cmd storage.Remo
 
 func (c *haPlanningNodeClient) UpdateChainPeers(_ context.Context, cmd storage.UpdateChainPeersCommand) error {
 	assignment := cloneReplicaAssignment(cmd.Assignment)
+	c.mu.Lock()
 	c.entries = append(c.entries, OutboxEntry{
 		NodeID:      c.nodeID,
 		Slot:        cmd.Assignment.Slot,
@@ -325,11 +383,13 @@ func (c *haPlanningNodeClient) UpdateChainPeers(_ context.Context, cmd storage.U
 		Kind:        OutboxCommandUpdateChainPeers,
 		Assignment:  &assignment,
 	})
+	c.mu.Unlock()
 	return nil
 }
 
 func (c *haPlanningNodeClient) ResumeRecoveredReplica(_ context.Context, cmd storage.ResumeRecoveredReplicaCommand) error {
 	assignment := cloneReplicaAssignment(cmd.Assignment)
+	c.mu.Lock()
 	c.entries = append(c.entries, OutboxEntry{
 		NodeID:      c.nodeID,
 		Slot:        cmd.Assignment.Slot,
@@ -337,11 +397,13 @@ func (c *haPlanningNodeClient) ResumeRecoveredReplica(_ context.Context, cmd sto
 		Kind:        OutboxCommandResumeRecovered,
 		Assignment:  &assignment,
 	})
+	c.mu.Unlock()
 	return nil
 }
 
 func (c *haPlanningNodeClient) RecoverReplica(_ context.Context, cmd storage.RecoverReplicaCommand) error {
 	assignment := cloneReplicaAssignment(cmd.Assignment)
+	c.mu.Lock()
 	c.entries = append(c.entries, OutboxEntry{
 		NodeID:       c.nodeID,
 		Slot:         cmd.Assignment.Slot,
@@ -350,15 +412,18 @@ func (c *haPlanningNodeClient) RecoverReplica(_ context.Context, cmd storage.Rec
 		Assignment:   &assignment,
 		SourceNodeID: cmd.SourceNodeID,
 	})
+	c.mu.Unlock()
 	return nil
 }
 
 func (c *haPlanningNodeClient) DropRecoveredReplica(_ context.Context, cmd storage.DropRecoveredReplicaCommand) error {
+	c.mu.Lock()
 	c.entries = append(c.entries, OutboxEntry{
 		NodeID: c.nodeID,
 		Slot:   cmd.Slot,
 		Kind:   OutboxCommandDropRecovered,
 	})
+	c.mu.Unlock()
 	return nil
 }
 
@@ -377,7 +442,10 @@ func rewriteSnapshotEpoch(snapshot HASnapshot, epoch uint64) (HASnapshot, bool) 
 func (s *Server) plannerEntries(clients map[string]*haPlanningNodeClient, epoch uint64) []OutboxEntry {
 	var entries []OutboxEntry
 	for _, client := range clients {
-		for _, entry := range client.entries {
+		client.mu.Lock()
+		clientEntries := append([]OutboxEntry(nil), client.entries...)
+		client.mu.Unlock()
+		for _, entry := range clientEntries {
 			cloned := cloneOutboxEntry(entry)
 			cloned.Epoch = epoch
 			if cloned.CommandID == "" {

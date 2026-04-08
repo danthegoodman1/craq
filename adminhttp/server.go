@@ -39,6 +39,9 @@ type healthResponse struct {
 
 func NewCoordinator(server *coordserver.Server, cfg Config) *Server {
 	return newServer("coordserver", cfg, func(mux *http.ServeMux) {
+		mux.HandleFunc("/admin/v1/routing", func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusOK, server.RoutingStatus(r.Context()))
+		})
 		mux.HandleFunc("/admin/v1/state", func(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, server.AdminState(r.Context()))
 		})

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -492,6 +493,7 @@ func waitForLocalRoutingReady(
 	stallTimeout := routingReadyStallTimeout(profile)
 	deadline := time.Now().Add(overallTimeout)
 	stallDeadline := time.Now().Add(stallTimeout)
+	routingURL := "http://" + coordinatorAdminAddr + "/admin/v1/routing"
 	stateURL := "http://" + coordinatorAdminAddr + "/admin/v1/state"
 	var lastState []byte
 	var lastErr error
@@ -503,10 +505,7 @@ func waitForLocalRoutingReady(
 		if err := unexpectedLocalDaemonError(handles); err != nil {
 			return time.Time{}, lastProgress, err
 		}
-		data, err := fetchURLBytes(ctx, httpClient, stateURL)
-		if len(data) > 0 {
-			lastState = append(lastState[:0], data...)
-		}
+		data, err := fetchURLBytes(ctx, httpClient, routingURL)
 		lastErr = err
 		if err == nil {
 			progress, progressErr := decodeRoutingProgress(data)
@@ -553,9 +552,18 @@ func waitForLocalRoutingReady(
 		case <-time.After(3 * time.Second):
 		}
 	}
+	data, err := fetchURLBytes(ctx, httpClient, stateURL)
+	if len(data) > 0 {
+		lastState = append(lastState[:0], data...)
+	}
+	if err != nil {
+		lastErr = err
+	}
 
 	diag := strings.TrimSpace(string(lastState))
-	if len(diag) > 1200 {
+	if summary := summarizeCoordinatorAdminState(lastState); summary != "" {
+		diag = summary
+	} else if len(diag) > 1200 {
 		diag = diag[:1200] + "...(truncated)"
 	}
 	progressSummary := ""
@@ -577,6 +585,128 @@ func waitForLocalRoutingReady(
 	default:
 		return time.Time{}, lastProgress, fmt.Errorf("timed out waiting for writable routing state after %s; %s", overallTimeout, progressSummary)
 	}
+}
+
+func summarizeCoordinatorAdminState(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	var state coordserver.AdminState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return ""
+	}
+	readyNodes := make([]string, 0, len(state.Current.Cluster.ReadyNodeIDs))
+	for nodeID, ready := range state.Current.Cluster.ReadyNodeIDs {
+		if ready {
+			readyNodes = append(readyNodes, nodeID)
+		}
+	}
+	sort.Strings(readyNodes)
+
+	pendingByNode := map[string]int{}
+	pendingByKind := map[string]int{}
+	pendingSlots := make([]int, 0, len(state.Pending))
+	for slot, pending := range state.Pending {
+		pendingByNode[pending.NodeID]++
+		pendingByKind[string(pending.Kind)]++
+		pendingSlots = append(pendingSlots, slot)
+	}
+	sort.Ints(pendingSlots)
+	if len(pendingSlots) > 12 {
+		pendingSlots = pendingSlots[:12]
+	}
+
+	outboxByNode := map[string]int{}
+	outboxByKind := map[string]int{}
+	for _, entry := range state.Current.Outbox {
+		outboxByNode[entry.NodeID]++
+		outboxByKind[string(entry.Kind)]++
+	}
+
+	oneActive := 0
+	twoActive := 0
+	threeActive := 0
+	activeByNode := map[string]int{}
+	joiningByNode := map[string]int{}
+	for _, chain := range state.Current.Cluster.Chains {
+		active := 0
+		for _, replica := range chain.Replicas {
+			switch replica.State {
+			case coordinator.ReplicaStateActive:
+				active++
+				activeByNode[replica.NodeID]++
+			case coordinator.ReplicaStateJoining:
+				joiningByNode[replica.NodeID]++
+			}
+		}
+		switch active {
+		case 1:
+			oneActive++
+		case 2:
+			twoActive++
+		case 3:
+			threeActive++
+		}
+	}
+
+	liveness := make([]string, 0, len(state.Liveness))
+	for _, nodeID := range sortedStringKeys(state.Liveness) {
+		liveness = append(liveness, fmt.Sprintf("%s=%s", nodeID, state.Liveness[nodeID].State))
+	}
+
+	recent := make([]string, 0, minInt(len(state.Recent), 6))
+	for i := maxInt(0, len(state.Recent)-6); i < len(state.Recent); i++ {
+		event := state.Recent[i]
+		if event.Error != "" {
+			recent = append(recent, fmt.Sprintf("%s:%s", event.Kind, event.Error))
+			continue
+		}
+		recent = append(recent, event.Kind)
+	}
+
+	return fmt.Sprintf(
+		"version=%d ready=%v health=%v liveness=%v pending=%d pendingByNode=%v pendingByKind=%v firstPendingSlots=%v outbox=%d outboxByNode=%v outboxByKind=%v chains(one=%d two=%d three=%d) activeByNode=%v joiningByNode=%v recent=%v",
+		state.Current.Version,
+		readyNodes,
+		state.Current.Cluster.NodeHealthByID,
+		liveness,
+		len(state.Pending),
+		pendingByNode,
+		pendingByKind,
+		pendingSlots,
+		len(state.Current.Outbox),
+		outboxByNode,
+		outboxByKind,
+		oneActive,
+		twoActive,
+		threeActive,
+		activeByNode,
+		joiningByNode,
+		recent,
+	)
+}
+
+func sortedStringKeys[V any](values map[string]V) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func minInt(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func fetchURLBytes(ctx context.Context, client *http.Client, url string) ([]byte, error) {

@@ -396,7 +396,7 @@ func TestNonHACrashAfterReadyProgressBeforeMarkLeavingResumesRepairAndRestoresDa
 	if err := h.adapters["d"].Node().ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: slot}); err != nil {
 		t.Fatalf("ActivateReplica(d) returned error: %v", err)
 	}
-	leavingNodeID := lastActiveReplicaNode(server.Current().Cluster.Chains[slot])
+	leavingNodeID := plannedLeavingNodeAfterReady(t, server, slot, "d")
 	if leavingNodeID == "" {
 		t.Fatal("failed to determine active tail before ready progress")
 	}
@@ -543,7 +543,7 @@ func TestNonHACrashAfterMarkLeavingAckBeforeRemovedProgressDoesNotRedispatchAndR
 		t.Fatalf("AddNode returned error: %v", err)
 	}
 	slot := mustPendingSlotForNode(t, server.Pending(), "d", pendingKindReady)
-	leavingNodeID := lastActiveReplicaNode(server.Current().Cluster.Chains[slot])
+	leavingNodeID := plannedLeavingNodeAfterReady(t, server, slot, "d")
 	if leavingNodeID == "" {
 		t.Fatal("failed to find leaving node before mark-leaving ack crash")
 	}

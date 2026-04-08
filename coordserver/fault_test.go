@@ -71,11 +71,8 @@ func runQueuedProgressFaultHistory(t *testing.T) queuedProgressFaultHistory {
 	if err != nil {
 		t.Fatalf("RoutingSnapshot returned error: %v", err)
 	}
-	if routing.Slots[1].Writable {
-		t.Fatalf("routing during undelivered ready = %#v, want not writable", routing.Slots[1])
-	}
-	if !routing.Slots[1].Readable {
-		t.Fatalf("routing during undelivered ready = %#v, want readable", routing.Slots[1])
+	if routing.Slots[1].Writable || !routing.Slots[1].Readable {
+		t.Fatalf("routing during undelivered ready = %#v, want readable but not writable until the new replica is ready", routing.Slots[1])
 	}
 
 	if err := h.adapters["d"].ReportReplicaReady(ctx, 1, 0); err != nil {

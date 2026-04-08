@@ -239,11 +239,320 @@ func TestCloudShapeStartupScaleProgressAndHeartbeatStayBoundedUnderLargeOutbox(t
 	}
 }
 
+func TestAsyncStartupLeavesFirstWaveAndMakesForwardProgress(t *testing.T) {
+	ctx := context.Background()
+	h := newInMemoryHarnessWithConfig(t, []string{"a", "b", "c"}, ServerConfig{
+		AsyncHotPathDispatch:  true,
+		DispatchRetryInterval: time.Hour,
+		ReconfigurationPolicy: coordinator.ReconfigurationPolicy{
+			MaxChangedChains: 3,
+		},
+	})
+	for _, adapter := range h.adapters {
+		adapter.BindServer(h.server)
+	}
+
+	if _, err := h.server.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 12, 3)); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+
+	updateWrappers := map[string]*faultInjectingNodeClient{}
+	for _, nodeID := range []string{"a", "b", "c"} {
+		wrapper := newFaultInjectingNodeClient(h.adapters[nodeID])
+		h.server.nodes[nodeID] = wrapper
+		updateWrappers[nodeID] = wrapper
+		node := uniqueNode(nodeID)
+		if _, err := h.server.RegisterNode(ctx, storage.NodeRegistration{
+			NodeID:         nodeID,
+			RPCAddress:     node.RPCAddress,
+			FailureDomains: node.FailureDomains,
+		}); err != nil {
+			t.Fatalf("RegisterNode(%q) returned error: %v", nodeID, err)
+		}
+		if err := h.server.ReportNodeHeartbeat(ctx, storage.NodeStatus{NodeID: nodeID}); err != nil {
+			t.Fatalf("ReportNodeHeartbeat(%q) returned error: %v", nodeID, err)
+		}
+	}
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		h.server.runBackgroundDispatchOnce()
+		return len(h.server.Pending()) > 0
+	}, "first-wave pending work to be scheduled")
+
+	firstWavePending := h.server.Pending()
+	for slot, pending := range firstWavePending {
+		if pending.Kind != pendingKindReady {
+			t.Fatalf("pending[%d] kind = %q, want %q", slot, pending.Kind, pendingKindReady)
+		}
+		if err := h.adapters[pending.NodeID].ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: slot}); err != nil {
+			t.Fatalf("ActivateReplica(node=%q, slot=%d) returned error: %v", pending.NodeID, slot, err)
+		}
+	}
+
+	stuckVersion := h.server.Current().Version
+	waitForCondition(t, 2*time.Second, func() bool {
+		h.server.runBackgroundDispatchOnce()
+		current := h.server.Current()
+		snapshot, err := h.server.RoutingSnapshot(ctx)
+		if err != nil {
+			t.Fatalf("RoutingSnapshot returned error: %v", err)
+		}
+		if current.Version > stuckVersion {
+			return true
+		}
+		if len(current.Outbox) > 0 || len(current.PendingBySlot) > 0 {
+			return true
+		}
+		readable := 0
+		for _, route := range snapshot.Slots {
+			if route.Readable {
+				readable++
+			}
+		}
+		return readable > 0
+	}, "post-first-wave coordinator progress")
+
+	current := h.server.Current()
+	snapshot, err := h.server.RoutingSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("RoutingSnapshot after progress returned error: %v", err)
+	}
+	readable := 0
+	for _, route := range snapshot.Slots {
+		if route.Readable {
+			readable++
+		}
+	}
+	if current.Version == stuckVersion && len(current.Outbox) == 0 && len(current.PendingBySlot) == 0 && readable == 0 {
+		t.Fatalf(
+			"coordinator stalled after first wave: version=%d outbox=%d pending=%d active_peer_refresh=%d readable=%d",
+			current.Version,
+			len(current.Outbox),
+			len(current.PendingBySlot),
+			len(h.server.snapshotActivePeerRefreshSlots()),
+			readable,
+		)
+	}
+
+	updateCalls := 0
+	for _, wrapper := range updateWrappers {
+		updateCalls += wrapper.updatePeersCallCount()
+	}
+	if updateCalls == 0 && readable == 0 && len(current.PendingBySlot) == 0 && len(current.Outbox) == 0 {
+		t.Fatalf("expected peer refresh or new repair work after first wave, but no UpdateChainPeers calls were attempted")
+	}
+}
+
+func TestAsyncRemovedProgressKeepsRoutingBlockedUntilPeerRefreshRetrySucceeds(t *testing.T) {
+	ctx := context.Background()
+	h := newInMemoryHarnessWithConfig(t, []string{"a", "b", "c", "d"}, ServerConfig{
+		AsyncHotPathDispatch:  true,
+		DispatchRetryInterval: time.Hour,
+		DispatchTimeout:       5 * time.Millisecond,
+	})
+	if _, err := h.server.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 8, 3, "a", "b", "c")); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	h.seedBootstrap(t, 8, 3, []string{"a", "b", "c"})
+	h.adapters["d"].EnableQueuedProgress()
+
+	if _, err := h.server.AddNode(ctx, reconfigureCommand("add-d", 1, coordinator.Event{
+		Kind: coordinator.EventKindAddNode,
+		Node: uniqueNode("d"),
+	}, coordinator.ReconfigurationPolicy{MaxChangedChains: 1})); err != nil {
+		t.Fatalf("AddNode returned error: %v", err)
+	}
+	slot := mustPendingSlotForNode(t, h.server.Pending(), "d", pendingKindReady)
+	if err := h.adapters["d"].Node().ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: slot}); err != nil {
+		t.Fatalf("ActivateReplica(d) returned error: %v", err)
+	}
+	if err := h.adapters["d"].DeliverNextProgress(ctx); err != nil {
+		t.Fatalf("DeliverNextProgress(ready) returned error: %v", err)
+	}
+	h.server.runBackgroundDispatchOnce()
+
+	leavingNodeID := replicaNodeWithState(h.server.Current().Cluster.Chains[slot], coordinator.ReplicaStateLeaving)
+	if leavingNodeID == "" {
+		t.Fatal("failed to find leaving node after ready progress")
+	}
+	h.adapters[leavingNodeID].EnableQueuedProgress()
+	updateNodes := activeAfterNodeIDs(activeServingChain(h.server.Current().Cluster.Chains[slot]), map[string]bool{leavingNodeID: true})
+	if len(updateNodes) == 0 {
+		t.Fatal("no active peer-update targets found after ready progress")
+	}
+	updateWrapper := newFaultInjectingNodeClient(h.adapters[updateNodes[0]])
+	updateWrapper.updatePeersTimeouts = 1
+	h.server.nodes[updateNodes[0]] = updateWrapper
+
+	if err := h.adapters[leavingNodeID].Node().RemoveReplica(ctx, storage.RemoveReplicaCommand{Slot: slot}); err != nil {
+		t.Fatalf("RemoveReplica(%q) returned error: %v", leavingNodeID, err)
+	}
+	if err := h.adapters[leavingNodeID].DeliverNextProgress(ctx); err != nil {
+		t.Fatalf("DeliverNextProgress(removed) returned error: %v", err)
+	}
+
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for updateWrapper.updatePeersCallCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := updateWrapper.updatePeersCallCount(); got == 0 {
+		t.Fatal("expected async peer refresh dispatch to attempt UpdateChainPeers")
+	}
+
+	snapshot, err := h.server.RoutingSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("RoutingSnapshot while peer refresh is queued returned error: %v", err)
+	}
+	if snapshot.Slots[slot].Writable || snapshot.Slots[slot].Readable {
+		t.Fatalf("route while peer refresh retry is outstanding = %#v, want blocked", snapshot.Slots[slot])
+	}
+
+	h.server.nodes[updateNodes[0]] = h.adapters[updateNodes[0]]
+	h.server.runBackgroundDispatchOnce()
+
+	snapshot, err = h.server.RoutingSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("RoutingSnapshot after peer refresh retry returned error: %v", err)
+	}
+	if !snapshot.Slots[slot].Writable || !snapshot.Slots[slot].Readable {
+		t.Fatalf("route after peer refresh retry = %#v, want readable+writable", snapshot.Slots[slot])
+	}
+	assertSlotRoundTrip(t, ctx, h.server, h.adapters, slot, "queued-peer-refresh", "v1")
+}
+
+func TestAsyncStartupReadyKeepsRoutingWritableViaPreviousServingChainWhilePeerRefreshRetries(t *testing.T) {
+	ctx := context.Background()
+	h := newInMemoryHarnessWithConfig(t, []string{"a", "b", "c"}, ServerConfig{
+		AsyncHotPathDispatch:  true,
+		DispatchRetryInterval: time.Hour,
+		DispatchTimeout:       5 * time.Millisecond,
+	})
+	nodesByID := map[string]coordinator.Node{
+		"a": uniqueNode("a"),
+		"b": uniqueNode("b"),
+		"c": uniqueNode("c"),
+	}
+	stableChain := coordinator.Chain{
+		Slot: 0,
+		Replicas: []coordinator.Replica{
+			{NodeID: "a", State: coordinator.ReplicaStateActive},
+			{NodeID: "b", State: coordinator.ReplicaStateActive},
+		},
+	}
+	joiningChain := coordinator.Chain{
+		Slot: 0,
+		Replicas: []coordinator.Replica{
+			{NodeID: "a", State: coordinator.ReplicaStateActive},
+			{NodeID: "b", State: coordinator.ReplicaStateActive},
+			{NodeID: "c", State: coordinator.ReplicaStateJoining},
+		},
+	}
+	for _, nodeID := range []string{"a", "b"} {
+		assignment, err := assignmentForNode(stableChain, nodesByID, nodeID, 2)
+		if err != nil {
+			t.Fatalf("assignmentForNode(stable, %s) returned error: %v", nodeID, err)
+		}
+		if err := h.adapters[nodeID].Node().AddReplicaAsTail(ctx, storage.AddReplicaAsTailCommand{Assignment: assignment}); err != nil {
+			t.Fatalf("AddReplicaAsTail(%s, stable) returned error: %v", nodeID, err)
+		}
+		if err := h.adapters[nodeID].Node().ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: 0}); err != nil {
+			t.Fatalf("ActivateReplica(%s, stable) returned error: %v", nodeID, err)
+		}
+	}
+	joiningAssignment, err := assignmentForNode(joiningChain, nodesByID, "c", 2)
+	if err != nil {
+		t.Fatalf("assignmentForNode(joining, c) returned error: %v", err)
+	}
+	if err := h.adapters["c"].Node().AddReplicaAsTail(ctx, storage.AddReplicaAsTailCommand{Assignment: joiningAssignment}); err != nil {
+		t.Fatalf("AddReplicaAsTail(c, joining) returned error: %v", err)
+	}
+
+	h.server.replaceRuntime(coordruntime.OpenInMemoryFromState(coordruntime.State{
+		Version:      2,
+		LastLogIndex: 2,
+		Cluster: coordinator.ClusterState{
+			Chains:            []coordinator.Chain{joiningChain},
+			NodesByID:         nodesByID,
+			NodeHealthByID:    map[string]coordinator.NodeHealth{"a": coordinator.NodeHealthAlive, "b": coordinator.NodeHealthAlive, "c": coordinator.NodeHealthAlive},
+			ReadyNodeIDs:      map[string]bool{"a": true, "b": true, "c": true},
+			DrainingNodeIDs:   map[string]bool{},
+			NodeOrder:         []string{"a", "b", "c"},
+			SlotCount:         1,
+			ReplicationFactor: 3,
+		},
+		SlotVersions: map[int]uint64{0: 2},
+		NodeLivenessByID: map[string]coordruntime.NodeLivenessRecord{
+			"a": {State: coordruntime.NodeLivenessStateHealthy, LastStatus: storage.NodeStatus{NodeID: "a", ReplicaCount: 1, ActiveCount: 1}},
+			"b": {State: coordruntime.NodeLivenessStateHealthy, LastStatus: storage.NodeStatus{NodeID: "b", ReplicaCount: 1, ActiveCount: 1}},
+			"c": {State: coordruntime.NodeLivenessStateHealthy, LastStatus: storage.NodeStatus{NodeID: "c", ReplicaCount: 1, CatchingUpCount: 1}},
+		},
+		PendingBySlot: map[int]coordruntime.PendingWork{
+			0: {Slot: 0, NodeID: "c", Kind: coordruntime.PendingKindReady, SlotVersion: 2},
+		},
+		CompletedProgressBySlot: map[int][]coordruntime.CompletedProgressRecord{},
+		Outbox:                  []coordruntime.OutboxEntry{},
+		AppliedCommands:         map[string]coordruntime.AppliedCommand{},
+		LastPolicy:              coordinator.ReconfigurationPolicy{MaxChangedChains: 32},
+	}))
+	h.server.syncViewsFromRuntime()
+	h.server.rebuildRoutingSnapshot()
+
+	before, err := h.server.RoutingSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("RoutingSnapshot before ready returned error: %v", err)
+	}
+	if before.Slots[0].Writable || !before.Slots[0].Readable {
+		t.Fatalf("route before ready = %#v, want readable but not writable while the tail is still joining", before.Slots[0])
+	}
+
+	updateWrapper := newFaultInjectingNodeClient(h.adapters["a"])
+	updateWrapper.updatePeersTimeouts = 1
+	h.server.nodes["a"] = updateWrapper
+
+	if _, err := h.server.ReportReplicaReady(ctx, "c", 0, 0, "ready-c"); err != nil {
+		t.Fatalf("ReportReplicaReady returned error: %v", err)
+	}
+	waitForCondition(t, 250*time.Millisecond, func() bool {
+		return updateWrapper.updatePeersCallCount() > 0
+	}, "startup peer refresh dispatch after ready progress")
+
+	current := h.server.Current()
+	if got, want := replicaNodeStates(current.Cluster.Chains[0]), []string{"a:active", "b:active", "c:active"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("current chain after ready = %v, want %v", got, want)
+	}
+
+	after, err := h.server.RoutingSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("RoutingSnapshot during peer refresh retry returned error: %v", err)
+	}
+	if !after.Slots[0].Writable || !after.Slots[0].Readable {
+		t.Fatalf("route during startup peer refresh retry = %#v, want readable+writable via previous serving chain", after.Slots[0])
+	}
+	if got, want := after.Slots[0].ReadReplicas, before.Slots[0].ReadReplicas; !reflect.DeepEqual(got, want) {
+		t.Fatalf("route during startup peer refresh retry = %#v, want previous serving chain %#v", got, want)
+	}
+	if got, want := after.Slots[0].ChainVersion, h.server.Current().SlotVersions[0]; got != want {
+		t.Fatalf("route chain version during startup peer refresh retry = %d, want %d", got, want)
+	}
+}
+
 func requireBenchmarkCloudShapeSoak(t *testing.T) {
 	t.Helper()
 	if os.Getenv("CRAQ_RUN_BENCHMARK_SOAK_LOCAL") == "" {
 		t.Skip("set CRAQ_RUN_BENCHMARK_SOAK_LOCAL=1 to run the local cloud-shape benchmark soak")
 	}
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool, description string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", description)
 }
 
 func TestBeginDrainUpdatePeersTimeoutDoesNotFabricateCoordinatorAdvancement(t *testing.T) {
@@ -542,7 +851,7 @@ func TestMarkLeavingDispatchTimeoutThenRetryCompletesRepairAndRestoresDataPlane(
 		t.Fatalf("ActivateReplica(d) returned error: %v", err)
 	}
 
-	leavingNodeID := lastActiveReplicaNode(h.server.Current().Cluster.Chains[slot])
+	leavingNodeID := plannedLeavingNodeAfterReady(t, h.server, slot, "d")
 	if leavingNodeID == "" {
 		t.Fatal("failed to determine leaving node before retry timeout")
 	}
@@ -605,7 +914,7 @@ func TestMarkLeavingPartialOutboxSuccessThenRetryDoesNotRedispatchCompletedPeerU
 		t.Fatalf("ActivateReplica(d) returned error: %v", err)
 	}
 
-	leavingNodeID := lastActiveReplicaNode(h.server.Current().Cluster.Chains[slot])
+	leavingNodeID := plannedLeavingNodeAfterReady(t, h.server, slot, "d")
 	if leavingNodeID == "" {
 		t.Fatal("failed to determine leaving node before partial mark-leaving timeout")
 	}

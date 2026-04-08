@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -176,9 +178,10 @@ func RunStorageProcess(ctx context.Context, cfg StorageProcessConfig) error {
 	node, err := storage.OpenNode(
 		ctx,
 		storage.Config{
-			NodeID:         nodeCfg.ID,
-			RPCAddress:     nodeCfg.RPCAddress,
-			FailureDomains: nodeCfg.FailureDomains,
+			NodeID:                    nodeCfg.ID,
+			RPCAddress:                nodeCfg.RPCAddress,
+			FailureDomains:            nodeCfg.FailureDomains,
+			AutoActivateEmptyReplicas: true,
 		},
 		store.Backend(),
 		store.LocalStateStore(),
@@ -238,7 +241,7 @@ func RunStorageProcess(ctx context.Context, cfg StorageProcessConfig) error {
 		}
 	})
 	go runTicker(ctx, cfg.ActivationInterval, func() {
-		activateCatchingUpReplicas(ctx, node, cfg.NodeID, cfg.RPCDeadline)
+		advanceReplicaLifecycle(ctx, node, cfg.NodeID, cfg.RPCDeadline)
 	})
 
 	<-ctx.Done()
@@ -279,21 +282,91 @@ func runTicker(ctx context.Context, interval time.Duration, fn func()) {
 	}
 }
 
-func activateCatchingUpReplicas(ctx context.Context, node *storage.Node, nodeID string, rpcDeadline time.Duration) {
-	for _, slot := range node.CatchingUpSlots() {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
+func advanceReplicaLifecycle(ctx context.Context, node *storage.Node, nodeID string, rpcDeadline time.Duration) {
+	processReplicaLifecycleSlots(ctx, node.CatchingUpSlots(), func(slot int) error {
 		slotCtx, cancel := context.WithTimeout(ctx, rpcDeadline)
-		err := node.ActivateReplica(slotCtx, storage.ActivateReplicaCommand{Slot: slot})
-		cancel()
-		if err != nil {
-			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+		defer cancel()
+		return node.ActivateReplica(slotCtx, storage.ActivateReplicaCommand{Slot: slot})
+	}, func(slot int, err error) {
+		fmt.Fprintf(os.Stderr, "storage activate failed node=%s slot=%d error=%v\n", nodeID, slot, err)
+	})
+	processReplicaLifecycleSlots(ctx, node.LeavingSlots(), func(slot int) error {
+		slotCtx, cancel := context.WithTimeout(ctx, rpcDeadline)
+		defer cancel()
+		return node.RemoveReplica(slotCtx, storage.RemoveReplicaCommand{Slot: slot})
+	}, func(slot int, err error) {
+		fmt.Fprintf(os.Stderr, "storage remove failed node=%s slot=%d error=%v\n", nodeID, slot, err)
+	})
+}
+
+func processReplicaLifecycleSlots(
+	ctx context.Context,
+	slots []int,
+	op func(slot int) error,
+	logFailure func(slot int, err error),
+) {
+	if len(slots) == 0 {
+		return
+	}
+	workerCount := lifecycleWorkerCount(len(slots))
+	if workerCount == 1 {
+		for _, slot := range slots {
+			if ctx.Err() != nil {
 				return
 			}
-			fmt.Fprintf(os.Stderr, "storage activate failed node=%s slot=%d error=%v\n", nodeID, slot, err)
+			if err := op(slot); err != nil {
+				if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+					return
+				}
+				logFailure(slot, err)
+			}
 		}
+		return
 	}
+
+	slotCh := make(chan int)
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for slot := range slotCh {
+				if ctx.Err() != nil {
+					return
+				}
+				if err := op(slot); err != nil {
+					if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+						return
+					}
+					logFailure(slot, err)
+				}
+			}
+		}()
+	}
+
+	for _, slot := range slots {
+		if ctx.Err() != nil {
+			break
+		}
+		slotCh <- slot
+	}
+	close(slotCh)
+	wg.Wait()
+}
+
+func lifecycleWorkerCount(slotCount int) int {
+	if slotCount <= 1 {
+		return slotCount
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 2 {
+		workers = 2
+	}
+	if workers > 4 {
+		workers = 4
+	}
+	if workers > slotCount {
+		return slotCount
+	}
+	return workers
 }

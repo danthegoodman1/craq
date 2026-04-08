@@ -462,9 +462,10 @@ func runStorageProcessWithReporterLatency(ctx context.Context, cfg StorageProces
 	node, err := storage.OpenNode(
 		ctx,
 		storage.Config{
-			NodeID:         nodeCfg.ID,
-			RPCAddress:     nodeCfg.RPCAddress,
-			FailureDomains: nodeCfg.FailureDomains,
+			NodeID:                    nodeCfg.ID,
+			RPCAddress:                nodeCfg.RPCAddress,
+			FailureDomains:            nodeCfg.FailureDomains,
+			AutoActivateEmptyReplicas: true,
 		},
 		store.Backend(),
 		store.LocalStateStore(),
@@ -518,7 +519,7 @@ func runStorageProcessWithReporterLatency(ctx context.Context, cfg StorageProces
 		}
 	})
 	go runTicker(ctx, cfg.ActivationInterval, func() {
-		activateCatchingUpReplicas(ctx, node, cfg.NodeID, cfg.RPCDeadline)
+		advanceReplicaLifecycle(ctx, node, cfg.NodeID, cfg.RPCDeadline)
 	})
 
 	<-ctx.Done()
