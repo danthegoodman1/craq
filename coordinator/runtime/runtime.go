@@ -45,6 +45,18 @@ type View struct {
 	LastPolicy              coordinator.ReconfigurationPolicy
 }
 
+// SlotProgressView keeps the replica progress hot path slot-scoped so the
+// coordinator can validate ready/removed reports without cloning the whole
+// runtime view at startup scale.
+type SlotProgressView struct {
+	Version           uint64
+	ReplicationFactor int
+	Chain             coordinator.Chain
+	SlotVersion       uint64
+	Pending           *PendingWork
+	Completed         []CompletedProgressRecord
+}
+
 type PendingKind string
 
 const (
@@ -293,6 +305,25 @@ func (r *Runtime) CurrentView() View {
 	return cloneView(viewFromState(r.state))
 }
 
+func (r *Runtime) CurrentSlotProgressView(slot int) SlotProgressView {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	view := SlotProgressView{
+		Version:           r.state.Version,
+		ReplicationFactor: r.state.Cluster.ReplicationFactor,
+		SlotVersion:       r.state.SlotVersions[slot],
+		Completed:         append([]CompletedProgressRecord(nil), r.state.CompletedProgressBySlot[slot]...),
+	}
+	if pending, ok := r.state.PendingBySlot[slot]; ok {
+		cloned := pending
+		view.Pending = &cloned
+	}
+	if slot >= 0 && slot < len(r.state.Cluster.Chains) {
+		view.Chain = cloneChain(r.state.Cluster.Chains[slot])
+	}
+	return view
+}
+
 func (r *Runtime) Bootstrap(ctx context.Context, cmd Command) (State, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -358,6 +389,25 @@ func (r *Runtime) ApplyProgress(ctx context.Context, cmd Command) (State, error)
 	r.state = nextState
 
 	return cloneState(r.state), nil
+}
+
+func (r *Runtime) ApplyProgressVersion(ctx context.Context, cmd Command) (uint64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cluster, _, duplicate, err := r.executeProgress(cmd)
+	if err != nil {
+		return 0, fmt.Errorf("err in r.executeProgress: %w", err)
+	}
+	if duplicate != nil {
+		return duplicate.Version, nil
+	}
+
+	record, nextState := r.commitCandidate(cmd, cluster, nil)
+	if err := r.store.AppendWAL(ctx, record); err != nil {
+		return 0, fmt.Errorf("err in r.store.AppendWAL: %w", err)
+	}
+	r.state = nextState
+	return r.state.Version, nil
 }
 
 func (r *Runtime) MarkNodeReady(ctx context.Context, cmd Command) (State, error) {
@@ -444,6 +494,35 @@ func (r *Runtime) AcknowledgeOutbox(ctx context.Context, cmd Command) (State, er
 	}
 	r.state = nextState
 	return cloneState(r.state), nil
+}
+
+func (r *Runtime) AcknowledgeOutboxVersion(ctx context.Context, cmd Command) (uint64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	duplicate, err := r.validateCommand(cmd)
+	if err != nil {
+		return 0, fmt.Errorf("err in r.validateCommand: %w", err)
+	}
+	if duplicate != nil {
+		return duplicate.Version, nil
+	}
+	if cmd.AcknowledgeOutbox != nil && !outboxEntriesExist(r.state.Outbox, outboxAckEntryIDs(*cmd.AcknowledgeOutbox)) {
+		return r.state.Version, nil
+	}
+	_, _, duplicate, err = r.executeAcknowledgeOutbox(cmd)
+	if err != nil {
+		return 0, fmt.Errorf("err in r.executeAcknowledgeOutbox: %w", err)
+	}
+	if duplicate != nil {
+		return duplicate.Version, nil
+	}
+
+	record, nextState := r.commitCandidate(cmd, r.state.Cluster, nil)
+	if err := r.store.AppendWAL(ctx, record); err != nil {
+		return 0, fmt.Errorf("err in r.store.AppendWAL: %w", err)
+	}
+	r.state = nextState
+	return r.state.Version, nil
 }
 
 func (r *Runtime) Checkpoint(ctx context.Context) error {
