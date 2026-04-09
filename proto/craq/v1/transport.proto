@@ -248,12 +248,14 @@ message WriteOperation {
 message ForwardWriteRequest {
   WriteOperation operation = 1;
   string from_node_id = 2;
+  uint64 chain_version = 3;
 }
 
 message CommitWriteRequest {
   int32 slot = 1;
   uint64 sequence = 2;
   string from_node_id = 3;
+  uint64 chain_version = 4;
 }
 
 message FetchSnapshotRequest {

@@ -439,17 +439,21 @@ func (t *InMemoryReplicationTransport) RegisterNode(nodeID string, node replicat
 	t.nodes[nodeID] = node
 }
 
-func (t *InMemoryReplicationTransport) FetchSnapshot(_ context.Context, fromNodeID string, slot int) (Snapshot, error) {
+func (t *InMemoryReplicationTransport) FetchSnapshot(_ context.Context, fromNodeID string, slot int) (Snapshot, uint64, error) {
 	backend, ok := t.backends[fromNodeID]
 	if !ok {
-		return nil, fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, fromNodeID)
+		return nil, 0, fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, fromNodeID)
 	}
 
 	snapshot, err := backend.Snapshot(slot)
 	if err != nil {
-		return nil, fmt.Errorf("err in backend.Snapshot: %w", err)
+		return nil, 0, fmt.Errorf("err in backend.Snapshot: %w", err)
 	}
-	return cloneSnapshot(snapshot), nil
+	sequence, err := backend.HighestCommittedSequence(slot)
+	if err != nil {
+		return nil, 0, fmt.Errorf("err in backend.HighestCommittedSequence: %w", err)
+	}
+	return cloneSnapshot(snapshot), sequence, nil
 }
 
 func (t *InMemoryReplicationTransport) ForwardWrite(ctx context.Context, toNodeID string, req ForwardWriteRequest) error {
@@ -525,14 +529,14 @@ func (t *QueuedInMemoryReplicationTransport) RegisterNode(nodeID string, node re
 	t.nodes[nodeID] = node
 }
 
-func (t *QueuedInMemoryReplicationTransport) FetchSnapshot(ctx context.Context, fromNodeID string, slot int) (Snapshot, error) {
+func (t *QueuedInMemoryReplicationTransport) FetchSnapshot(ctx context.Context, fromNodeID string, slot int) (Snapshot, uint64, error) {
 	if t.beforeFetchSnapshot != nil {
 		t.beforeFetchSnapshot(fromNodeID, slot)
 	}
 	if t.blockSnapshot != nil {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, 0, ctx.Err()
 		case <-t.blockSnapshot:
 		}
 	}

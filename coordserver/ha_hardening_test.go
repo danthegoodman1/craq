@@ -1061,6 +1061,75 @@ func TestHANoopStepDoesNotChurnSettledState(t *testing.T) {
 	}
 }
 
+func TestHACurrentReadDoesNotSyncStandbyState(t *testing.T) {
+	ctx := context.Background()
+	h := newHAInMemoryHarness(t, []string{"a"})
+
+	h.mustStepLeader(t)
+	if _, err := h.leader.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 1, 1, "a")); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+
+	before := h.standby.Current()
+	beforePending := h.standby.Pending()
+	snapshot, err := h.store.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("LoadSnapshot returned error: %v", err)
+	}
+	pending := PendingWork{Slot: 0, NodeID: "a", Kind: pendingKindReady, SlotVersion: 1}
+	snapshot.Pending[0] = pending
+	if err := h.leader.saveHASnapshot(ctx, snapshot.SnapshotVersion, snapshot); err != nil {
+		t.Fatalf("saveHASnapshot returned error: %v", err)
+	}
+
+	if got := h.standby.Current(); !reflect.DeepEqual(got, before) {
+		t.Fatalf("Current unexpectedly synced standby state\ngot=%#v\nwant=%#v", got, before)
+	}
+	if got := h.standby.Pending(); !reflect.DeepEqual(got, beforePending) {
+		t.Fatalf("Pending unexpectedly changed after Current read\ngot=%#v\nwant=%#v", got, beforePending)
+	}
+}
+
+func TestHAAdminStateUsesPublishedSnapshotWithoutMutatingStandbyViews(t *testing.T) {
+	ctx := context.Background()
+	h := newHAInMemoryHarness(t, []string{"a"})
+
+	h.mustStepLeader(t)
+	if _, err := h.leader.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 1, 1, "a")); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+
+	before := h.standby.Current()
+	beforePending := h.standby.Pending()
+	snapshot, err := h.store.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("LoadSnapshot returned error: %v", err)
+	}
+	pending := PendingWork{Slot: 0, NodeID: "a", Kind: pendingKindReady, SlotVersion: 1}
+	snapshot.Pending[0] = pending
+	snapshot.Heartbeats["a"] = storage.NodeStatus{NodeID: "a", ReplicaCount: 1, ActiveCount: 1}
+	if err := h.leader.saveHASnapshot(ctx, snapshot.SnapshotVersion, snapshot); err != nil {
+		t.Fatalf("saveHASnapshot returned error: %v", err)
+	}
+
+	state := h.standby.AdminState(ctx)
+	if got, want := len(state.Current.Cluster.NodesByID), 1; got != want {
+		t.Fatalf("admin current node count = %d, want %d", got, want)
+	}
+	if got, ok := state.Pending[0]; !ok || !reflect.DeepEqual(got, pending) {
+		t.Fatalf("admin pending[0] = %#v, want %#v", got, pending)
+	}
+	if got, ok := state.Heartbeats["a"]; !ok || got.NodeID != "a" {
+		t.Fatalf("admin heartbeat = %#v, want node a", got)
+	}
+	if got := h.standby.Current(); !reflect.DeepEqual(got, before) {
+		t.Fatalf("AdminState unexpectedly mutated standby current state\ngot=%#v\nwant=%#v", got, before)
+	}
+	if got := h.standby.Pending(); !reflect.DeepEqual(got, beforePending) {
+		t.Fatalf("AdminState unexpectedly mutated standby pending\ngot=%#v\nwant=%#v", got, beforePending)
+	}
+}
+
 func TestHAConcurrentHeartbeatsAndStepHandoffsConvergeAfterFailover(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

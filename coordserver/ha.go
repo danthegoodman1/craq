@@ -32,7 +32,7 @@ type haController struct {
 const defaultHALeaseTTL = 2 * time.Second
 const defaultHARenewInterval = 250 * time.Millisecond
 
-func (s *Server) enableHA(cfg HAConfig) error {
+func (s *Server) enableHA(ctx context.Context, cfg HAConfig) error {
 	if cfg.CoordinatorID == "" {
 		return fmt.Errorf("%w: ha coordinator ID must not be empty", ErrInvalidServerConfig)
 	}
@@ -51,7 +51,7 @@ func (s *Server) enableHA(cfg HAConfig) error {
 		done: make(chan struct{}),
 	}
 	s.syncFromHASnapshot(zeroHASnapshot())
-	if _, err := s.StepHA(context.Background()); err != nil && !isNotLeader(err) {
+	if _, err := s.StepHA(ctx); err != nil && !isNotLeader(err) {
 		return err
 	}
 	if !cfg.DisableBackgroundLoops {
@@ -73,7 +73,7 @@ func (s *Server) runHALoop() {
 		case <-s.closeCh:
 			return
 		case <-ticker.C:
-			_, _ = s.StepHA(context.Background())
+			_, _ = s.StepHA(s.backgroundContext())
 		}
 	}
 }
@@ -248,8 +248,19 @@ func (s *Server) saveHASnapshot(ctx context.Context, expectedSnapshotVersion uin
 	return nil
 }
 
-func (s *Server) loadCurrentHASnapshot(ctx context.Context) (HASnapshot, error) {
+func (s *Server) readHASnapshot(ctx context.Context) (HASnapshot, error) {
+	if s.ha == nil {
+		return HASnapshot{}, fmt.Errorf("%w: ha is not enabled", ErrInvalidServerConfig)
+	}
 	snapshot, err := s.ha.cfg.Store.LoadSnapshot(ctx)
+	if err != nil {
+		return HASnapshot{}, err
+	}
+	return cloneHASnapshot(snapshot), nil
+}
+
+func (s *Server) loadCurrentHASnapshot(ctx context.Context) (HASnapshot, error) {
+	snapshot, err := s.readHASnapshot(ctx)
 	if err != nil {
 		return HASnapshot{}, err
 	}
@@ -567,7 +578,10 @@ func (s *Server) dispatchOutbox(ctx context.Context) error {
 		return fmt.Errorf("err in s.loadCurrentHASnapshot: %w", err)
 	}
 	for _, entry := range snapshot.Outbox {
-		if err := s.dispatchOutboxEntry(ctx, entry); err != nil {
+		dispatchCtx, cancel := deriveDeadlineContext(ctx, s.haDispatchTimeout(entry.Kind))
+		err := s.dispatchOutboxEntry(dispatchCtx, entry)
+		cancel()
+		if err != nil {
 			return err
 		}
 		current, err := s.loadCurrentHASnapshot(ctx)
@@ -594,6 +608,13 @@ func (s *Server) dispatchOutbox(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (s *Server) haDispatchTimeout(kind OutboxCommandKind) time.Duration {
+	if isRecoveryOutboxKind(kind) {
+		return s.recoveryCommandTimeout
+	}
+	return s.dispatchTimeout
 }
 
 func (c *haController) setLease(lease LeaderLease, isLeader bool) {

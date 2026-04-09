@@ -43,12 +43,14 @@ func TestAddReplicaAsTailReplayIsIdempotent(t *testing.T) {
 	}
 }
 
+// Per-slot locking serializes concurrent AddReplicaAsTail calls for the same
+// slot. The second call observes the record created by the first and returns
+// nil (idempotent).
 func TestAddReplicaAsTailConcurrentReplayIsIdempotent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	backend := newCoordinatedCreateBackend(2)
-	node := mustNewNode(t, ctx, Config{NodeID: "node-a"}, backend, NewInMemoryCoordinatorClient(), NewInMemoryReplicationTransport())
+	node := mustNewNode(t, ctx, Config{NodeID: "node-a"}, NewInMemoryBackend(), NewInMemoryCoordinatorClient(), NewInMemoryReplicationTransport())
 	cmd := AddReplicaAsTailCommand{
 		Assignment: ReplicaAssignment{Slot: 1, ChainVersion: 1, Role: ReplicaRoleSingle},
 		Epoch:      5,
@@ -63,13 +65,6 @@ func TestAddReplicaAsTailConcurrentReplayIsIdempotent(t *testing.T) {
 			errCh <- node.AddReplicaAsTail(ctx, cmd)
 		}()
 	}
-
-	select {
-	case <-backend.arrived:
-	case <-ctx.Done():
-		t.Fatalf("timed out waiting for concurrent CreateReplica calls: %v", ctx.Err())
-	}
-	close(backend.release)
 
 	wg.Wait()
 	close(errCh)

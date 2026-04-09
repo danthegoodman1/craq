@@ -1586,7 +1586,8 @@ func enqueueDirtyCommittedMiddleWrite(
 				UpdatedAt: ts,
 			},
 		},
-		FromNodeID: "a",
+		FromNodeID:   "a",
+		ChainVersion: 1,
 	}); err != nil {
 		t.Fatalf("HandleForwardWrite returned error: %v", err)
 	}

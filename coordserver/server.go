@@ -114,6 +114,7 @@ type ServerConfig struct {
 	StartupMaxChangedChains int
 	Clock                   Clock
 	AsyncHotPathDispatch    bool
+	DisableBackgroundLoops  bool
 	DispatchTimeout         time.Duration
 	DispatchRetryInterval   time.Duration
 	RecoveryCommandTimeout  time.Duration
@@ -160,6 +161,8 @@ type Server struct {
 	dispatchNotify          chan struct{}
 	closeOnce               sync.Once
 	closeCh                 chan struct{}
+	backgroundCtx           context.Context
+	backgroundCancel        context.CancelFunc
 }
 
 type activePeerRefreshState struct {
@@ -201,6 +204,7 @@ func OpenWithConfig(
 	for nodeID, node := range nodes {
 		clonedNodes[nodeID] = node
 	}
+	backgroundCtx, backgroundCancel := context.WithCancel(context.Background())
 
 	server := &Server{
 		rt:                      rt,
@@ -227,6 +231,8 @@ func OpenWithConfig(
 		events:                  newServerEventRecorder(),
 		dispatchNotify:          make(chan struct{}, 1),
 		closeCh:                 make(chan struct{}),
+		backgroundCtx:           backgroundCtx,
+		backgroundCancel:        backgroundCancel,
 	}
 	if server.clock == nil {
 		server.clock = realClock{}
@@ -246,10 +252,11 @@ func OpenWithConfig(
 	}
 	server.rebuildRoutingSnapshot()
 	if cfg.HA != nil {
-		if err := server.enableHA(*cfg.HA); err != nil {
+		if err := server.enableHA(ctx, *cfg.HA); err != nil {
+			server.backgroundCancel()
 			return nil, fmt.Errorf("err in server.enableHA: %w", err)
 		}
-	} else {
+	} else if !cfg.DisableBackgroundLoops {
 		server.startDispatchLoop()
 	}
 	return server, nil
@@ -257,6 +264,9 @@ func OpenWithConfig(
 
 func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
+		if s.backgroundCancel != nil {
+			s.backgroundCancel()
+		}
 		close(s.closeCh)
 		if s.ha != nil && s.ha.stop != nil {
 			close(s.ha.stop)
@@ -269,11 +279,6 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) Current() coordruntime.State {
-	if s.ha != nil {
-		if snapshot, err := s.ha.cfg.Store.LoadSnapshot(context.Background()); err == nil {
-			s.syncFromHASnapshot(snapshot)
-		}
-	}
 	return s.currentState()
 }
 
@@ -336,6 +341,12 @@ func (s *Server) RoutingSnapshot(ctx context.Context) (RoutingSnapshot, error) {
 	s.routingSnapshotMu.RLock()
 	defer s.routingSnapshotMu.RUnlock()
 	return cloneRoutingSnapshot(s.routingSnapshot), nil
+}
+
+func (s *Server) routingSnapshotReadOnly() RoutingSnapshot {
+	s.routingSnapshotMu.RLock()
+	defer s.routingSnapshotMu.RUnlock()
+	return cloneRoutingSnapshot(s.routingSnapshot)
 }
 
 func (s *Server) clientForNodeID(nodeID string) (StorageNodeClient, error) {
@@ -426,6 +437,10 @@ func (s *Server) ReportReplicaReady(ctx context.Context, nodeID string, slot int
 			return planner.ReportReplicaReady(ctx, nodeID, slot, epoch, commandID)
 		})
 	}
+	return s.applyReplicaReadyDirect(ctx, nodeID, slot, epoch, commandID)
+}
+
+func (s *Server) applyReplicaReadyDirect(ctx context.Context, nodeID string, slot int, epoch uint64, commandID string) (coordruntime.State, error) {
 	defer s.refreshMetricGauges()
 	rt := s.runtimeRef()
 	duplicateCompleted := false
@@ -503,14 +518,22 @@ func (s *Server) ReportReplicaReady(ctx context.Context, nodeID string, slot int
 	if duplicateCompleted {
 		return updated, nil
 	}
-	s.syncViewsFromRuntime()
-	if enqueuePeerRefresh {
-		s.enqueueActivePeerRefresh(slot, refreshState)
-	}
-	s.rebuildRoutingSnapshot()
 	if s.asyncHotPathDispatch {
+		// Defer the expensive sync+rebuild to the dispatch loop. The
+		// runtime already has the authoritative state; the server's views
+		// and routing snapshot will be refreshed on the next dispatch pass.
+		// This keeps the hot-path progress handler O(1) per slot instead
+		// of O(N) where N = total slot count.
+		if enqueuePeerRefresh {
+			s.enqueueActivePeerRefresh(slot, refreshState)
+		}
 		s.notifyDispatchLoop()
 	} else {
+		s.syncViewsFromRuntime()
+		if enqueuePeerRefresh {
+			s.enqueueActivePeerRefresh(slot, refreshState)
+		}
+		s.rebuildRoutingSnapshot()
 		if err := s.reconcileAndDispatch(ctx); err != nil {
 			return coordruntime.State{}, err
 		}
@@ -531,6 +554,10 @@ func (s *Server) ReportReplicaRemoved(ctx context.Context, nodeID string, slot i
 			return planner.ReportReplicaRemoved(ctx, nodeID, slot, epoch, commandID)
 		})
 	}
+	return s.applyReplicaRemovedDirect(ctx, nodeID, slot, epoch, commandID)
+}
+
+func (s *Server) applyReplicaRemovedDirect(ctx context.Context, nodeID string, slot int, epoch uint64, commandID string) (coordruntime.State, error) {
 	defer s.refreshMetricGauges()
 	rt := s.runtimeRef()
 	duplicateCompleted := false
@@ -596,12 +623,11 @@ func (s *Server) ReportReplicaRemoved(ctx context.Context, nodeID string, slot i
 	if duplicateCompleted {
 		return updated, nil
 	}
-	s.syncViewsFromRuntime()
 	if s.asyncHotPathDispatch {
 		s.enqueueActivePeerRefresh(slot, activePeerRefreshState{})
-		s.rebuildRoutingSnapshot()
 		s.notifyDispatchLoop()
 	} else {
+		s.syncViewsFromRuntime()
 		s.enqueueActivePeerRefresh(slot, activePeerRefreshState{})
 		s.rebuildRoutingSnapshot()
 		if err := s.reconcileAndDispatch(ctx); err != nil {
@@ -676,9 +702,11 @@ func (s *Server) ReportNodeHeartbeat(ctx context.Context, status storage.NodeSta
 			s.observeTimeoutOrFailure("node_ready", err)
 			return err
 		}
-		s.syncViewsFromRuntime()
-		s.rebuildRoutingSnapshot()
 		becameReady = true
+		if !s.asyncHotPathDispatch {
+			s.syncViewsFromRuntime()
+			s.rebuildRoutingSnapshot()
+		}
 	}
 	if becameReady {
 		if s.asyncHotPathDispatch {
@@ -1081,17 +1109,26 @@ func (s *Server) notifyDispatchLoop() {
 	}
 }
 
+func (s *Server) backgroundContext() context.Context {
+	if s.backgroundCtx == nil {
+		return context.Background()
+	}
+	return s.backgroundCtx
+}
+
 func (s *Server) runBackgroundDispatchOnce() {
 	for pass := 0; pass < runtimeVersionRetryLimit; pass++ {
 		before := s.backgroundDispatchSignature()
 		var err error
 		if s.asyncHotPathDispatch {
-			err = s.reconcileAndDispatch(context.Background())
+			s.syncViewsFromRuntime()
+			s.rebuildRoutingSnapshot()
+			err = s.reconcileAndDispatch(s.backgroundContext())
 			if err == nil {
-				err = s.dispatchQueuedActivePeerRefreshes(context.Background())
+				err = s.dispatchQueuedActivePeerRefreshes(s.backgroundContext())
 			}
 		} else {
-			err = s.dispatchRuntimeOutbox(context.Background())
+			err = s.dispatchRuntimeOutbox(s.backgroundContext())
 		}
 		if err != nil {
 			if errors.Is(err, ErrDispatchFailed) || errors.Is(err, ErrDispatchTimeout) {
@@ -1234,12 +1271,17 @@ func outboxDispatchWorkerCount(entryCount int) int {
 	if entryCount <= 1 {
 		return entryCount
 	}
+	// Cap at 8 to limit concurrent add_replica_as_tail dispatches. Each
+	// dispatch can trigger an inline auto-activation that calls
+	// ReportReplicaReady back to the coordinator. Too many concurrent
+	// callers saturate the runtime's single mutex, starving the dispatch
+	// loop and causing cascading timeouts.
 	workers := runtime.GOMAXPROCS(0)
 	if workers < 2 {
 		workers = 2
 	}
-	if workers > 32 {
-		workers = 32
+	if workers > 8 {
+		workers = 8
 	}
 	if workers > entryCount {
 		return entryCount
@@ -2114,7 +2156,10 @@ func retryOnRuntimeVersionMismatch[T any](
 		if !errors.Is(err, coordruntime.ErrVersionMismatch) || attempt >= runtimeVersionRetryLimit {
 			return zero, err
 		}
-		time.Sleep(time.Millisecond)
+		// No sleep: the runtime lock provides natural backpressure.
+		// Yielding the goroutine is sufficient to let the successful
+		// writer complete its lock-protected section.
+		runtime.Gosched()
 	}
 }
 

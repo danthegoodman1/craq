@@ -81,7 +81,6 @@ func RunCoordinatorProcess(ctx context.Context, cfg CoordinatorProcessConfig) er
 			manifest.Coordinator.SlotCount,
 			cfg.Reconfiguration.MaxChangedChains,
 		),
-		AsyncHotPathDispatch:  true,
 		NodeClientFactory:     grpcx.NewDynamicNodeClientFactory(pool),
 		DispatchRetryInterval: 200 * time.Millisecond,
 	})
@@ -131,7 +130,7 @@ func RunCoordinatorProcess(ctx context.Context, cfg CoordinatorProcessConfig) er
 
 	adminClient := grpcx.NewCoordinatorAdminClient(manifest.Coordinator.RPCAddress, pool)
 	go runTicker(ctx, cfg.TickInterval, func() {
-		evalCtx, cancel := context.WithTimeout(context.Background(), cfg.RPCDeadline)
+		evalCtx, cancel := context.WithTimeout(ctx, cfg.RPCDeadline)
 		defer cancel()
 		_ = adminClient.EvaluateLiveness(evalCtx)
 	})
@@ -364,12 +363,14 @@ func lifecycleWorkerCount(slotCount int) int {
 	if slotCount <= 1 {
 		return slotCount
 	}
+	// Cap at 4 to limit concurrent progress reports to the coordinator,
+	// preventing runtime lock contention that starves the dispatch loop.
 	workers := runtime.GOMAXPROCS(0)
 	if workers < 2 {
 		workers = 2
 	}
-	if workers > 16 {
-		workers = 16
+	if workers > 4 {
+		workers = 4
 	}
 	if workers > slotCount {
 		return slotCount

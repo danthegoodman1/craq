@@ -87,7 +87,8 @@ func TestNodeObservabilityRecordsAmbiguousWriteAndBackpressure(t *testing.T) {
 			Value:    "two",
 			Metadata: testObjectMetadata(2),
 		},
-		FromNodeID: "head",
+		FromNodeID:   "head",
+		ChainVersion: 1,
 	})
 	if err != nil {
 		t.Fatalf("first future HandleForwardWrite returned error: %v", err)
@@ -101,7 +102,8 @@ func TestNodeObservabilityRecordsAmbiguousWriteAndBackpressure(t *testing.T) {
 			Value:    "three",
 			Metadata: testObjectMetadata(3),
 		},
-		FromNodeID: "head",
+		FromNodeID:   "head",
+		ChainVersion: 1,
 	})
 	var pressure *BackpressureError
 	if !errors.As(err, &pressure) || !errors.Is(err, ErrReplicaBackpressure) {

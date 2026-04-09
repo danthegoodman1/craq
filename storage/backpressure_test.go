@@ -203,8 +203,9 @@ func TestReplicaBackpressureEnforcesNodeWideBufferedLimit(t *testing.T) {
 	record := node.ensureProtocolState(node.replicas[1])
 	var err error
 	record, err = node.bufferFutureForward(record, ForwardWriteRequest{
-		Operation:  WriteOperation{Slot: 1, Sequence: 2, Kind: OperationKindPut, Key: "k1", Value: "v1"},
-		FromNodeID: "pred-1",
+		Operation:    WriteOperation{Slot: 1, Sequence: 2, Kind: OperationKindPut, Key: "k1", Value: "v1"},
+		FromNodeID:   "pred-1",
+		ChainVersion: 1,
 	})
 	if err != nil {
 		t.Fatalf("bufferFutureForward(seq=2) returned error: %v", err)
@@ -212,8 +213,9 @@ func TestReplicaBackpressureEnforcesNodeWideBufferedLimit(t *testing.T) {
 	node.replicas[1] = record
 	record = node.replicas[1]
 	record, err = node.bufferFutureForward(record, ForwardWriteRequest{
-		Operation:  WriteOperation{Slot: 1, Sequence: 2, Kind: OperationKindPut, Key: "k1", Value: "v1"},
-		FromNodeID: "pred-1",
+		Operation:    WriteOperation{Slot: 1, Sequence: 2, Kind: OperationKindPut, Key: "k1", Value: "v1"},
+		FromNodeID:   "pred-1",
+		ChainVersion: 1,
 	})
 	if err != nil {
 		t.Fatalf("duplicate bufferFutureForward returned error: %v", err)
@@ -221,8 +223,9 @@ func TestReplicaBackpressureEnforcesNodeWideBufferedLimit(t *testing.T) {
 	node.replicas[1] = record
 	record = node.replicas[1]
 	record, err = node.bufferFutureForward(record, ForwardWriteRequest{
-		Operation:  WriteOperation{Slot: 1, Sequence: 3, Kind: OperationKindPut, Key: "k2", Value: "v2"},
-		FromNodeID: "pred-1",
+		Operation:    WriteOperation{Slot: 1, Sequence: 3, Kind: OperationKindPut, Key: "k2", Value: "v2"},
+		FromNodeID:   "pred-1",
+		ChainVersion: 1,
 	})
 	if err != nil {
 		t.Fatalf("bufferFutureForward(seq=3) returned error: %v", err)
@@ -234,23 +237,28 @@ func TestReplicaBackpressureEnforcesNodeWideBufferedLimit(t *testing.T) {
 
 	record = node.ensureProtocolState(node.replicas[2])
 	record, err = node.bufferFutureForward(record, ForwardWriteRequest{
-		Operation:  WriteOperation{Slot: 2, Sequence: 2, Kind: OperationKindPut, Key: "k3", Value: "v3"},
-		FromNodeID: "pred-2",
+		Operation:    WriteOperation{Slot: 2, Sequence: 2, Kind: OperationKindPut, Key: "k3", Value: "v3"},
+		FromNodeID:   "pred-2",
+		ChainVersion: 1,
 	})
 	assertReplicaBackpressure(t, err, 2, 2)
 
-	if err := node.applyForward(ctx, node.replicas[1], ForwardWriteRequest{
-		Operation: WriteOperation{Slot: 1, Sequence: 1, Kind: OperationKindPut, Key: "k0", Value: "v0"},
+	slotMu := node.getSlotMu(1)
+	slotMu.Lock()
+	if err := node.applyForwardLocked(ctx, slotMu, node.replicas[1], ForwardWriteRequest{
+		Operation:    WriteOperation{Slot: 1, Sequence: 1, Kind: OperationKindPut, Key: "k0", Value: "v0"},
+		ChainVersion: 1,
 	}); err != nil {
-		t.Fatalf("applyForward(seq=1) returned error: %v", err)
+		t.Fatalf("applyForwardLocked(seq=1) returned error: %v", err)
 	}
 	if got, want := node.BufferedReplicaMessages(), 0; got != want {
 		t.Fatalf("buffered replica messages after drain = %d, want %d", got, want)
 	}
 	record = node.ensureProtocolState(node.replicas[2])
 	record, err = node.bufferFutureForward(record, ForwardWriteRequest{
-		Operation:  WriteOperation{Slot: 2, Sequence: 2, Kind: OperationKindPut, Key: "k3", Value: "v3"},
-		FromNodeID: "pred-2",
+		Operation:    WriteOperation{Slot: 2, Sequence: 2, Kind: OperationKindPut, Key: "k3", Value: "v3"},
+		FromNodeID:   "pred-2",
+		ChainVersion: 1,
 	})
 	if err != nil {
 		t.Fatalf("bufferFutureForward(slot=2, seq=2) returned error after drain: %v", err)

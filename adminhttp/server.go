@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"sync/atomic"
+	"time"
 
 	"github.com/danthegoodman1/craq/coordserver"
 	"github.com/danthegoodman1/craq/gologger"
@@ -85,7 +86,12 @@ func newServer(component string, cfg Config, registerState func(*http.ServeMux))
 	})
 	mux.Handle("/metrics", promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{}))
 	registerState(mux)
-	s.http = &http.Server{Handler: mux}
+	s.http = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	return s
 }
 

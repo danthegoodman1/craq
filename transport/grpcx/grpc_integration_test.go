@@ -213,6 +213,53 @@ func TestClientTransportReturnsTypedErrorsOverGRPC(t *testing.T) {
 	})
 }
 
+func TestReplicationTransportRejectsStaleChainVersionOverGRPC(t *testing.T) {
+	ctx := context.Background()
+	pool := grpcx.NewConnPool()
+	t.Cleanup(func() { _ = pool.Close() })
+
+	repl := storage.NewInMemoryReplicationTransport()
+	node := mustOpenNode(t, ctx, storage.Config{NodeID: "mid"}, storage.NewInMemoryBackend(), storage.NewInMemoryCoordinatorClient(), repl)
+	mustActivateReplica(t, node, storage.ReplicaAssignment{
+		Slot:         6,
+		ChainVersion: 2,
+		Role:         storage.ReplicaRoleSingle,
+	})
+	if err := node.UpdateChainPeers(ctx, storage.UpdateChainPeersCommand{
+		Assignment: storage.ReplicaAssignment{
+			Slot:         6,
+			ChainVersion: 2,
+			Role:         storage.ReplicaRoleTail,
+			Peers: storage.ChainPeers{
+				PredecessorNodeID: "head",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("UpdateChainPeers returned error: %v", err)
+	}
+	server, address := mustStartStorageServer(t, node)
+	defer func() { _ = server.Close() }()
+
+	err := grpcx.NewReplicationTransport(pool).ForwardWrite(ctx, address, storage.ForwardWriteRequest{
+		Operation: storage.WriteOperation{
+			Slot:     6,
+			Sequence: 1,
+			Kind:     storage.OperationKindPut,
+			Key:      "alpha",
+			Value:    "one",
+			Metadata: storage.ObjectMetadata{Version: 1},
+		},
+		FromNodeID:   "head",
+		ChainVersion: 1,
+	})
+	if err == nil {
+		t.Fatal("ForwardWrite unexpectedly succeeded")
+	}
+	if !errors.Is(err, storage.ErrPeerMismatch) {
+		t.Fatalf("ForwardWrite error = %v, want ErrPeerMismatch", err)
+	}
+}
+
 func TestDynamicAutoJoinIdentityAndTombstoneSafetyOverFactoryBackedGRPC(t *testing.T) {
 	ctx := context.Background()
 	pool := grpcx.NewConnPool()
@@ -948,7 +995,8 @@ func queueDirtyCommittedMiddleWrite(
 				UpdatedAt: ts,
 			},
 		},
-		FromNodeID: "head",
+		FromNodeID:   "head",
+		ChainVersion: 1,
 	}); err != nil {
 		t.Fatalf("HandleForwardWrite returned error: %v", err)
 	}
@@ -1104,8 +1152,8 @@ func waitFor(t *testing.T, condition func() bool) {
 
 type blockingTransport struct{}
 
-func (t *blockingTransport) FetchSnapshot(context.Context, string, int) (storage.Snapshot, error) {
-	return storage.Snapshot{}, nil
+func (t *blockingTransport) FetchSnapshot(context.Context, string, int) (storage.Snapshot, uint64, error) {
+	return storage.Snapshot{}, 0, nil
 }
 
 func (t *blockingTransport) FetchCommittedSequence(context.Context, string, int) (uint64, error) {

@@ -234,12 +234,13 @@ func (t *manualAmbiguousReplicationTransport) Register(nodeID string, backend st
 	t.nodes[nodeID] = node
 }
 
-func (t *manualAmbiguousReplicationTransport) FetchSnapshot(_ context.Context, fromNodeID string, slot int) (storage.Snapshot, error) {
+func (t *manualAmbiguousReplicationTransport) FetchSnapshot(_ context.Context, fromNodeID string, slot int) (storage.Snapshot, uint64, error) {
 	backend, ok := t.backends[fromNodeID]
 	if !ok {
-		return nil, fmt.Errorf("%w: node %q", storage.ErrSnapshotSourceUnavailable, fromNodeID)
+		return nil, 0, fmt.Errorf("%w: node %q", storage.ErrSnapshotSourceUnavailable, fromNodeID)
 	}
-	return backend.CommittedSnapshot(slot)
+	snap, err := backend.CommittedSnapshot(slot)
+	return snap, 0, err
 }
 
 func (t *manualAmbiguousReplicationTransport) FetchCommittedSequence(_ context.Context, fromNodeID string, slot int) (uint64, error) {

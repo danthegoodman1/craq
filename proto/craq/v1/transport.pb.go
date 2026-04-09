@@ -2400,6 +2400,7 @@ type ForwardWriteRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Operation     *WriteOperation        `protobuf:"bytes,1,opt,name=operation,proto3" json:"operation,omitempty"`
 	FromNodeId    string                 `protobuf:"bytes,2,opt,name=from_node_id,json=fromNodeId,proto3" json:"from_node_id,omitempty"`
+	ChainVersion  uint64                 `protobuf:"varint,3,opt,name=chain_version,json=chainVersion,proto3" json:"chain_version,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2448,11 +2449,19 @@ func (x *ForwardWriteRequest) GetFromNodeId() string {
 	return ""
 }
 
+func (x *ForwardWriteRequest) GetChainVersion() uint64 {
+	if x != nil {
+		return x.ChainVersion
+	}
+	return 0
+}
+
 type CommitWriteRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Slot          int32                  `protobuf:"varint,1,opt,name=slot,proto3" json:"slot,omitempty"`
 	Sequence      uint64                 `protobuf:"varint,2,opt,name=sequence,proto3" json:"sequence,omitempty"`
 	FromNodeId    string                 `protobuf:"bytes,3,opt,name=from_node_id,json=fromNodeId,proto3" json:"from_node_id,omitempty"`
+	ChainVersion  uint64                 `protobuf:"varint,4,opt,name=chain_version,json=chainVersion,proto3" json:"chain_version,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2506,6 +2515,13 @@ func (x *CommitWriteRequest) GetFromNodeId() string {
 		return x.FromNodeId
 	}
 	return ""
+}
+
+func (x *CommitWriteRequest) GetChainVersion() uint64 {
+	if x != nil {
+		return x.ChainVersion
+	}
+	return 0
 }
 
 type FetchSnapshotRequest struct {
@@ -3371,16 +3387,18 @@ const file_craq_v1_transport_proto_rawDesc = "" +
 	"\x04kind\x18\x03 \x01(\tR\x04kind\x12\x10\n" +
 	"\x03key\x18\x04 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x05 \x01(\tR\x05value\x123\n" +
-	"\bmetadata\x18\x06 \x01(\v2\x17.craq.v1.ObjectMetadataR\bmetadata\"n\n" +
+	"\bmetadata\x18\x06 \x01(\v2\x17.craq.v1.ObjectMetadataR\bmetadata\"\x93\x01\n" +
 	"\x13ForwardWriteRequest\x125\n" +
 	"\toperation\x18\x01 \x01(\v2\x17.craq.v1.WriteOperationR\toperation\x12 \n" +
 	"\ffrom_node_id\x18\x02 \x01(\tR\n" +
-	"fromNodeId\"f\n" +
+	"fromNodeId\x12#\n" +
+	"\rchain_version\x18\x03 \x01(\x04R\fchainVersion\"\x8b\x01\n" +
 	"\x12CommitWriteRequest\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\x05R\x04slot\x12\x1a\n" +
 	"\bsequence\x18\x02 \x01(\x04R\bsequence\x12 \n" +
 	"\ffrom_node_id\x18\x03 \x01(\tR\n" +
-	"fromNodeId\"*\n" +
+	"fromNodeId\x12#\n" +
+	"\rchain_version\x18\x04 \x01(\x04R\fchainVersion\"*\n" +
 	"\x14FetchSnapshotRequest\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\x05R\x04slot\"l\n" +
 	"\rSnapshotEntry\x12\x10\n" +

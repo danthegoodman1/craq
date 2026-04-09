@@ -231,28 +231,64 @@ func (s *Server) LastRecoveryReports() map[string]storage.NodeRecoveryReport {
 
 func (s *Server) AdminState(ctx context.Context) AdminState {
 	s.refreshMetricGauges()
-	snapshot, _ := s.RoutingSnapshot(ctx)
+	snapshot := s.routingSnapshotReadOnly()
+	current := s.Current()
+	pending := s.Pending()
+	heartbeats := s.Heartbeats()
+	liveness := s.Liveness()
+	unavailable := s.UnavailableReplicas()
+	lastRecovery := s.LastRecoveryReports()
+	if s.ha != nil {
+		if published, err := s.readHASnapshot(ctx); err == nil {
+			current = published.State
+			pending = published.Pending
+			heartbeats = published.Heartbeats
+			liveness = published.Liveness
+			unavailable = make(map[string][]int, len(published.UnavailableReplicas))
+			for nodeID, slots := range published.UnavailableReplicas {
+				nodeSlots := make([]int, 0, len(slots))
+				for slot := range slots {
+					nodeSlots = append(nodeSlots, slot)
+				}
+				sort.Ints(nodeSlots)
+				unavailable[nodeID] = nodeSlots
+			}
+			lastRecovery = published.LastRecoveryReports
+		}
+	}
 	return AdminState{
-		Current:             s.Current(),
+		Current:             current,
 		RoutingSnapshot:     snapshot,
-		Pending:             s.Pending(),
+		Pending:             pending,
 		ActivePeerRefreshes: len(s.snapshotActivePeerRefreshSlots()),
-		Heartbeats:          s.Heartbeats(),
-		Liveness:            s.Liveness(),
-		UnavailableReplicas: s.UnavailableReplicas(),
-		LastRecoveryReports: s.LastRecoveryReports(),
+		Heartbeats:          heartbeats,
+		Liveness:            liveness,
+		UnavailableReplicas: unavailable,
+		LastRecoveryReports: lastRecovery,
 		Recent:              s.RecentEvents(),
 	}
 }
 
 func (s *Server) RoutingStatus(ctx context.Context) RoutingStatus {
 	s.refreshMetricGauges()
-	snapshot, _ := s.RoutingSnapshot(ctx)
-	current := s.currentStateView()
-	s.viewMu.RLock()
-	pendingCount := len(s.pending)
-	liveness := mergeLivenessRecords(nil, s.liveness)
-	s.viewMu.RUnlock()
+	snapshot := s.routingSnapshotReadOnly()
+	current := s.currentState()
+	pendingCount := 0
+	liveness := map[string]coordruntime.NodeLivenessRecord{}
+	outboxCount := len(current.Outbox)
+	if s.ha != nil {
+		if published, err := s.readHASnapshot(ctx); err == nil {
+			current = published.State
+			pendingCount = len(published.Pending)
+			liveness = mergeLivenessRecords(nil, published.Liveness)
+			outboxCount = len(published.Outbox)
+		}
+	} else {
+		s.viewMu.RLock()
+		pendingCount = len(s.pending)
+		liveness = mergeLivenessRecords(nil, s.liveness)
+		s.viewMu.RUnlock()
+	}
 	activePeerRefreshCount := len(s.snapshotActivePeerRefreshSlots())
 	settledSlotCount := 0
 	for _, chain := range current.Cluster.Chains {
@@ -279,7 +315,7 @@ func (s *Server) RoutingStatus(ctx context.Context) RoutingStatus {
 	return RoutingStatus{
 		RoutingSnapshot:        snapshot,
 		PendingCount:           pendingCount,
-		OutboxCount:            len(current.Outbox),
+		OutboxCount:            outboxCount,
 		ActivePeerRefreshCount: activePeerRefreshCount,
 		SettledSlotCount:       settledSlotCount,
 		HealthyNodeCount:       healthyNodeCount,

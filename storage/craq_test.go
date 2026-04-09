@@ -201,7 +201,8 @@ func TestCRAQDuplicateForwardAndCommitDoNotCorruptDirtyIndex(t *testing.T) {
 			Value:    "v2",
 			Metadata: testObjectMetadata(2),
 		},
-		FromNodeID: "head",
+		FromNodeID:   "head",
+		ChainVersion: 1,
 	}
 	if err := nodes["mid"].HandleForwardWrite(ctx, req); err != nil {
 		t.Fatalf("first HandleForwardWrite returned error: %v", err)
@@ -236,9 +237,10 @@ func TestCRAQDuplicateForwardAndCommitDoNotCorruptDirtyIndex(t *testing.T) {
 		t.Fatalf("dirty entries after commit = %d, want 0", got)
 	}
 	if err := nodes["mid"].HandleCommitWrite(ctx, CommitWriteRequest{
-		Slot:       15,
-		Sequence:   2,
-		FromNodeID: "tail",
+		Slot:         15,
+		Sequence:     2,
+		FromNodeID:   "tail",
+		ChainVersion: 1,
 	}); err != nil {
 		t.Fatalf("duplicate HandleCommitWrite returned error: %v", err)
 	}
@@ -267,7 +269,8 @@ func TestCRAQBufferedFutureForwardIsNotReadVisibleUntilContiguousAndTailCommitte
 			Value:    "v3",
 			Metadata: testObjectMetadata(3),
 		},
-		FromNodeID: "head",
+		FromNodeID:   "head",
+		ChainVersion: 1,
 	}); err != nil {
 		t.Fatalf("future HandleForwardWrite returned error: %v", err)
 	}
@@ -290,7 +293,8 @@ func TestCRAQBufferedFutureForwardIsNotReadVisibleUntilContiguousAndTailCommitte
 			Value:    "v2",
 			Metadata: testObjectMetadata(2),
 		},
-		FromNodeID: "head",
+		FromNodeID:   "head",
+		ChainVersion: 1,
 	}); err != nil {
 		t.Fatalf("contiguous HandleForwardWrite returned error: %v", err)
 	}
@@ -405,7 +409,7 @@ func stageTailCommittedDirtyOps(
 		op.Slot = slot
 		op.Sequence = uint64(i + 2)
 		op.Key = key
-		req := ForwardWriteRequest{Operation: op, FromNodeID: "head"}
+		req := ForwardWriteRequest{Operation: op, FromNodeID: "head", ChainVersion: 1}
 		if err := mid.HandleForwardWrite(ctx, req); err != nil {
 			t.Fatalf("HandleForwardWrite(%d) returned error: %v", op.Sequence, err)
 		}

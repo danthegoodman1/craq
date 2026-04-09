@@ -164,17 +164,21 @@ func TestBadgerNodeReopenAfterDirtyCRAQStateRecoversFromServingPeer(t *testing.T
 			TailTarget:        "tail",
 		},
 	}
-	for node, assignment := range map[*storage.Node]storage.ReplicaAssignment{
-		head: headAssignment,
-		tail: tailAssignment,
+	// Head must be initialized first so that the tail can fetch its snapshot.
+	for _, pair := range []struct {
+		node       *storage.Node
+		assignment storage.ReplicaAssignment
+	}{
+		{head, headAssignment},
+		{tail, tailAssignment},
 	} {
-		if err := node.AddReplicaAsTail(ctx, storage.AddReplicaAsTailCommand{Assignment: assignment, Epoch: 5}); err != nil {
+		if err := pair.node.AddReplicaAsTail(ctx, storage.AddReplicaAsTailCommand{Assignment: pair.assignment, Epoch: 5}); err != nil {
 			t.Fatalf("AddReplicaAsTail returned error: %v", err)
 		}
-		if err := node.ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: 3, Epoch: 5}); err != nil {
+		if err := pair.node.ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: 3, Epoch: 5}); err != nil {
 			t.Fatalf("ActivateReplica returned error: %v", err)
 		}
-		if err := node.UpdateChainPeers(ctx, storage.UpdateChainPeersCommand{Assignment: assignment, Epoch: 5}); err != nil {
+		if err := pair.node.UpdateChainPeers(ctx, storage.UpdateChainPeersCommand{Assignment: pair.assignment, Epoch: 5}); err != nil {
 			t.Fatalf("UpdateChainPeers returned error: %v", err)
 		}
 	}
