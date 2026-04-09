@@ -109,17 +109,18 @@ type Clock interface {
 }
 
 type ServerConfig struct {
-	LivenessPolicy         LivenessPolicy
-	ReconfigurationPolicy  coordinator.ReconfigurationPolicy
-	Clock                  Clock
-	AsyncHotPathDispatch   bool
-	DispatchTimeout        time.Duration
-	DispatchRetryInterval  time.Duration
-	RecoveryCommandTimeout time.Duration
-	NodeClientFactory      NodeClientFactory
-	HA                     *HAConfig
-	Logger                 *zerolog.Logger
-	MetricsRegistry        *prometheus.Registry
+	LivenessPolicy          LivenessPolicy
+	ReconfigurationPolicy   coordinator.ReconfigurationPolicy
+	StartupMaxChangedChains int
+	Clock                   Clock
+	AsyncHotPathDispatch    bool
+	DispatchTimeout         time.Duration
+	DispatchRetryInterval   time.Duration
+	RecoveryCommandTimeout  time.Duration
+	NodeClientFactory       NodeClientFactory
+	HA                      *HAConfig
+	Logger                  *zerolog.Logger
+	MetricsRegistry         *prometheus.Registry
 }
 
 type NodeClientFactory interface {
@@ -127,41 +128,46 @@ type NodeClientFactory interface {
 }
 
 type Server struct {
-	rt                     *coordruntime.Runtime
-	runtimeMu              sync.RWMutex
-	nodes                  map[string]StorageNodeClient
-	nodesMu                sync.RWMutex
-	heartbeats             map[string]storage.NodeStatus
-	liveness               map[string]coordruntime.NodeLivenessRecord
-	pending                map[int]PendingWork
-	completed              map[int][]coordruntime.CompletedProgressRecord
-	routingSnapshot        RoutingSnapshot
-	routingSnapshotMu      sync.RWMutex
-	viewMu                 sync.RWMutex
-	lastPolicy             coordinator.ReconfigurationPolicy
-	unavailableReplicas    map[string]map[int]bool
-	lastRecoveryReports    map[string]storage.NodeRecoveryReport
-	livenessPolicy         LivenessPolicy
-	clock                  Clock
-	asyncHotPathDispatch   bool
-	activePeerRefresh      map[int]activePeerRefreshState
-	activePeerRefreshMu    sync.Mutex
-	dispatchTimeout        time.Duration
-	dispatchRetryInterval  time.Duration
-	recoveryCommandTimeout time.Duration
-	nodeClientFactory      NodeClientFactory
-	logger                 zerolog.Logger
-	metrics                *serverMetrics
-	events                 *serverEventRecorder
-	ha                     *haController
-	dispatchNotify         chan struct{}
-	closeOnce              sync.Once
-	closeCh                chan struct{}
+	rt                      *coordruntime.Runtime
+	runtimeMu               sync.RWMutex
+	nodes                   map[string]StorageNodeClient
+	nodesMu                 sync.RWMutex
+	heartbeats              map[string]storage.NodeStatus
+	liveness                map[string]coordruntime.NodeLivenessRecord
+	pending                 map[int]PendingWork
+	completed               map[int][]coordruntime.CompletedProgressRecord
+	routingSnapshot         RoutingSnapshot
+	routingSnapshotMu       sync.RWMutex
+	viewMu                  sync.RWMutex
+	lastPolicy              coordinator.ReconfigurationPolicy
+	startupMaxChangedChains int
+	startupBudgetActive     bool
+	unavailableReplicas     map[string]map[int]bool
+	lastRecoveryReports     map[string]storage.NodeRecoveryReport
+	livenessPolicy          LivenessPolicy
+	clock                   Clock
+	asyncHotPathDispatch    bool
+	activePeerRefresh       map[int]activePeerRefreshState
+	activePeerRefreshMu     sync.Mutex
+	dispatchTimeout         time.Duration
+	dispatchRetryInterval   time.Duration
+	recoveryCommandTimeout  time.Duration
+	nodeClientFactory       NodeClientFactory
+	logger                  zerolog.Logger
+	metrics                 *serverMetrics
+	events                  *serverEventRecorder
+	ha                      *haController
+	dispatchNotify          chan struct{}
+	closeOnce               sync.Once
+	closeCh                 chan struct{}
 }
 
 type activePeerRefreshState struct {
 	fallbackServingChain coordinator.Chain
+	assignmentChain      coordinator.Chain
 	useFallbackRoute     bool
+	allowWhilePending    bool
+	remainingNodeIDs     map[string]bool
 }
 
 const (
@@ -197,28 +203,30 @@ func OpenWithConfig(
 	}
 
 	server := &Server{
-		rt:                     rt,
-		nodes:                  clonedNodes,
-		heartbeats:             map[string]storage.NodeStatus{},
-		liveness:               map[string]coordruntime.NodeLivenessRecord{},
-		pending:                map[int]PendingWork{},
-		completed:              map[int][]coordruntime.CompletedProgressRecord{},
-		unavailableReplicas:    map[string]map[int]bool{},
-		lastRecoveryReports:    map[string]storage.NodeRecoveryReport{},
-		livenessPolicy:         normalizeLivenessPolicy(cfg.LivenessPolicy),
-		asyncHotPathDispatch:   cfg.AsyncHotPathDispatch,
-		activePeerRefresh:      map[int]activePeerRefreshState{},
-		lastPolicy:             cfg.ReconfigurationPolicy,
-		clock:                  cfg.Clock,
-		dispatchTimeout:        cfg.DispatchTimeout,
-		dispatchRetryInterval:  cfg.DispatchRetryInterval,
-		recoveryCommandTimeout: cfg.RecoveryCommandTimeout,
-		nodeClientFactory:      cfg.NodeClientFactory,
-		logger:                 coordLoggerFromConfig(cfg.Logger),
-		metrics:                newServerMetrics(cfg.MetricsRegistry),
-		events:                 newServerEventRecorder(),
-		dispatchNotify:         make(chan struct{}, 1),
-		closeCh:                make(chan struct{}),
+		rt:                      rt,
+		nodes:                   clonedNodes,
+		heartbeats:              map[string]storage.NodeStatus{},
+		liveness:                map[string]coordruntime.NodeLivenessRecord{},
+		pending:                 map[int]PendingWork{},
+		completed:               map[int][]coordruntime.CompletedProgressRecord{},
+		unavailableReplicas:     map[string]map[int]bool{},
+		lastRecoveryReports:     map[string]storage.NodeRecoveryReport{},
+		livenessPolicy:          normalizeLivenessPolicy(cfg.LivenessPolicy),
+		asyncHotPathDispatch:    cfg.AsyncHotPathDispatch,
+		activePeerRefresh:       map[int]activePeerRefreshState{},
+		lastPolicy:              cfg.ReconfigurationPolicy,
+		startupMaxChangedChains: cfg.StartupMaxChangedChains,
+		startupBudgetActive:     cfg.StartupMaxChangedChains > 0,
+		clock:                   cfg.Clock,
+		dispatchTimeout:         cfg.DispatchTimeout,
+		dispatchRetryInterval:   cfg.DispatchRetryInterval,
+		recoveryCommandTimeout:  cfg.RecoveryCommandTimeout,
+		nodeClientFactory:       cfg.NodeClientFactory,
+		logger:                  coordLoggerFromConfig(cfg.Logger),
+		metrics:                 newServerMetrics(cfg.MetricsRegistry),
+		events:                  newServerEventRecorder(),
+		dispatchNotify:          make(chan struct{}, 1),
+		closeCh:                 make(chan struct{}),
 	}
 	if server.clock == nil {
 		server.clock = realClock{}
@@ -422,6 +430,7 @@ func (s *Server) ReportReplicaReady(ctx context.Context, nodeID string, slot int
 	rt := s.runtimeRef()
 	duplicateCompleted := false
 	refreshState := activePeerRefreshState{}
+	enqueuePeerRefresh := false
 	updated, err := retryOnRuntimeVersionMismatch(ctx, rt, func(current coordruntime.View, attempt int) (coordruntime.State, error) {
 		slotVersion := current.SlotVersions[slot]
 		pending, ok := current.PendingBySlot[slot]
@@ -461,6 +470,8 @@ func (s *Server) ReportReplicaReady(ctx context.Context, nodeID string, slot int
 				slot,
 			)
 		}
+		currentChain := current.Cluster.Chains[slot]
+		enqueuePeerRefresh = activeReplicaCount(currentChain) > 0 || hasLeavingReplica(currentChain)
 		if fallback, ok := readyProgressFallbackServingChain(current, slot); ok {
 			refreshState = activePeerRefreshState{
 				fallbackServingChain: fallback,
@@ -493,18 +504,20 @@ func (s *Server) ReportReplicaReady(ctx context.Context, nodeID string, slot int
 		return updated, nil
 	}
 	s.syncViewsFromRuntime()
-	if s.asyncHotPathDispatch {
+	if enqueuePeerRefresh {
 		s.enqueueActivePeerRefresh(slot, refreshState)
-		s.rebuildRoutingSnapshot()
+	}
+	s.rebuildRoutingSnapshot()
+	if s.asyncHotPathDispatch {
 		s.notifyDispatchLoop()
 	} else {
-		s.enqueueActivePeerRefresh(slot, refreshState)
-		s.rebuildRoutingSnapshot()
 		if err := s.reconcileAndDispatch(ctx); err != nil {
 			return coordruntime.State{}, err
 		}
-		if err := s.dispatchQueuedActivePeerRefreshes(ctx); err != nil {
-			return coordruntime.State{}, err
+		if enqueuePeerRefresh {
+			if err := s.dispatchQueuedActivePeerRefreshes(ctx); err != nil {
+				return coordruntime.State{}, err
+			}
 		}
 	}
 	slotVersion := updated.SlotVersions[slot]
@@ -704,96 +717,115 @@ func (s *Server) EvaluateLiveness(ctx context.Context) error {
 		})
 		return err
 	}
-	if s.livenessPolicy.SuspectAfter <= 0 || s.livenessPolicy.DeadAfter <= 0 {
-		return nil
-	}
-	if s.metrics != nil {
-		s.metrics.livenessEvaluations.Inc()
-	}
-	nowUnix := s.clock.Now().UnixNano()
-
-	liveness := s.Liveness()
-	nodeIDs := make([]string, 0, len(liveness))
-	for nodeID := range liveness {
-		nodeIDs = append(nodeIDs, nodeID)
-	}
-	sort.Strings(nodeIDs)
-
-	for _, nodeID := range nodeIDs {
-		record := liveness[nodeID]
-		age := time.Duration(nowUnix - record.LastHeartbeatUnixNano)
-		target := record.State
-		switch {
-		case age >= s.livenessPolicy.DeadAfter:
-			target = coordruntime.NodeLivenessStateDead
-		case age >= s.livenessPolicy.SuspectAfter:
-			target = coordruntime.NodeLivenessStateSuspect
-		default:
-			target = coordruntime.NodeLivenessStateHealthy
+	if s.livenessPolicy.SuspectAfter > 0 && s.livenessPolicy.DeadAfter > 0 {
+		if s.metrics != nil {
+			s.metrics.livenessEvaluations.Inc()
 		}
+		nowUnix := s.clock.Now().UnixNano()
 
-		if target != record.State {
-			updated, err := s.applyLivenessTransition(ctx, nodeID, target, nowUnix, record.DeadActionFired)
-			if err != nil {
-				return err
-			}
-			record = updated
-			if target == coordruntime.NodeLivenessStateDead && s.metrics != nil {
-				s.metrics.deadDetections.Inc()
-			}
-			s.events.record(s.logger, zerolog.InfoLevel, "liveness_transition", "coordinator node liveness transitioned", nodeID, nil, nil, "", "", nil)
-			if target == coordruntime.NodeLivenessStateSuspect && flapDetectionEnabled(s.livenessPolicy) {
-				flapCount := len(record.SuspectTransitionsUnixNano)
-				s.events.record(s.logger, zerolog.WarnLevel, "flap_suspect_transition", "coordinator recorded suspect transition for flap detection", nodeID, nil, nil, "", "", nil)
-				if flapCount >= s.livenessPolicy.FlapThreshold {
-					updated, err := s.applyLivenessTransition(ctx, nodeID, coordruntime.NodeLivenessStateDead, nowUnix, record.DeadActionFired)
-					if err != nil {
-						return err
-					}
-					record = updated
-					if s.metrics != nil {
-						s.metrics.deadDetections.Inc()
-						s.metrics.flapDetections.Inc()
-					}
-					s.events.record(s.logger, zerolog.WarnLevel, "flap_eviction", "coordinator evicted flapping node", nodeID, nil, nil, "", "", nil)
-				}
-			}
+		liveness := s.Liveness()
+		nodeIDs := make([]string, 0, len(liveness))
+		for nodeID := range liveness {
+			nodeIDs = append(nodeIDs, nodeID)
 		}
+		sort.Strings(nodeIDs)
 
-		if record.State == coordruntime.NodeLivenessStateDead && !record.DeadActionFired {
-			if len(s.Pending()) > 0 {
-				continue
+		for _, nodeID := range nodeIDs {
+			record := liveness[nodeID]
+			age := time.Duration(nowUnix - record.LastHeartbeatUnixNano)
+			target := record.State
+			switch {
+			case age >= s.livenessPolicy.DeadAfter:
+				target = coordruntime.NodeLivenessStateDead
+			case age >= s.livenessPolicy.SuspectAfter:
+				target = coordruntime.NodeLivenessStateSuspect
+			default:
+				target = coordruntime.NodeLivenessStateHealthy
 			}
-			currentState := s.currentState()
-			if nodeMarkedDead(currentState.Cluster, nodeID) || !isRuntimeInitialized(currentState) {
-				updated, err := s.applyLivenessTransition(ctx, nodeID, coordruntime.NodeLivenessStateDead, nowUnix, true)
+
+			if target != record.State {
+				updated, err := s.applyLivenessTransition(ctx, nodeID, target, nowUnix, record.DeadActionFired)
 				if err != nil {
 					return err
 				}
 				record = updated
-				_ = record
-				continue
+				if target == coordruntime.NodeLivenessStateDead && s.metrics != nil {
+					s.metrics.deadDetections.Inc()
+				}
+				s.events.record(s.logger, zerolog.InfoLevel, "liveness_transition", "coordinator node liveness transitioned", nodeID, nil, nil, "", "", nil)
+				if target == coordruntime.NodeLivenessStateSuspect && flapDetectionEnabled(s.livenessPolicy) {
+					flapCount := len(record.SuspectTransitionsUnixNano)
+					s.events.record(s.logger, zerolog.WarnLevel, "flap_suspect_transition", "coordinator recorded suspect transition for flap detection", nodeID, nil, nil, "", "", nil)
+					if flapCount >= s.livenessPolicy.FlapThreshold {
+						updated, err := s.applyLivenessTransition(ctx, nodeID, coordruntime.NodeLivenessStateDead, nowUnix, record.DeadActionFired)
+						if err != nil {
+							return err
+						}
+						record = updated
+						if s.metrics != nil {
+							s.metrics.deadDetections.Inc()
+							s.metrics.flapDetections.Inc()
+						}
+						s.events.record(s.logger, zerolog.WarnLevel, "flap_eviction", "coordinator evicted flapping node", nodeID, nil, nil, "", "", nil)
+					}
+				}
 			}
 
-			currentState = s.currentState()
-			if _, err := s.MarkNodeDead(ctx, coordruntime.Command{
-				ID:              fmt.Sprintf("server-auto-dead-%s-v%d", nodeID, currentState.Version),
-				ExpectedVersion: currentState.Version,
-				Kind:            coordruntime.CommandKindReconfigure,
-				Reconfigure: &coordruntime.ReconfigureCommand{
-					Events: []coordinator.Event{{
-						Kind:   coordinator.EventKindMarkNodeDead,
-						NodeID: nodeID,
-					}},
-					Policy: s.reconfigurationPolicy(),
-				},
-			}); err != nil {
-				return fmt.Errorf("err in s.MarkNodeDead: %w", err)
+			if record.State == coordruntime.NodeLivenessStateDead && !record.DeadActionFired {
+				if len(s.Pending()) > 0 {
+					continue
+				}
+				currentState := s.currentState()
+				if nodeMarkedDead(currentState.Cluster, nodeID) || !isRuntimeInitialized(currentState) {
+					updated, err := s.applyLivenessTransition(ctx, nodeID, coordruntime.NodeLivenessStateDead, nowUnix, true)
+					if err != nil {
+						return err
+					}
+					record = updated
+					_ = record
+					continue
+				}
+
+				currentState = s.currentState()
+				if _, err := s.MarkNodeDead(ctx, coordruntime.Command{
+					ID:              fmt.Sprintf("server-auto-dead-%s-v%d", nodeID, currentState.Version),
+					ExpectedVersion: currentState.Version,
+					Kind:            coordruntime.CommandKindReconfigure,
+					Reconfigure: &coordruntime.ReconfigureCommand{
+						Events: []coordinator.Event{{
+							Kind:   coordinator.EventKindMarkNodeDead,
+							NodeID: nodeID,
+						}},
+						Policy: s.reconfigurationPolicy(),
+					},
+				}); err != nil {
+					return fmt.Errorf("err in s.MarkNodeDead: %w", err)
+				}
+				if _, err := s.applyLivenessTransition(ctx, nodeID, coordruntime.NodeLivenessStateDead, nowUnix, true); err != nil {
+					return err
+				}
+				s.observeRepair("mark_dead", "success", nodeID, nil, nil)
 			}
-			if _, err := s.applyLivenessTransition(ctx, nodeID, coordruntime.NodeLivenessStateDead, nowUnix, true); err != nil {
-				return err
+		}
+	}
+	current := s.currentStateView()
+	if clusterNeedsPeriodicAdvance(current.Cluster) &&
+		len(current.PendingBySlot) == 0 &&
+		len(current.Outbox) == 0 &&
+		len(s.snapshotActivePeerRefreshSlots()) == 0 {
+		if err := s.reconcileState(ctx); err != nil {
+			return err
+		}
+		if s.asyncHotPathDispatch {
+			s.notifyDispatchLoop()
+		} else {
+			if err := s.dispatchRuntimeOutbox(ctx); err != nil {
+				if errors.Is(err, ErrDispatchFailed) || errors.Is(err, ErrDispatchTimeout) {
+					s.logger.Warn().Err(err).Str("component", "coordserver").Msg("periodic liveness evaluation triggered repair work that will retry later")
+				} else {
+					return err
+				}
 			}
-			s.observeRepair("mark_dead", "success", nodeID, nil, nil)
 		}
 	}
 	s.refreshMetricGauges()
@@ -942,10 +974,37 @@ func (s *Server) applyMembershipMutation(
 		return coordruntime.State{}, err
 	}
 	for _, slotPlan := range plan.ChangedSlots {
+		if slotPlanHasOnlyStepKind(slotPlan, coordinator.StepKindAppendTail) {
+			refreshState := activePeerRefreshState{
+				assignmentChain:   cloneCoordinatorChain(slotPlan.After),
+				allowWhilePending: true,
+			}
+			if s.asyncHotPathDispatch {
+				s.enqueueActivePeerRefresh(slotPlan.Slot, refreshState)
+				s.rebuildRoutingSnapshot()
+				s.notifyDispatchLoop()
+			} else {
+				nextRefresh, err := s.dispatchActivePeerUpdates(ctx, slotPlan.Slot, refreshState)
+				if len(nextRefresh.remainingNodeIDs) > 0 {
+					s.enqueueActivePeerRefresh(slotPlan.Slot, nextRefresh)
+					s.rebuildRoutingSnapshot()
+				}
+				if err != nil {
+					s.observeCommandResult(string(expectedEvent), err)
+					return coordruntime.State{}, err
+				}
+			}
+			continue
+		}
 		if !s.shouldDispatchActivePeerRefresh(slotPlan.Slot) {
 			continue
 		}
-		if err := s.dispatchActivePeerUpdates(ctx, slotPlan.Slot); err != nil {
+		nextRefresh, err := s.dispatchActivePeerUpdates(ctx, slotPlan.Slot, activePeerRefreshState{})
+		if len(nextRefresh.remainingNodeIDs) > 0 {
+			s.enqueueActivePeerRefresh(slotPlan.Slot, nextRefresh)
+			s.rebuildRoutingSnapshot()
+		}
+		if err != nil {
 			s.observeCommandResult(string(expectedEvent), err)
 			return coordruntime.State{}, err
 		}
@@ -1035,7 +1094,16 @@ func (s *Server) runBackgroundDispatchOnce() {
 			err = s.dispatchRuntimeOutbox(context.Background())
 		}
 		if err != nil {
-			if !errors.Is(err, ErrDispatchFailed) && !errors.Is(err, ErrDispatchTimeout) {
+			if errors.Is(err, ErrDispatchFailed) || errors.Is(err, ErrDispatchTimeout) {
+				after := s.backgroundDispatchSignature()
+				s.logger.Warn().
+					Err(err).
+					Str("component", "coordserver").
+					Int("pending_entries", after.PendingEntries).
+					Int("outbox_entries", after.OutboxEntries).
+					Int("active_peer_refreshes", after.ActivePeerRefreshes).
+					Msg("background dispatch loop will retry after partial failure")
+			} else {
 				s.logger.Warn().Err(err).Str("component", "coordserver").Msg("non-ha dispatch loop observed error")
 			}
 			return
@@ -1106,18 +1174,51 @@ func (s *Server) dispatchRuntimeOutbox(ctx context.Context) error {
 		wg.Wait()
 	}
 
-	for index, entry := range entries {
-		if err := results[index]; err != nil {
-			return err
+	for index := range entries {
+		if results[index] == nil {
+			continue
 		}
+		firstErr := results[index]
+		successIDs := make([]string, 0, len(entries))
+		for ackIndex, ackEntry := range entries {
+			if results[ackIndex] == nil {
+				successIDs = append(successIDs, ackEntry.ID)
+			}
+		}
+		if len(successIDs) > 0 {
+			rt := s.runtimeRef()
+			if _, err := retryOnRuntimeVersionMismatch(ctx, rt, func(current coordruntime.View, attempt int) (coordruntime.State, error) {
+				return rt.AcknowledgeOutbox(ctx, coordruntime.Command{
+					ID:              fmt.Sprintf("server-ack-outbox-batch-%d-r%d-v%d", len(successIDs), attempt, current.Version),
+					ExpectedVersion: current.Version,
+					Kind:            coordruntime.CommandKindAcknowledgeOutbox,
+					AcknowledgeOutbox: &coordruntime.AcknowledgeOutboxCommand{
+						EntryIDs: successIDs,
+					},
+				})
+			}); err != nil {
+				return fmt.Errorf("err in rt.AcknowledgeOutbox: %w", err)
+			}
+			s.syncViewsFromRuntime()
+		}
+		s.rebuildRoutingSnapshot()
+		return firstErr
+	}
+	successIDs := make([]string, 0, len(entries))
+	for index, entry := range entries {
+		if results[index] == nil {
+			successIDs = append(successIDs, entry.ID)
+		}
+	}
+	if len(successIDs) > 0 {
 		rt := s.runtimeRef()
 		if _, err := retryOnRuntimeVersionMismatch(ctx, rt, func(current coordruntime.View, attempt int) (coordruntime.State, error) {
 			return rt.AcknowledgeOutbox(ctx, coordruntime.Command{
-				ID:              fmt.Sprintf("server-ack-outbox-%s-r%d-v%d", entry.ID, attempt, current.Version),
+				ID:              fmt.Sprintf("server-ack-outbox-batch-%d-r%d-v%d", len(successIDs), attempt, current.Version),
 				ExpectedVersion: current.Version,
 				Kind:            coordruntime.CommandKindAcknowledgeOutbox,
 				AcknowledgeOutbox: &coordruntime.AcknowledgeOutboxCommand{
-					EntryID: entry.ID,
+					EntryIDs: successIDs,
 				},
 			})
 		}); err != nil {
@@ -1137,8 +1238,8 @@ func outboxDispatchWorkerCount(entryCount int) int {
 	if workers < 2 {
 		workers = 2
 	}
-	if workers > 8 {
-		workers = 8
+	if workers > 32 {
+		workers = 32
 	}
 	if workers > entryCount {
 		return entryCount
@@ -1205,7 +1306,10 @@ func runtimeOutboxHasSlot(entries []coordruntime.OutboxEntry, slot int) bool {
 	return false
 }
 
-func (s *Server) shouldDispatchActivePeerRefresh(slot int) bool {
+func (s *Server) shouldDispatchActivePeerRefresh(slot int, refresh ...activePeerRefreshState) bool {
+	if len(refresh) > 0 && refresh[0].allowWhilePending {
+		return true
+	}
 	s.viewMu.RLock()
 	_, pending := s.pending[slot]
 	s.viewMu.RUnlock()
@@ -1216,6 +1320,12 @@ func (s *Server) shouldDispatchActivePeerRefresh(slot int) bool {
 }
 
 func (s *Server) enqueueActivePeerRefresh(slot int, state activePeerRefreshState) {
+	s.activePeerRefreshMu.Lock()
+	s.activePeerRefresh[slot] = cloneActivePeerRefreshState(state)
+	s.activePeerRefreshMu.Unlock()
+}
+
+func (s *Server) updateActivePeerRefresh(slot int, state activePeerRefreshState) {
 	s.activePeerRefreshMu.Lock()
 	s.activePeerRefresh[slot] = cloneActivePeerRefreshState(state)
 	s.activePeerRefreshMu.Unlock()
@@ -1259,19 +1369,29 @@ func (s *Server) dispatchQueuedActivePeerRefreshes(ctx context.Context) error {
 	}
 	results := make([]error, len(slots))
 	updated := make([]bool, len(slots))
+	nextStates := make([]activePeerRefreshState, len(slots))
 	workerCount := activePeerRefreshWorkerCount(len(slots))
 	if workerCount == 1 {
+		states := s.snapshotActivePeerRefreshStates()
 		for index, slot := range slots {
-			if !s.shouldDispatchActivePeerRefresh(slot) {
+			state, ok := states[slot]
+			if !ok {
 				continue
 			}
-			if err := s.dispatchActivePeerUpdates(ctx, slot); err != nil {
-				return err
+			if !s.shouldDispatchActivePeerRefresh(slot, state) {
+				continue
 			}
-			updated[index] = true
+			nextState, err := s.dispatchActivePeerUpdates(ctx, slot, state)
+			nextStates[index] = nextState
+			if err != nil {
+				results[index] = err
+				continue
+			}
+			updated[index] = len(nextState.remainingNodeIDs) == 0
 		}
 	} else {
 		taskCh := make(chan task)
+		states := s.snapshotActivePeerRefreshStates()
 		var wg sync.WaitGroup
 		for i := 0; i < workerCount; i++ {
 			wg.Add(1)
@@ -1282,14 +1402,20 @@ func (s *Server) dispatchQueuedActivePeerRefreshes(ctx context.Context) error {
 						results[task.index] = ctx.Err()
 						continue
 					}
-					if !s.shouldDispatchActivePeerRefresh(task.slot) {
+					state, ok := states[task.slot]
+					if !ok {
 						continue
 					}
-					if err := s.dispatchActivePeerUpdates(ctx, task.slot); err != nil {
+					if !s.shouldDispatchActivePeerRefresh(task.slot, state) {
+						continue
+					}
+					nextState, err := s.dispatchActivePeerUpdates(ctx, task.slot, state)
+					nextStates[task.index] = nextState
+					if err != nil {
 						results[task.index] = err
 						continue
 					}
-					updated[task.index] = true
+					updated[task.index] = len(nextState.remainingNodeIDs) == 0
 				}
 			}()
 		}
@@ -1300,20 +1426,27 @@ func (s *Server) dispatchQueuedActivePeerRefreshes(ctx context.Context) error {
 		wg.Wait()
 	}
 	anyUpdated := false
+	var firstErr error
 	for index, slot := range slots {
-		if err := results[index]; err != nil {
-			return err
+		if len(nextStates[index].remainingNodeIDs) > 0 {
+			s.updateActivePeerRefresh(slot, nextStates[index])
 		}
 		if !updated[index] {
+			if results[index] != nil && firstErr == nil {
+				firstErr = results[index]
+			}
 			continue
 		}
 		s.clearActivePeerRefresh(slot)
 		anyUpdated = true
+		if results[index] != nil && firstErr == nil {
+			firstErr = results[index]
+		}
 	}
 	if anyUpdated {
 		s.rebuildRoutingSnapshot()
 	}
-	return nil
+	return firstErr
 }
 
 func activePeerRefreshWorkerCount(slotCount int) int {
@@ -1324,8 +1457,8 @@ func activePeerRefreshWorkerCount(slotCount int) int {
 	if workers < 2 {
 		workers = 2
 	}
-	if workers > 16 {
-		workers = 16
+	if workers > 32 {
+		workers = 32
 	}
 	if workers > slotCount {
 		return slotCount
@@ -1414,7 +1547,7 @@ func (s *Server) dropRecoveredReplica(ctx context.Context, nodeID string, slot i
 	return nil
 }
 
-func (s *Server) dispatchActivePeerUpdates(ctx context.Context, slot int) error {
+func (s *Server) dispatchActivePeerUpdates(ctx context.Context, slot int, refresh activePeerRefreshState) (activePeerRefreshState, error) {
 	state := s.currentStateView()
 	var chain *coordinator.Chain
 	for i := range state.Cluster.Chains {
@@ -1424,32 +1557,63 @@ func (s *Server) dispatchActivePeerUpdates(ctx context.Context, slot int) error 
 			break
 		}
 	}
-	if chain == nil {
-		return nil
+	if len(refresh.assignmentChain.Replicas) > 0 && refresh.assignmentChain.Slot == slot {
+		assignment := cloneCoordinatorChain(refresh.assignmentChain)
+		chain = &assignment
 	}
+	if chain == nil {
+		return activePeerRefreshState{}, nil
+	}
+	nextRefresh := cloneActivePeerRefreshState(refresh)
+	if len(nextRefresh.remainingNodeIDs) == 0 {
+		nextRefresh.remainingNodeIDs = make(map[string]bool)
+		for _, replica := range chain.Replicas {
+			if replica.State == coordinator.ReplicaStateActive {
+				nextRefresh.remainingNodeIDs[replica.NodeID] = true
+			}
+		}
+	}
+	var firstErr error
 	for _, replica := range chain.Replicas {
 		if replica.State != coordinator.ReplicaStateActive {
 			continue
 		}
+		if len(nextRefresh.remainingNodeIDs) > 0 && !nextRefresh.remainingNodeIDs[replica.NodeID] {
+			continue
+		}
 		client, err := s.clientForNodeID(replica.NodeID)
 		if err != nil {
-			return fmt.Errorf("%w: %w", ErrDispatchFailed, err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%w: %w", ErrDispatchFailed, err)
+			}
+			continue
 		}
 		assignment, err := assignmentForNode(*chain, state.Cluster.NodesByID, replica.NodeID, state.SlotVersions[slot])
 		if err != nil {
-			return fmt.Errorf("err in assignmentForNode(update active peers): %w", err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("err in assignmentForNode(update active peers): %w", err)
+			}
+			continue
 		}
 		dispatchCtx, cancel := deriveDeadlineContext(ctx, s.dispatchTimeout)
 		err = client.UpdateChainPeers(dispatchCtx, storage.UpdateChainPeersCommand{Assignment: assignment})
 		cancel()
 		if err != nil {
-			if isContextTimeoutOrCancel(err) {
-				return fmt.Errorf("%w: err in node[%q].UpdateChainPeers: %w", ErrDispatchTimeout, replica.NodeID, err)
+			if firstErr == nil {
+				if isContextTimeoutOrCancel(err) {
+					firstErr = fmt.Errorf("%w: err in node[%q].UpdateChainPeers: %w", ErrDispatchTimeout, replica.NodeID, err)
+				} else {
+					firstErr = fmt.Errorf("%w: err in node[%q].UpdateChainPeers: %v", ErrDispatchFailed, replica.NodeID, err)
+				}
 			}
-			return fmt.Errorf("%w: err in node[%q].UpdateChainPeers: %v", ErrDispatchFailed, replica.NodeID, err)
+			continue
 		}
+		delete(nextRefresh.remainingNodeIDs, replica.NodeID)
 	}
-	return nil
+	if len(nextRefresh.remainingNodeIDs) == 0 {
+		nextRefresh.remainingNodeIDs = nil
+	}
+	return nextRefresh, firstErr
 }
 
 func assignmentForNode(
@@ -1664,6 +1828,15 @@ func cloneActivePeerRefreshState(state activePeerRefreshState) activePeerRefresh
 	cloned := state
 	if state.useFallbackRoute {
 		cloned.fallbackServingChain = cloneCoordinatorChain(state.fallbackServingChain)
+	}
+	if len(state.assignmentChain.Replicas) > 0 {
+		cloned.assignmentChain = cloneCoordinatorChain(state.assignmentChain)
+	}
+	if len(state.remainingNodeIDs) > 0 {
+		cloned.remainingNodeIDs = make(map[string]bool, len(state.remainingNodeIDs))
+		for nodeID, remaining := range state.remainingNodeIDs {
+			cloned.remainingNodeIDs[nodeID] = remaining
+		}
 	}
 	return cloned
 }
@@ -1966,6 +2139,9 @@ func (s *Server) syncViewsFromRuntime() {
 		s.completed[slot] = append([]coordruntime.CompletedProgressRecord(nil), records...)
 	}
 	s.lastPolicy = current.LastPolicy
+	if s.startupBudgetActive && clusterFullySettledForStartup(current.Cluster) {
+		s.startupBudgetActive = false
+	}
 }
 
 func (s *Server) runtimeRef() *coordruntime.Runtime {
@@ -1994,8 +2170,61 @@ func (s *Server) replaceRuntime(rt *coordruntime.Runtime) {
 
 func (s *Server) reconfigurationPolicy() coordinator.ReconfigurationPolicy {
 	s.viewMu.RLock()
-	defer s.viewMu.RUnlock()
-	return s.lastPolicy
+	policy := s.lastPolicy
+	startupMax := s.startupMaxChangedChains
+	startupActive := s.startupBudgetActive
+	s.viewMu.RUnlock()
+	if !startupActive || startupMax <= policy.MaxChangedChains {
+		return policy
+	}
+	if !clusterFullySettledForStartup(s.currentStateView().Cluster) {
+		policy.MaxChangedChains = startupMax
+		return policy
+	}
+	s.viewMu.Lock()
+	if s.startupBudgetActive {
+		s.startupBudgetActive = false
+	}
+	s.viewMu.Unlock()
+	return policy
+}
+
+func clusterFullySettledForStartup(cluster coordinator.ClusterState) bool {
+	if cluster.SlotCount == 0 || cluster.ReplicationFactor <= 0 || len(cluster.Chains) != cluster.SlotCount {
+		return false
+	}
+	for _, chain := range cluster.Chains {
+		activeCount := 0
+		if len(chain.Replicas) != cluster.ReplicationFactor {
+			return false
+		}
+		for _, replica := range chain.Replicas {
+			if replica.State != coordinator.ReplicaStateActive {
+				return false
+			}
+			activeCount++
+		}
+		if activeCount != cluster.ReplicationFactor {
+			return false
+		}
+	}
+	return true
+}
+
+func clusterNeedsPeriodicAdvance(cluster coordinator.ClusterState) bool {
+	return !clusterFullySettledForStartup(cluster)
+}
+
+func slotPlanHasOnlyStepKind(slotPlan coordinator.SlotPlan, kind coordinator.StepKind) bool {
+	if len(slotPlan.Steps) == 0 {
+		return false
+	}
+	for _, step := range slotPlan.Steps {
+		if step.Kind != kind {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) lastRecoveryReport(nodeID string) (storage.NodeRecoveryReport, bool) {
@@ -2035,6 +2264,9 @@ func validateServerConfig(cfg ServerConfig) error {
 	}
 	if cfg.ReconfigurationPolicy.MaxChangedChains < 0 {
 		return fmt.Errorf("%w: max changed chains must be >= 0", ErrInvalidServerConfig)
+	}
+	if cfg.StartupMaxChangedChains < 0 {
+		return fmt.Errorf("%w: startup max changed chains must be >= 0", ErrInvalidServerConfig)
 	}
 	if cfg.DispatchRetryInterval < 0 {
 		return fmt.Errorf("%w: dispatch retry interval must be >= 0", ErrInvalidServerConfig)

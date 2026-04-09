@@ -24,6 +24,8 @@ import (
 	"github.com/danthegoodman1/craq/transport/grpcx"
 )
 
+const benchmarkStartupChangedChainFloor = 1024
+
 type CoordinatorProcessConfig struct {
 	ManifestPath    string                            `json:"manifest_path"`
 	DataDir         string                            `json:"data_dir"`
@@ -75,6 +77,10 @@ func RunCoordinatorProcess(ctx context.Context, cfg CoordinatorProcessConfig) er
 	server, err := coordserver.OpenWithConfig(ctx, store, nil, coordserver.ServerConfig{
 		LivenessPolicy:        cfg.Liveness,
 		ReconfigurationPolicy: cfg.Reconfiguration,
+		StartupMaxChangedChains: benchmarkStartupMaxChangedChains(
+			manifest.Coordinator.SlotCount,
+			cfg.Reconfiguration.MaxChangedChains,
+		),
 		AsyncHotPathDispatch:  true,
 		NodeClientFactory:     grpcx.NewDynamicNodeClientFactory(pool),
 		DispatchRetryInterval: 200 * time.Millisecond,
@@ -362,11 +368,23 @@ func lifecycleWorkerCount(slotCount int) int {
 	if workers < 2 {
 		workers = 2
 	}
-	if workers > 4 {
-		workers = 4
+	if workers > 16 {
+		workers = 16
 	}
 	if workers > slotCount {
 		return slotCount
 	}
 	return workers
+}
+
+func benchmarkStartupMaxChangedChains(slotCount int, steadyStateBudget int) int {
+	startupBudget := steadyStateBudget
+	floor := slotCount
+	if floor > benchmarkStartupChangedChainFloor {
+		floor = benchmarkStartupChangedChainFloor
+	}
+	if floor > startupBudget {
+		startupBudget = floor
+	}
+	return startupBudget
 }

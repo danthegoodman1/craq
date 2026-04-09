@@ -173,7 +173,7 @@ func TestCoordinatorProcessConfigIncludesReconfigurationBudget(t *testing.T) {
 
 func TestDecodeRoutingProgress(t *testing.T) {
 	data := []byte(`{
-  "current": {"Version": 17},
+  "active_peer_refresh_count": 2,
   "routing_snapshot": {
     "Version": 17,
     "SlotCount": 3,
@@ -183,8 +183,25 @@ func TestDecodeRoutingProgress(t *testing.T) {
       {"Slot": 2, "Readable": false, "Writable": false}
     ]
   },
+  "liveness": {
+    "a": {"State": "healthy"},
+    "b": {"State": "suspect"},
+    "c": {"State": "dead"}
+  },
   "pending": {
     "1": {"Slot": 1, "NodeID": "c", "Kind": "ready", "SlotVersion": 3, "Epoch": 0, "CommandID": "cmd-1"}
+  },
+  "current": {
+    "Version": 17,
+    "Cluster": {
+      "ReplicationFactor": 3,
+      "Chains": [
+        {"Slot": 0, "Replicas": [{"NodeID": "a", "State": "active"}, {"NodeID": "b", "State": "active"}, {"NodeID": "c", "State": "active"}]},
+        {"Slot": 1, "Replicas": [{"NodeID": "a", "State": "active"}, {"NodeID": "b", "State": "joining"}]},
+        {"Slot": 2, "Replicas": [{"NodeID": "a", "State": "active"}]}
+      ]
+    },
+    "Outbox": [{"ID":"x"}]
   }
 }`)
 
@@ -206,6 +223,24 @@ func TestDecodeRoutingProgress(t *testing.T) {
 	}
 	if got, want := progress.pendingSlots, 1; got != want {
 		t.Fatalf("progress.pendingSlots = %d, want %d", got, want)
+	}
+	if got, want := progress.outboxEntries, 1; got != want {
+		t.Fatalf("progress.outboxEntries = %d, want %d", got, want)
+	}
+	if got, want := progress.activePeerRefreshes, 2; got != want {
+		t.Fatalf("progress.activePeerRefreshes = %d, want %d", got, want)
+	}
+	if got, want := progress.settledSlots, 1; got != want {
+		t.Fatalf("progress.settledSlots = %d, want %d", got, want)
+	}
+	if got, want := progress.healthyNodes, 1; got != want {
+		t.Fatalf("progress.healthyNodes = %d, want %d", got, want)
+	}
+	if got, want := progress.suspectNodes, 1; got != want {
+		t.Fatalf("progress.suspectNodes = %d, want %d", got, want)
+	}
+	if got, want := progress.deadNodes, 1; got != want {
+		t.Fatalf("progress.deadNodes = %d, want %d", got, want)
 	}
 }
 
@@ -229,5 +264,64 @@ func TestRoutingReadyStallTimeoutHonorsRPCDeadline(t *testing.T) {
 	}
 	if got, want := routingReadyStallTimeout(profile), 90*time.Second; got != want {
 		t.Fatalf("routingReadyStallTimeout = %s, want %s", got, want)
+	}
+}
+
+func TestBenchmarkCoordinatorLivenessPolicyUsesTolerantFlapDetection(t *testing.T) {
+	policy := benchmarkCoordinatorLivenessPolicy(ClusterProfile{
+		SuspectAfter: 3 * time.Second,
+		DeadAfter:    6 * time.Second,
+	})
+
+	if got, want := policy.SuspectAfter, 3*time.Second; got != want {
+		t.Fatalf("policy.SuspectAfter = %s, want %s", got, want)
+	}
+	if got, want := policy.DeadAfter, 6*time.Second; got != want {
+		t.Fatalf("policy.DeadAfter = %s, want %s", got, want)
+	}
+	if got, want := policy.FlapWindow, 24*time.Second; got != want {
+		t.Fatalf("policy.FlapWindow = %s, want %s", got, want)
+	}
+	if got, want := policy.FlapThreshold, 8; got != want {
+		t.Fatalf("policy.FlapThreshold = %d, want %d", got, want)
+	}
+}
+
+func TestRoutingProgressReadyRequiresSettledCluster(t *testing.T) {
+	progress := routingProgress{
+		slotCount:           1024,
+		readableSlots:       1024,
+		writableSlots:       1024,
+		settledSlots:        992,
+		pendingSlots:        0,
+		outboxEntries:       0,
+		activePeerRefreshes: 0,
+		healthyNodes:        3,
+	}
+	if routingProgressReady(progress) {
+		t.Fatal("routingProgressReady unexpectedly accepted partially settled routing")
+	}
+
+	progress.settledSlots = 1024
+	progress.pendingSlots = 12
+	if routingProgressReady(progress) {
+		t.Fatal("routingProgressReady unexpectedly accepted routing with pending work")
+	}
+
+	progress.pendingSlots = 0
+	progress.outboxEntries = 4
+	if routingProgressReady(progress) {
+		t.Fatal("routingProgressReady unexpectedly accepted routing with outbox work")
+	}
+
+	progress.outboxEntries = 0
+	progress.deadNodes = 1
+	if routingProgressReady(progress) {
+		t.Fatal("routingProgressReady unexpectedly accepted routing with dead nodes")
+	}
+
+	progress.deadNodes = 0
+	if !routingProgressReady(progress) {
+		t.Fatal("routingProgressReady rejected fully settled routing")
 	}
 }

@@ -239,6 +239,128 @@ func TestCloudShapeStartupScaleProgressAndHeartbeatStayBoundedUnderLargeOutbox(t
 	}
 }
 
+func TestStartupMaxChangedChainsExpandsInitialEmptyClusterWave(t *testing.T) {
+	ctx := context.Background()
+	h := newInMemoryHarnessWithConfig(t, []string{"a", "b", "c"}, ServerConfig{
+		ReconfigurationPolicy: coordinator.ReconfigurationPolicy{
+			MaxChangedChains: 32,
+		},
+		StartupMaxChangedChains: 64,
+	})
+	if _, err := h.server.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 64, 3)); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	for _, nodeID := range []string{"a", "b", "c"} {
+		node := uniqueNode(nodeID)
+		if _, err := h.server.RegisterNode(ctx, storage.NodeRegistration{
+			NodeID:         nodeID,
+			RPCAddress:     node.RPCAddress,
+			FailureDomains: node.FailureDomains,
+		}); err != nil {
+			t.Fatalf("RegisterNode(%q) returned error: %v", nodeID, err)
+		}
+		if err := h.server.ReportNodeHeartbeat(ctx, storage.NodeStatus{NodeID: nodeID}); err != nil {
+			t.Fatalf("ReportNodeHeartbeat(%q) returned error: %v", nodeID, err)
+		}
+	}
+	if got, want := len(h.server.Pending()), 64; got != want {
+		t.Fatalf("len(Pending()) = %d, want %d", got, want)
+	}
+}
+
+func TestStartupMaxChangedChainsDisablesAfterSettledBootstrap(t *testing.T) {
+	ctx := context.Background()
+	h := newInMemoryHarnessWithConfig(t, []string{"a", "b", "c"}, ServerConfig{
+		ReconfigurationPolicy: coordinator.ReconfigurationPolicy{
+			MaxChangedChains: 32,
+		},
+		StartupMaxChangedChains: 64,
+	})
+	cmd := bootstrapCommand("bootstrap-1", 0, 8, 3, "a", "b", "c")
+	cmd.Bootstrap.Policy = coordinator.ReconfigurationPolicy{MaxChangedChains: 32}
+	if _, err := h.server.Bootstrap(ctx, cmd); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	h.seedBootstrap(t, 8, 3, []string{"a", "b", "c"})
+	if got, want := h.server.reconfigurationPolicy().MaxChangedChains, 32; got != want {
+		t.Fatalf("reconfigurationPolicy().MaxChangedChains = %d, want %d", got, want)
+	}
+}
+
+func TestCloudShapeSecondWaveDispatchDrains(t *testing.T) {
+	if os.Getenv("CRAQ_RUN_BENCHMARK_SOAK_LOCAL") == "" {
+		t.Skip("set CRAQ_RUN_BENCHMARK_SOAK_LOCAL=1 to run the cloud-shape dispatch drain test")
+	}
+
+	ctx := context.Background()
+	h := newInMemoryHarnessWithConfig(t, []string{"a", "b", "c"}, ServerConfig{
+		AsyncHotPathDispatch:  true,
+		DispatchRetryInterval: time.Hour,
+		ReconfigurationPolicy: coordinator.ReconfigurationPolicy{
+			MaxChangedChains: 32,
+		},
+		StartupMaxChangedChains: 1024,
+	})
+	for _, adapter := range h.adapters {
+		adapter.BindServer(h.server)
+	}
+
+	if _, err := h.server.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 1024, 3)); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	for _, nodeID := range []string{"a", "b", "c"} {
+		node := uniqueNode(nodeID)
+		if _, err := h.server.RegisterNode(ctx, storage.NodeRegistration{
+			NodeID:         nodeID,
+			RPCAddress:     node.RPCAddress,
+			FailureDomains: node.FailureDomains,
+		}); err != nil {
+			t.Fatalf("RegisterNode(%q) returned error: %v", nodeID, err)
+		}
+		if err := h.server.ReportNodeHeartbeat(ctx, storage.NodeStatus{NodeID: nodeID}); err != nil {
+			t.Fatalf("ReportNodeHeartbeat(%q) returned error: %v", nodeID, err)
+		}
+	}
+
+	waitForCondition(t, 30*time.Second, func() bool {
+		h.server.runBackgroundDispatchOnce()
+		return len(h.server.Pending()) == 1024
+	}, "first-wave pending work to be scheduled")
+
+	firstWavePending := h.server.Pending()
+	for slot, pending := range firstWavePending {
+		if err := h.adapters[pending.NodeID].ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: slot}); err != nil {
+			t.Fatalf("ActivateReplica(node=%q, slot=%d) returned error: %v", pending.NodeID, slot, err)
+		}
+	}
+
+	waitForCondition(t, 30*time.Second, func() bool {
+		current := h.server.Current()
+		return len(current.PendingBySlot) == 0 && len(current.Outbox) == 0
+	}, "first-wave work to drain")
+
+	if err := h.server.reconcileState(ctx); err != nil {
+		t.Fatalf("reconcileState returned error: %v", err)
+	}
+	current := h.server.Current()
+	if got, want := len(current.PendingBySlot), 1024; got != want {
+		t.Fatalf("len(current.PendingBySlot) after second-wave reconcile = %d, want %d", got, want)
+	}
+	if got, want := len(current.Outbox), 1024; got != want {
+		t.Fatalf("len(current.Outbox) after second-wave reconcile = %d, want %d", got, want)
+	}
+
+	dispatchCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	if err := h.server.dispatchRuntimeOutbox(dispatchCtx); err != nil {
+		t.Fatalf("dispatchRuntimeOutbox returned error: %v", err)
+	}
+	current = h.server.Current()
+	if got := len(current.Outbox); got != 0 {
+		t.Fatalf("len(current.Outbox) after second-wave dispatch = %d, want 0", got)
+	}
+}
+
 func TestAsyncStartupLeavesFirstWaveAndMakesForwardProgress(t *testing.T) {
 	ctx := context.Background()
 	h := newInMemoryHarnessWithConfig(t, []string{"a", "b", "c"}, ServerConfig{
@@ -564,17 +686,18 @@ func TestBeginDrainUpdatePeersTimeoutDoesNotFabricateCoordinatorAdvancement(t *t
 		"d": newBlockingNodeClient("d"),
 	}
 	nodes["a"].blockUpdatePeers = true
-	server := mustBootstrappedBlockingServer(t, ctx, nodes, ServerConfig{DispatchTimeout: time.Nanosecond}, 1, 3, "a", "b", "c", "d")
+	server := mustBootstrappedBlockingServer(t, ctx, nodes, ServerConfig{
+		AsyncHotPathDispatch:  true,
+		DispatchTimeout:       time.Nanosecond,
+		DispatchRetryInterval: time.Hour,
+	}, 1, 3, "a", "b", "c", "d")
 
 	_, err := server.BeginDrainNode(ctx, reconfigureCommand("drain-b", 1, coordinator.Event{
 		Kind:   coordinator.EventKindBeginDrainNode,
 		NodeID: "b",
 	}, coordinator.ReconfigurationPolicy{}))
-	if err == nil {
-		t.Fatal("BeginDrainNode unexpectedly succeeded")
-	}
-	if !errors.Is(err, ErrDispatchTimeout) {
-		t.Fatalf("error = %v, want dispatch timeout", err)
+	if err != nil {
+		t.Fatalf("BeginDrainNode returned error: %v", err)
 	}
 	if got, want := server.Pending()[0], (PendingWork{
 		Slot:        0,
@@ -687,6 +810,7 @@ func TestLivenessTriggeredDeadRepairRespectsDispatchTimeout(t *testing.T) {
 func TestAddNodeDispatchTimeoutThenRetryCompletesRepairAndRestoresDataPlane(t *testing.T) {
 	ctx := context.Background()
 	h := newInMemoryHarnessWithConfig(t, []string{"a", "b", "c", "d"}, ServerConfig{
+		AsyncHotPathDispatch:  true,
 		DispatchTimeout:       time.Nanosecond,
 		DispatchRetryInterval: time.Hour,
 	})
@@ -726,6 +850,7 @@ func TestAddNodeDispatchTimeoutThenRetryCompletesRepairAndRestoresDataPlane(t *t
 	if err := h.adapters["d"].Node().ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: slot}); err != nil {
 		t.Fatalf("ActivateReplica(d) returned error: %v", err)
 	}
+	h.server.runBackgroundDispatchOnce()
 	leavingNodeID := replicaNodeWithState(h.server.Current().Cluster.Chains[slot], coordinator.ReplicaStateLeaving)
 	if leavingNodeID == "" {
 		t.Fatal("failed to find leaving node after retry activation")
@@ -733,6 +858,7 @@ func TestAddNodeDispatchTimeoutThenRetryCompletesRepairAndRestoresDataPlane(t *t
 	if err := h.adapters[leavingNodeID].Node().RemoveReplica(ctx, storage.RemoveReplicaCommand{Slot: slot}); err != nil {
 		t.Fatalf("RemoveReplica(%q) returned error: %v", leavingNodeID, err)
 	}
+	h.server.runBackgroundDispatchOnce()
 
 	assertActiveReplicaSet(t, h.server.Current().Cluster.Chains[slot], "a", "b", "d")
 	if runtimeOutboxHasSlot(h.server.Current().Outbox, slot) {
@@ -744,6 +870,7 @@ func TestAddNodeDispatchTimeoutThenRetryCompletesRepairAndRestoresDataPlane(t *t
 func TestAddNodePartialOutboxSuccessThenRetryDoesNotRedispatchCompletedPeerUpdates(t *testing.T) {
 	ctx := context.Background()
 	h := newInMemoryHarnessWithConfig(t, []string{"a", "b", "c", "d"}, ServerConfig{
+		AsyncHotPathDispatch:  true,
 		DispatchTimeout:       time.Nanosecond,
 		DispatchRetryInterval: time.Hour,
 	})
@@ -760,71 +887,122 @@ func TestAddNodePartialOutboxSuccessThenRetryDoesNotRedispatchCompletedPeerUpdat
 		t.Fatalf("PlanReconfiguration preview returned error: %v", err)
 	}
 	slot := preview.ChangedSlots[0].Slot
-	updateNodes := activeAfterNodeIDs(activeServingChain(preview.ChangedSlots[0].After), map[string]bool{"d": true})
-	if len(updateNodes) < 2 {
-		t.Fatalf("update node count = %d, want at least 2 for partial-success replay", len(updateNodes))
-	}
-
 	addTailWrapper := newFaultInjectingNodeClient(h.adapters["d"])
 	h.server.nodes["d"] = addTailWrapper
-	updateWrappers := make(map[string]*faultInjectingNodeClient, len(updateNodes))
-	for _, nodeID := range updateNodes {
-		wrapper := newFaultInjectingNodeClient(h.adapters[nodeID])
-		updateWrappers[nodeID] = wrapper
+	updateWrappers := map[string]*faultInjectingNodeClient{
+		"a": newFaultInjectingNodeClient(h.adapters["a"]),
+		"b": newFaultInjectingNodeClient(h.adapters["b"]),
+		"c": newFaultInjectingNodeClient(h.adapters["c"]),
+	}
+	for nodeID, wrapper := range updateWrappers {
 		h.server.nodes[nodeID] = wrapper
 	}
-	updateWrappers[updateNodes[len(updateNodes)-1]].updatePeersTimeouts = 1
 
 	_, err = h.server.AddNode(ctx, reconfigureCommand("add-d", 1, coordinator.Event{
 		Kind: coordinator.EventKindAddNode,
 		Node: uniqueNode("d"),
 	}, coordinator.ReconfigurationPolicy{MaxChangedChains: 1}))
-	if err == nil {
-		t.Fatal("AddNode unexpectedly succeeded")
-	}
-	if !errors.Is(err, ErrDispatchTimeout) {
-		t.Fatalf("error = %v, want dispatch timeout", err)
+	if err != nil {
+		t.Fatalf("AddNode returned error: %v", err)
 	}
 	if got, want := addTailWrapper.addTailCallCount(), 1; got != want {
 		t.Fatalf("add-tail calls after partial success = %d, want %d", got, want)
 	}
-	for _, nodeID := range updateNodes[:len(updateNodes)-1] {
-		if got, want := updateWrappers[nodeID].updatePeersCallCount(), 1; got != want {
-			t.Fatalf("update-peers calls for %q after partial success = %d, want %d", nodeID, got, want)
+	predictedCluster := h.server.Current().Cluster
+	predictedCluster.Chains = append([]coordinator.Chain(nil), predictedCluster.Chains...)
+	predictedChain := cloneCoordinatorChain(predictedCluster.Chains[slot])
+	for i := range predictedChain.Replicas {
+		if predictedChain.Replicas[i].NodeID == "d" {
+			predictedChain.Replicas[i].State = coordinator.ReplicaStateActive
 		}
 	}
-	if got, want := updateWrappers[updateNodes[len(updateNodes)-1]].updatePeersCallCount(), 1; got != want {
-		t.Fatalf("update-peers calls for timed-out node after partial success = %d, want %d", got, want)
+	predictedCluster.Chains[slot] = predictedChain
+	readyPlan, err := coordinator.PlanReconfiguration(predictedCluster, nil, coordinator.ReconfigurationPolicy{MaxChangedChains: 1})
+	if err != nil {
+		t.Fatalf("PlanReconfiguration after ready returned error: %v", err)
+	}
+	updateNodes := activeAfterNodeIDs(activeServingChain(readyPlan.ChangedSlots[0].After), map[string]bool{})
+	if len(updateNodes) < 2 {
+		t.Fatalf("update node count after ready preview = %d, want at least 2 for partial-success replay", len(updateNodes))
+	}
+	preReadyNodes := activeAfterNodeIDs(activeServingChain(h.server.Current().Cluster.Chains[slot]), map[string]bool{})
+	waitDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(waitDeadline) {
+		ready := true
+		for _, nodeID := range preReadyNodes {
+			if nodeID == "d" {
+				continue
+			}
+			if updateWrappers[nodeID].updatePeersCallCount() == 0 {
+				ready = false
+				break
+			}
+		}
+		if ready {
+			break
+		}
+		time.Sleep(time.Millisecond)
 	}
 	if got, want := h.server.Pending()[slot].Kind, pendingKindReady; got != want {
 		t.Fatalf("pending kind after partial success = %q, want %q", got, want)
 	}
-
-	if err := h.server.dispatchRuntimeOutbox(ctx); err != nil {
-		t.Fatalf("dispatchRuntimeOutbox returned error: %v", err)
-	}
-	if got, want := addTailWrapper.addTailCallCount(), 1; got != want {
-		t.Fatalf("add-tail calls after retry = %d, want no redispatch", got)
-	}
-	for _, nodeID := range updateNodes[:len(updateNodes)-1] {
-		if got, want := updateWrappers[nodeID].updatePeersCallCount(), 1; got != want {
-			t.Fatalf("update-peers calls for %q after retry = %d, want no duplicate", nodeID, got)
-		}
-	}
-	if got, want := updateWrappers[updateNodes[len(updateNodes)-1]].updatePeersCallCount(), 2; got != want {
-		t.Fatalf("update-peers calls for retried node after retry = %d, want %d", got, want)
+	retryNodeID := updateNodes[len(updateNodes)-1]
+	switch retryNodeID {
+	case "d":
+		addTailWrapper.updatePeersTimeouts = 1
+	default:
+		updateWrappers[retryNodeID].updatePeersTimeouts = 1
 	}
 
 	if err := h.adapters["d"].Node().ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: slot}); err != nil {
 		t.Fatalf("ActivateReplica(d) returned error: %v", err)
 	}
-	leavingNodeID := replicaNodeWithState(h.server.Current().Cluster.Chains[slot], coordinator.ReplicaStateLeaving)
+	peerUpdateCalls := func(nodeID string) int {
+		if nodeID == "d" {
+			return addTailWrapper.updatePeersCallCount()
+		}
+		return updateWrappers[nodeID].updatePeersCallCount()
+	}
+	baselineCalls := make(map[string]int, len(updateNodes))
+	for _, nodeID := range updateNodes {
+		baselineCalls[nodeID] = peerUpdateCalls(nodeID)
+	}
+	waitForCondition(t, 2*time.Second, func() bool {
+		chain := h.server.Current().Cluster.Chains[slot]
+		if replicaNodeWithState(chain, coordinator.ReplicaStateLeaving) == "" {
+			return false
+		}
+		for _, nodeID := range updateNodes {
+			if peerUpdateCalls(nodeID) < baselineCalls[nodeID]+1 {
+				return false
+			}
+		}
+		return true
+	}, "ready progress plus first peer refresh wave")
+	h.server.runBackgroundDispatchOnce()
+	h.server.runBackgroundDispatchOnce()
+	chain := h.server.Current().Cluster.Chains[slot]
+	leavingNodeID := replicaNodeWithState(chain, coordinator.ReplicaStateLeaving)
 	if leavingNodeID == "" {
 		t.Fatal("failed to find leaving node after partial-success retry activation")
+	}
+	activeAfterReady := activeAfterNodeIDs(activeServingChain(chain), map[string]bool{})
+	if !reflect.DeepEqual(activeAfterReady, updateNodes) {
+		t.Fatalf("active nodes after ready = %v, want preview update nodes %v", activeAfterReady, updateNodes)
+	}
+	for _, nodeID := range updateNodes[:len(updateNodes)-1] {
+		if got, want := peerUpdateCalls(nodeID), baselineCalls[nodeID]+1; got != want {
+			t.Fatalf("update-peers calls for %q after settled retry = %d, want %d", nodeID, got, want)
+		}
+	}
+	retryCalls := peerUpdateCalls(retryNodeID)
+	if got, want := retryCalls, baselineCalls[retryNodeID]+2; got != want {
+		t.Fatalf("update-peers calls for retry target after settled retry = %d, want %d", got, want)
 	}
 	if err := h.adapters[leavingNodeID].Node().RemoveReplica(ctx, storage.RemoveReplicaCommand{Slot: slot}); err != nil {
 		t.Fatalf("RemoveReplica(%q) returned error: %v", leavingNodeID, err)
 	}
+	h.server.runBackgroundDispatchOnce()
 	assertSlotRoundTrip(t, ctx, h.server, h.adapters, slot, "partial-add-tail", "v-partial-1")
 }
 

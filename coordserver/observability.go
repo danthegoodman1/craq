@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/danthegoodman1/craq/coordinator"
 	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
 	"github.com/danthegoodman1/craq/gologger"
 	"github.com/danthegoodman1/craq/ops"
@@ -18,6 +19,7 @@ type AdminState struct {
 	Current             coordruntime.State                         `json:"current"`
 	RoutingSnapshot     RoutingSnapshot                            `json:"routing_snapshot"`
 	Pending             map[int]PendingWork                        `json:"pending"`
+	ActivePeerRefreshes int                                        `json:"active_peer_refresh_count"`
 	Heartbeats          map[string]storage.NodeStatus              `json:"heartbeats"`
 	Liveness            map[string]coordruntime.NodeLivenessRecord `json:"liveness"`
 	UnavailableReplicas map[string][]int                           `json:"unavailable_replicas"`
@@ -26,8 +28,14 @@ type AdminState struct {
 }
 
 type RoutingStatus struct {
-	RoutingSnapshot RoutingSnapshot `json:"routing_snapshot"`
-	PendingCount    int             `json:"pending_count"`
+	RoutingSnapshot        RoutingSnapshot `json:"routing_snapshot"`
+	PendingCount           int             `json:"pending_count"`
+	OutboxCount            int             `json:"outbox_count"`
+	ActivePeerRefreshCount int             `json:"active_peer_refresh_count"`
+	SettledSlotCount       int             `json:"settled_slot_count"`
+	HealthyNodeCount       int             `json:"healthy_node_count"`
+	SuspectNodeCount       int             `json:"suspect_node_count"`
+	DeadNodeCount          int             `json:"dead_node_count"`
 }
 
 type serverEventRecorder struct {
@@ -228,6 +236,7 @@ func (s *Server) AdminState(ctx context.Context) AdminState {
 		Current:             s.Current(),
 		RoutingSnapshot:     snapshot,
 		Pending:             s.Pending(),
+		ActivePeerRefreshes: len(s.snapshotActivePeerRefreshSlots()),
 		Heartbeats:          s.Heartbeats(),
 		Liveness:            s.Liveness(),
 		UnavailableReplicas: s.UnavailableReplicas(),
@@ -239,12 +248,43 @@ func (s *Server) AdminState(ctx context.Context) AdminState {
 func (s *Server) RoutingStatus(ctx context.Context) RoutingStatus {
 	s.refreshMetricGauges()
 	snapshot, _ := s.RoutingSnapshot(ctx)
+	current := s.currentStateView()
 	s.viewMu.RLock()
 	pendingCount := len(s.pending)
+	liveness := mergeLivenessRecords(nil, s.liveness)
 	s.viewMu.RUnlock()
+	activePeerRefreshCount := len(s.snapshotActivePeerRefreshSlots())
+	settledSlotCount := 0
+	for _, chain := range current.Cluster.Chains {
+		if chainHasReplicaState(chain, coordinator.ReplicaStateJoining) || chainHasReplicaState(chain, coordinator.ReplicaStateLeaving) {
+			continue
+		}
+		if activeReplicaCount(chain) == current.Cluster.ReplicationFactor {
+			settledSlotCount++
+		}
+	}
+	healthyNodeCount := 0
+	suspectNodeCount := 0
+	deadNodeCount := 0
+	for _, record := range liveness {
+		switch record.State {
+		case coordruntime.NodeLivenessStateHealthy:
+			healthyNodeCount++
+		case coordruntime.NodeLivenessStateSuspect:
+			suspectNodeCount++
+		case coordruntime.NodeLivenessStateDead:
+			deadNodeCount++
+		}
+	}
 	return RoutingStatus{
-		RoutingSnapshot: snapshot,
-		PendingCount:    pendingCount,
+		RoutingSnapshot:        snapshot,
+		PendingCount:           pendingCount,
+		OutboxCount:            len(current.Outbox),
+		ActivePeerRefreshCount: activePeerRefreshCount,
+		SettledSlotCount:       settledSlotCount,
+		HealthyNodeCount:       healthyNodeCount,
+		SuspectNodeCount:       suspectNodeCount,
+		DeadNodeCount:          deadNodeCount,
 	}
 }
 

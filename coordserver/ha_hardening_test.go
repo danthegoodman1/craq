@@ -390,20 +390,16 @@ func TestHAFailoverAfterPartialAddTailOutboxSuccessRetriesRemainingPeerUpdatesOn
 		t.Fatalf("PlanReconfiguration preview returned error: %v", err)
 	}
 	slot := preview.ChangedSlots[0].Slot
-	updateNodes := activeAfterNodeIDs(activeServingChain(preview.ChangedSlots[0].After), map[string]bool{"d": true})
-	if len(updateNodes) < 2 {
-		t.Fatalf("update node count = %d, want at least 2 for HA partial-success replay", len(updateNodes))
-	}
 
 	addTailWrapper := newFaultInjectingNodeClient(h.adapters["d"])
 	h.leader.nodes["d"] = addTailWrapper
-	updateWrappers := make(map[string]*faultInjectingNodeClient, len(updateNodes))
-	for _, nodeID := range updateNodes {
-		wrapper := newFaultInjectingNodeClient(h.adapters[nodeID])
-		updateWrappers[nodeID] = wrapper
+	updateWrappers := map[string]*faultInjectingNodeClient{
+		"a": newFaultInjectingNodeClient(h.adapters["a"]),
+		"b": newFaultInjectingNodeClient(h.adapters["b"]),
+	}
+	for nodeID, wrapper := range updateWrappers {
 		h.leader.nodes[nodeID] = wrapper
 	}
-	updateWrappers[updateNodes[len(updateNodes)-1]].updatePeersTimeouts = 1
 
 	if _, err = h.leader.AddNode(ctx, reconfigureCommand("add-d", 1, uniqueAddNodeEvent("d"), noBudgetPolicy())); err != nil {
 		t.Fatalf("AddNode returned error: %v", err)
@@ -424,6 +420,51 @@ func TestHAFailoverAfterPartialAddTailOutboxSuccessRetriesRemainingPeerUpdatesOn
 	if got, want := addTailWrapper.addTailCallCount(), 1; got != want {
 		t.Fatalf("add-tail calls after manual dispatch = %d, want %d", got, want)
 	}
+	snapshot, err = h.store.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("LoadSnapshot after add tail returned error: %v", err)
+	}
+	for _, entry := range append([]OutboxEntry(nil), snapshot.Outbox...) {
+		if entry.Kind != OutboxCommandUpdateChainPeers || entry.Slot != slot {
+			continue
+		}
+		if err := h.leader.dispatchOutboxEntry(ctx, entry); err != nil {
+			t.Fatalf("dispatchOutboxEntry(pre-ready update peers %q) returned error: %v", entry.NodeID, err)
+		}
+		snapshot, err = h.store.LoadSnapshot(ctx)
+		if err != nil {
+			t.Fatalf("LoadSnapshot after pre-ready update peers %q returned error: %v", entry.NodeID, err)
+		}
+		snapshot.Outbox = removeOutboxEntry(snapshot.Outbox, entry.ID)
+		if err := h.leader.saveHASnapshot(ctx, snapshot.SnapshotVersion, snapshot); err != nil {
+			t.Fatalf("saveHASnapshot(after pre-ready update peers %q) returned error: %v", entry.NodeID, err)
+		}
+	}
+	baselineCalls := map[string]int{
+		"a": updateWrappers["a"].updatePeersCallCount(),
+		"b": updateWrappers["b"].updatePeersCallCount(),
+		"d": addTailWrapper.updatePeersCallCount(),
+	}
+
+	if err := h.adapters["d"].Node().ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: slot}); err != nil {
+		t.Fatalf("ActivateReplica(d) returned error: %v", err)
+	}
+	chain := h.leader.Current().Cluster.Chains[slot]
+	leavingNodeID := replicaNodeWithState(chain, coordinator.ReplicaStateLeaving)
+	if leavingNodeID == "" {
+		t.Fatal("failed to find leaving node after ready progress")
+	}
+	updateNodes := activeAfterNodeIDs(activeServingChain(chain), map[string]bool{leavingNodeID: true})
+	if len(updateNodes) < 2 {
+		t.Fatalf("update node count after ready = %d, want at least 2 for HA partial-success replay", len(updateNodes))
+	}
+	retriedNodeID := updateNodes[len(updateNodes)-1]
+	switch retriedNodeID {
+	case "d":
+		addTailWrapper.updatePeersTimeouts = 1
+	default:
+		updateWrappers[retriedNodeID].updatePeersTimeouts = 1
+	}
 
 	for _, nodeID := range updateNodes[:len(updateNodes)-1] {
 		entry := h.mustFindOutbox(t, OutboxCommandUpdateChainPeers, nodeID, slot)
@@ -438,12 +479,18 @@ func TestHAFailoverAfterPartialAddTailOutboxSuccessRetriesRemainingPeerUpdatesOn
 		if err := h.leader.saveHASnapshot(ctx, snapshot.SnapshotVersion, snapshot); err != nil {
 			t.Fatalf("saveHASnapshot(after update peers %q) returned error: %v", nodeID, err)
 		}
-		if got, want := updateWrappers[nodeID].updatePeersCallCount(), 1; got != want {
+		var got int
+		if nodeID == "d" {
+			got = addTailWrapper.updatePeersCallCount()
+		} else {
+			got = updateWrappers[nodeID].updatePeersCallCount()
+		}
+		want := baselineCalls[nodeID] + 1
+		if got != want {
 			t.Fatalf("update-peers calls for %q after manual dispatch = %d, want %d", nodeID, got, want)
 		}
 	}
 
-	retriedNodeID := updateNodes[len(updateNodes)-1]
 	entry := h.mustFindOutbox(t, OutboxCommandUpdateChainPeers, retriedNodeID, slot)
 	if err := h.leader.dispatchOutboxEntry(ctx, entry); err == nil {
 		t.Fatal("dispatchOutboxEntry(update peers retry target) unexpectedly succeeded")
@@ -452,7 +499,6 @@ func TestHAFailoverAfterPartialAddTailOutboxSuccessRetriesRemainingPeerUpdatesOn
 	}
 
 	h.clock.Advance(3 * time.Second)
-	h.mustStepStandby(t)
 	h.mustBind(t, h.standby)
 	h.standby.nodes["d"] = addTailWrapper
 	for nodeID, wrapper := range updateWrappers {
@@ -466,9 +512,25 @@ func TestHAFailoverAfterPartialAddTailOutboxSuccessRetriesRemainingPeerUpdatesOn
 		t.Fatalf("add-tail calls after failover = %d, want no redispatch", got)
 	}
 	for _, nodeID := range updateNodes[:len(updateNodes)-1] {
-		if got, want := updateWrappers[nodeID].updatePeersCallCount(), 1; got != want {
+		var got int
+		if nodeID == "d" {
+			got = addTailWrapper.updatePeersCallCount()
+		} else {
+			got = updateWrappers[nodeID].updatePeersCallCount()
+		}
+		want := baselineCalls[nodeID] + 1
+		if got != want {
 			t.Fatalf("update-peers calls for %q after failover = %d, want %d", nodeID, got, want)
 		}
+	}
+	var retriedCalls int
+	if retriedNodeID == "d" {
+		retriedCalls = addTailWrapper.updatePeersCallCount()
+	} else {
+		retriedCalls = updateWrappers[retriedNodeID].updatePeersCallCount()
+	}
+	if got, want := retriedCalls, baselineCalls[retriedNodeID]+2; got != want {
+		t.Fatalf("retry-target update-peers calls after failover = %d, want %d", got, want)
 	}
 	snapshot, err = h.store.LoadSnapshot(ctx)
 	if err != nil {
@@ -479,12 +541,8 @@ func TestHAFailoverAfterPartialAddTailOutboxSuccessRetriesRemainingPeerUpdatesOn
 			t.Fatalf("retry-target update-peers entry still present after failover dispatch: %#v", entry)
 		}
 	}
-
-	if err := h.adapters["d"].Node().ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: slot}); err != nil {
-		t.Fatalf("ActivateReplica(d) returned error: %v", err)
-	}
 	h.mustStepStandby(t)
-	leavingNodeID := replicaNodeWithState(h.standby.Current().Cluster.Chains[slot], coordinator.ReplicaStateLeaving)
+	leavingNodeID = replicaNodeWithState(h.standby.Current().Cluster.Chains[slot], coordinator.ReplicaStateLeaving)
 	if leavingNodeID == "" {
 		t.Fatal("failed to find leaving node after HA partial-success replay")
 	}

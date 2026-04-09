@@ -234,6 +234,18 @@ func TestLocalRuntimeAndLoadGen(t *testing.T) {
 	}
 }
 
+func TestBenchmarkStartupMaxChangedChainsUsesStartupFloor(t *testing.T) {
+	if got, want := benchmarkStartupMaxChangedChains(1024, 32), 1024; got != want {
+		t.Fatalf("benchmarkStartupMaxChangedChains(1024, 32) = %d, want %d", got, want)
+	}
+	if got, want := benchmarkStartupMaxChangedChains(64, 32), 64; got != want {
+		t.Fatalf("benchmarkStartupMaxChangedChains(64, 32) = %d, want %d", got, want)
+	}
+	if got, want := benchmarkStartupMaxChangedChains(1024, 512), 1024; got != want {
+		t.Fatalf("benchmarkStartupMaxChangedChains(1024, 512) = %d, want %d", got, want)
+	}
+}
+
 func TestAdvanceReplicaLifecycleActivatesAndRemovesCurrentSlots(t *testing.T) {
 	ctx := context.Background()
 	transport := storage.NewInMemoryReplicationTransport()
@@ -693,14 +705,32 @@ func TestRuntimeProcessesBecomeWritableWithBudgetedBenchmarkStartup(t *testing.T
 	}
 
 	var runErr error
-	snapshot, err := waitForWritableRouting(ctx, admin)
+	progressLogPath := filepath.Join(tempDir, "routing-progress.jsonl")
+	snapshotReadyAt, progress, err := waitForLocalRoutingReady(ctx, Profile{
+		Cluster: ClusterProfile{
+			SlotCount:          slotCount,
+			ReplicationFactor:  3,
+			Reconfiguration:    ReconfigProfile{MaxChangedChains: maxChangedChains},
+			HeartbeatInterval:  heartbeatInterval,
+			LivenessInterval:   tickInterval,
+			ActivationInterval: activationInterval,
+			RPCDeadline:        rpcDeadline,
+		},
+	}, manifest.Coordinator.AdminAddress, nil, progressLogPath)
 	if err != nil {
-		runErr = fmt.Errorf("waitForWritableRouting returned error: %w", err)
+		runErr = fmt.Errorf("waitForLocalRoutingReady returned error: %w", err)
 	} else {
-		for _, route := range snapshot.Slots {
-			if !route.Readable || !route.Writable {
-				runErr = fmt.Errorf("route %#v is not fully readable+writable", route)
-				break
+		_ = snapshotReadyAt
+		_ = progress
+		snapshot, snapshotErr := admin.RoutingSnapshot(ctx)
+		if snapshotErr != nil {
+			runErr = fmt.Errorf("admin.RoutingSnapshot returned error: %w", snapshotErr)
+		} else {
+			for _, route := range snapshot.Slots {
+				if !route.Readable || !route.Writable {
+					runErr = fmt.Errorf("route %#v is not fully readable+writable", route)
+					break
+				}
 			}
 		}
 	}

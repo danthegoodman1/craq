@@ -182,7 +182,8 @@ type LivenessCommand struct {
 }
 
 type AcknowledgeOutboxCommand struct {
-	EntryID string
+	EntryID  string
+	EntryIDs []string
 }
 
 type LogRecord struct {
@@ -426,7 +427,7 @@ func (r *Runtime) AcknowledgeOutbox(ctx context.Context, cmd Command) (State, er
 	if duplicate != nil {
 		return r.snapshotForApplied(*duplicate), nil
 	}
-	if cmd.AcknowledgeOutbox != nil && !outboxEntryExists(r.state.Outbox, cmd.AcknowledgeOutbox.EntryID) {
+	if cmd.AcknowledgeOutbox != nil && !outboxEntriesExist(r.state.Outbox, outboxAckEntryIDs(*cmd.AcknowledgeOutbox)) {
 		return cloneState(r.state), nil
 	}
 	_, _, duplicate, err = r.executeAcknowledgeOutbox(cmd)
@@ -570,7 +571,7 @@ func (r *Runtime) executeCommand(cmd Command) (coordinator.ClusterState, *coordi
 		if !isInitialized(r.state) {
 			return coordinator.ClusterState{}, nil, nil, ErrNotInitialized
 		}
-		if !outboxEntryExists(r.state.Outbox, cmd.AcknowledgeOutbox.EntryID) {
+		if !outboxEntriesExist(r.state.Outbox, outboxAckEntryIDs(*cmd.AcknowledgeOutbox)) {
 			return cloneClusterState(r.state.Cluster), nil, nil, nil
 		}
 		return cloneClusterState(r.state.Cluster), nil, nil, nil
@@ -650,8 +651,8 @@ func validateCommandPayload(cmd Command) error {
 		if cmd.AcknowledgeOutbox == nil || cmd.Bootstrap != nil || cmd.Reconfigure != nil || cmd.Progress != nil || cmd.Heartbeat != nil || cmd.Liveness != nil {
 			return fmt.Errorf("%w: acknowledge outbox command must set only outbox payload", ErrInvalidCommand)
 		}
-		if cmd.AcknowledgeOutbox.EntryID == "" {
-			return fmt.Errorf("%w: outbox entry id must not be empty", ErrInvalidCommand)
+		if len(outboxAckEntryIDs(*cmd.AcknowledgeOutbox)) == 0 {
+			return fmt.Errorf("%w: outbox entry ids must not be empty", ErrInvalidCommand)
 		}
 	default:
 		return fmt.Errorf("%w: unsupported command kind %q", ErrInvalidCommand, cmd.Kind)
@@ -973,7 +974,10 @@ func cloneCommand(cmd Command) Command {
 		}
 	}
 	if cmd.AcknowledgeOutbox != nil {
-		cloned.AcknowledgeOutbox = &AcknowledgeOutboxCommand{EntryID: cmd.AcknowledgeOutbox.EntryID}
+		cloned.AcknowledgeOutbox = &AcknowledgeOutboxCommand{
+			EntryID:  cmd.AcknowledgeOutbox.EntryID,
+			EntryIDs: append([]string(nil), cmd.AcknowledgeOutbox.EntryIDs...),
+		}
 	}
 	return cloned
 }
@@ -1210,9 +1214,13 @@ func nextOutbox(
 		if cmd.AcknowledgeOutbox == nil {
 			return cloneOutbox(current)
 		}
+		acked := make(map[string]struct{}, len(outboxAckEntryIDs(*cmd.AcknowledgeOutbox)))
+		for _, entryID := range outboxAckEntryIDs(*cmd.AcknowledgeOutbox) {
+			acked[entryID] = struct{}{}
+		}
 		next := make([]OutboxEntry, 0, len(current))
 		for _, entry := range current {
-			if entry.ID != cmd.AcknowledgeOutbox.EntryID {
+			if _, ok := acked[entry.ID]; !ok {
 				next = append(next, entry)
 			}
 		}
@@ -1272,22 +1280,6 @@ func outboxFromPlan(
 					Assignment: assignment,
 				})
 			}
-			skipped := map[string]bool{addedNodeID: true}
-			servingChain := activeServingChain(slotPlan.After)
-			for _, nodeID := range activeAfterNodeIDs(servingChain, skipped) {
-				assignment, err := assignmentForNode(servingChain, cluster.NodesByID, nodeID, slotVersions[slotPlan.Slot])
-				if err != nil {
-					continue
-				}
-				outbox = append(outbox, OutboxEntry{
-					ID:         outboxEntryID(version, slotPlan.Slot, nodeID, OutboxCommandKindUpdateChainPeers),
-					Slot:       slotPlan.Slot,
-					NodeID:     nodeID,
-					Kind:       OutboxCommandKindUpdateChainPeers,
-					CommandID:  outboxCommandID(version, slotPlan.Slot, nodeID, "update"),
-					Assignment: assignment,
-				})
-			}
 		case len(stepKinds) == 1 && stepKinds[0] == coordinator.StepKindMarkLeaving:
 			leavingNodeID := firstStepNodeID(slotPlan.Steps, coordinator.StepKindMarkLeaving)
 			if leavingNodeID == "" {
@@ -1328,6 +1320,25 @@ func outboxEntryExists(current []OutboxEntry, entryID string) bool {
 		}
 	}
 	return false
+}
+
+func outboxEntriesExist(current []OutboxEntry, entryIDs []string) bool {
+	for _, entryID := range entryIDs {
+		if outboxEntryExists(current, entryID) {
+			return true
+		}
+	}
+	return false
+}
+
+func outboxAckEntryIDs(cmd AcknowledgeOutboxCommand) []string {
+	if len(cmd.EntryIDs) > 0 {
+		return append([]string(nil), cmd.EntryIDs...)
+	}
+	if cmd.EntryID == "" {
+		return nil
+	}
+	return []string{cmd.EntryID}
 }
 
 func cloneNodeStatus(status storage.NodeStatus) storage.NodeStatus {

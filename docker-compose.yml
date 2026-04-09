@@ -1,0 +1,11 @@
+services:
+  opencode:
+    build: .
+    ports:
+      - "4096:4096"
+    volumes:
+      - .:/workspace
+      - root-home:/root
+
+volumes:
+  root-home:

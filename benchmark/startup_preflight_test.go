@@ -179,6 +179,9 @@ func TestRuntimeAllNodesAppearInWritableRouting(t *testing.T) {
 
 	verifyCtx, cancel := context.WithTimeout(h.ctx, cfg.TestTimeout)
 	defer cancel()
+	if _, _, err := waitForLocalRoutingReady(verifyCtx, h.profile, h.manifest.Coordinator.AdminAddress, nil, h.progressLogPath); err != nil {
+		t.Fatalf("waitForLocalRoutingReady returned error: %v", err)
+	}
 	if _, err := waitForWritableRoutingIncluding(verifyCtx, h.admin, "a", "b", "c"); err != nil {
 		t.Fatalf("waitForWritableRoutingIncluding returned error: %v", err)
 	}
@@ -643,15 +646,51 @@ func assertRoutingProgressHealthy(records []routingProgressRecord, slotCount int
 		if maxReadable >= max(1, slotCount/4) && record.ReadableSlots < maxReadable/2 {
 			return fmt.Errorf("readable routing collapsed from %d to %d", maxReadable, record.ReadableSlots)
 		}
-		if firstReadable != -1 && record.WritableSlots < slotCount {
+		if firstReadable != -1 && !routingProgressReady(routingProgress{
+			slotCount:           record.SlotCount,
+			readableSlots:       record.ReadableSlots,
+			writableSlots:       record.WritableSlots,
+			settledSlots:        record.SettledSlots,
+			pendingSlots:        record.PendingSlots,
+			outboxEntries:       record.OutboxEntries,
+			activePeerRefreshes: record.ActivePeerRefreshes,
+			healthyNodes:        record.HealthyNodes,
+			suspectNodes:        record.SuspectNodes,
+			deadNodes:           record.DeadNodes,
+		}) {
 			if gap := record.Time.Sub(lastImprovementAt); gap > stallBudget {
-				return fmt.Errorf("routing progress stalled for %s before full writability", gap)
+				return fmt.Errorf("routing progress stalled for %s before settled routing", gap)
 			}
 		}
 	}
 	last := records[len(records)-1]
-	if last.WritableSlots != slotCount || last.ReadableSlots != slotCount {
-		return fmt.Errorf("final routing progress = writable=%d/%d readable=%d/%d", last.WritableSlots, slotCount, last.ReadableSlots, slotCount)
+	if !routingProgressReady(routingProgress{
+		slotCount:           last.SlotCount,
+		readableSlots:       last.ReadableSlots,
+		writableSlots:       last.WritableSlots,
+		settledSlots:        last.SettledSlots,
+		pendingSlots:        last.PendingSlots,
+		outboxEntries:       last.OutboxEntries,
+		activePeerRefreshes: last.ActivePeerRefreshes,
+		healthyNodes:        last.HealthyNodes,
+		suspectNodes:        last.SuspectNodes,
+		deadNodes:           last.DeadNodes,
+	}) {
+		return fmt.Errorf(
+			"final routing progress not settled: writable=%d/%d readable=%d/%d settled=%d/%d pending=%d outbox=%d refresh=%d health=%d suspect=%d dead=%d",
+			last.WritableSlots,
+			slotCount,
+			last.ReadableSlots,
+			slotCount,
+			last.SettledSlots,
+			slotCount,
+			last.PendingSlots,
+			last.OutboxEntries,
+			last.ActivePeerRefreshes,
+			last.HealthyNodes,
+			last.SuspectNodes,
+			last.DeadNodes,
+		)
 	}
 	return nil
 }

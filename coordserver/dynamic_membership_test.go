@@ -37,9 +37,16 @@ func TestDynamicNodeRegistrationAndReadyGatingBuildsCluster(t *testing.T) {
 		t.Fatalf("ready node set = %#v, want a/b/c ready", server.Current().Cluster.ReadyNodeIDs)
 	}
 
-	for _, nodeID := range []string{"a", "b", "c"} {
-		if err := h.adapters[nodeID].Node().ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: 0}); err != nil {
-			t.Fatalf("ActivateReplica(%q) returned error: %v", nodeID, err)
+	for expectedActives := 1; expectedActives <= 3; expectedActives++ {
+		pending, ok := server.Pending()[0]
+		if !ok {
+			t.Fatalf("pending slot 0 missing before activation %d", expectedActives)
+		}
+		if err := h.adapters[pending.NodeID].Node().ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: 0}); err != nil {
+			t.Fatalf("ActivateReplica(%q) returned error: %v", pending.NodeID, err)
+		}
+		if got := len(activeServingChain(server.Current().Cluster.Chains[0]).Replicas); got != expectedActives {
+			t.Fatalf("active replica count after activation %d = %d, want %d", expectedActives, got, expectedActives)
 		}
 	}
 	if got, want := replicaNodeStates(server.Current().Cluster.Chains[0]), []string{"a:active", "b:active", "c:active"}; !reflect.DeepEqual(got, want) {

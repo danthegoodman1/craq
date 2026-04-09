@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/danthegoodman1/craq/coordinator"
+	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
 	"github.com/danthegoodman1/craq/coordserver"
 )
 
@@ -422,10 +423,7 @@ func installRemoteConfigs(ctx context.Context, state RunState, manifestPath stri
 	coordCfg := CoordinatorProcessConfig{
 		ManifestPath: "/etc/craq-bench/manifest.json",
 		DataDir:      "/var/lib/craq-bench/coordinator",
-		Liveness: coordserver.LivenessPolicy{
-			SuspectAfter: state.Profile.Cluster.SuspectAfter,
-			DeadAfter:    state.Profile.Cluster.DeadAfter,
-		},
+		Liveness:     benchmarkCoordinatorLivenessPolicy(state.Profile.Cluster),
 		Reconfiguration: coordinator.ReconfigurationPolicy{
 			MaxChangedChains: state.Profile.Cluster.Reconfiguration.MaxChangedChains,
 		},
@@ -593,7 +591,7 @@ func startServices(ctx context.Context, state RunState) error {
 }
 
 func waitForRoutingReady(ctx context.Context, state RunState) error {
-	logProgress("waiting for coordinator routing state to become writable")
+	logProgress("waiting for coordinator routing state to become fully settled")
 	clientSSH := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP, DisableJump: true}
 	routingCommand := "curl -fsS http://" + state.TerraformOutputs.PrivateIPs["coordinator"] + ":7401/admin/v1/routing"
 	stateCommand := "curl -fsS http://" + state.TerraformOutputs.PrivateIPs["coordinator"] + ":7401/admin/v1/state"
@@ -611,31 +609,17 @@ func waitForRoutingReady(ctx context.Context, state RunState) error {
 		if err == nil {
 			progress, progressErr := decodeRoutingProgress(data)
 			if progressErr == nil {
-				if progress.slotCount > 0 && progress.writableSlots == progress.slotCount {
-					logProgress("coordinator routing state is writable")
+				if routingProgressReady(progress) {
+					logProgress("coordinator routing state is fully settled")
 					return nil
 				}
 				if routingProgressChanged(lastProgress, progress) {
 					stallDeadline = time.Now().Add(stallTimeout)
-					logProgress(
-						"routing progress: writable=%d/%d readable=%d pending=%d version=%d",
-						progress.writableSlots,
-						progress.slotCount,
-						progress.readableSlots,
-						progress.pendingSlots,
-						progress.version,
-					)
+					logProgress("routing progress: %s", routingProgressSummary(progress))
 					lastLogged = time.Now()
 					lastProgress = progress
 				} else if lastLogged.IsZero() || time.Since(lastLogged) >= 15*time.Second {
-					logProgress(
-						"still waiting for writable routing: writable=%d/%d readable=%d pending=%d version=%d",
-						progress.writableSlots,
-						progress.slotCount,
-						progress.readableSlots,
-						progress.pendingSlots,
-						progress.version,
-					)
+					logProgress("still waiting for settled routing: %s", routingProgressSummary(progress))
 					lastLogged = time.Now()
 				}
 			}
@@ -662,31 +646,31 @@ func waitForRoutingReady(ctx context.Context, state RunState) error {
 	}
 	progressSummary := ""
 	if lastProgress.slotCount > 0 {
-		progressSummary = fmt.Sprintf(
-			"last routing progress: writable=%d/%d readable=%d pending=%d version=%d; ",
-			lastProgress.writableSlots,
-			lastProgress.slotCount,
-			lastProgress.readableSlots,
-			lastProgress.pendingSlots,
-			lastProgress.version,
-		)
+		progressSummary = fmt.Sprintf("last routing progress: %s; ", routingProgressSummary(lastProgress))
 	}
 	switch {
 	case diag != "":
-		return fmt.Errorf("timed out waiting for writable routing state after %s; %slast coordinator state: %s", overallTimeout, progressSummary, diag)
+		return fmt.Errorf("timed out waiting for settled routing state after %s; %slast coordinator state: %s", overallTimeout, progressSummary, diag)
 	case lastErr != nil:
-		return fmt.Errorf("timed out waiting for writable routing state after %s; %slast poll error: %w", overallTimeout, progressSummary, lastErr)
+		return fmt.Errorf("timed out waiting for settled routing state after %s; %slast poll error: %w", overallTimeout, progressSummary, lastErr)
 	default:
-		return fmt.Errorf("timed out waiting for writable routing state after %s; %s", overallTimeout, progressSummary)
+		return fmt.Errorf("timed out waiting for settled routing state after %s; %s", overallTimeout, progressSummary)
 	}
 }
 
 type routingProgress struct {
-	version       uint64
-	slotCount     int
-	writableSlots int
-	readableSlots int
-	pendingSlots  int
+	version             uint64
+	slotCount           int
+	writableSlots       int
+	readableSlots       int
+	pendingSlots        int
+	outboxEntries       int
+	activePeerRefreshes int
+	settledSlots        int
+	healthyNodes        int
+	suspectNodes        int
+	deadNodes           int
+	replicationFactor   int
 }
 
 func decodeRoutingProgress(data []byte) (routingProgress, error) {
@@ -700,9 +684,12 @@ func decodeRoutingProgress(data []byte) (routingProgress, error) {
 			return routingProgress{}, err
 		}
 		progress := routingProgress{
-			version:      state.Current.Version,
-			slotCount:    state.RoutingSnapshot.SlotCount,
-			pendingSlots: len(state.Pending),
+			version:             state.Current.Version,
+			slotCount:           state.RoutingSnapshot.SlotCount,
+			pendingSlots:        len(state.Pending),
+			outboxEntries:       len(state.Current.Outbox),
+			activePeerRefreshes: state.ActivePeerRefreshes,
+			replicationFactor:   state.Current.Cluster.ReplicationFactor,
 		}
 		for _, route := range state.RoutingSnapshot.Slots {
 			if route.Readable {
@@ -712,6 +699,21 @@ func decodeRoutingProgress(data []byte) (routingProgress, error) {
 				progress.writableSlots++
 			}
 		}
+		for _, chain := range state.Current.Cluster.Chains {
+			if chainSettled(chain, state.Current.Cluster.ReplicationFactor) {
+				progress.settledSlots++
+			}
+		}
+		for _, record := range state.Liveness {
+			switch record.State {
+			case coordruntime.NodeLivenessStateHealthy:
+				progress.healthyNodes++
+			case coordruntime.NodeLivenessStateSuspect:
+				progress.suspectNodes++
+			case coordruntime.NodeLivenessStateDead:
+				progress.deadNodes++
+			}
+		}
 		return progress, nil
 	}
 	var status coordserver.RoutingStatus
@@ -719,9 +721,15 @@ func decodeRoutingProgress(data []byte) (routingProgress, error) {
 		return routingProgress{}, err
 	}
 	progress := routingProgress{
-		version:      status.RoutingSnapshot.Version,
-		slotCount:    status.RoutingSnapshot.SlotCount,
-		pendingSlots: status.PendingCount,
+		version:             status.RoutingSnapshot.Version,
+		slotCount:           status.RoutingSnapshot.SlotCount,
+		pendingSlots:        status.PendingCount,
+		outboxEntries:       status.OutboxCount,
+		activePeerRefreshes: status.ActivePeerRefreshCount,
+		settledSlots:        status.SettledSlotCount,
+		healthyNodes:        status.HealthyNodeCount,
+		suspectNodes:        status.SuspectNodeCount,
+		deadNodes:           status.DeadNodeCount,
 	}
 	for _, route := range status.RoutingSnapshot.Slots {
 		if route.Readable {
@@ -739,7 +747,60 @@ func routingProgressChanged(prev routingProgress, next routingProgress) bool {
 		prev.slotCount != next.slotCount ||
 		prev.writableSlots != next.writableSlots ||
 		prev.readableSlots != next.readableSlots ||
-		prev.pendingSlots != next.pendingSlots
+		prev.pendingSlots != next.pendingSlots ||
+		prev.outboxEntries != next.outboxEntries ||
+		prev.activePeerRefreshes != next.activePeerRefreshes ||
+		prev.settledSlots != next.settledSlots ||
+		prev.healthyNodes != next.healthyNodes ||
+		prev.suspectNodes != next.suspectNodes ||
+		prev.deadNodes != next.deadNodes
+}
+
+func routingProgressReady(progress routingProgress) bool {
+	if progress.slotCount <= 0 {
+		return false
+	}
+	if progress.readableSlots != progress.slotCount || progress.writableSlots != progress.slotCount {
+		return false
+	}
+	if progress.settledSlots != progress.slotCount {
+		return false
+	}
+	if progress.pendingSlots != 0 || progress.outboxEntries != 0 || progress.activePeerRefreshes != 0 {
+		return false
+	}
+	return progress.suspectNodes == 0 && progress.deadNodes == 0
+}
+
+func routingProgressSummary(progress routingProgress) string {
+	return fmt.Sprintf(
+		"writable=%d/%d readable=%d settled=%d pending=%d outbox=%d refresh=%d health=%d suspect=%d dead=%d version=%d",
+		progress.writableSlots,
+		progress.slotCount,
+		progress.readableSlots,
+		progress.settledSlots,
+		progress.pendingSlots,
+		progress.outboxEntries,
+		progress.activePeerRefreshes,
+		progress.healthyNodes,
+		progress.suspectNodes,
+		progress.deadNodes,
+		progress.version,
+	)
+}
+
+func chainSettled(chain coordinator.Chain, replicationFactor int) bool {
+	if replicationFactor <= 0 {
+		return false
+	}
+	active := 0
+	for _, replica := range chain.Replicas {
+		if replica.State != coordinator.ReplicaStateActive {
+			return false
+		}
+		active++
+	}
+	return active == replicationFactor
 }
 
 func routingReadyOverallTimeout(profile Profile) time.Duration {

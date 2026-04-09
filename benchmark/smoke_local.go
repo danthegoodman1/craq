@@ -66,11 +66,17 @@ type localDaemonHandle struct {
 }
 
 type LocalSmokeProgress struct {
-	Version       uint64 `json:"version"`
-	SlotCount     int    `json:"slot_count"`
-	WritableSlots int    `json:"writable_slots"`
-	ReadableSlots int    `json:"readable_slots"`
-	PendingSlots  int    `json:"pending_slots"`
+	Version             uint64 `json:"version"`
+	SlotCount           int    `json:"slot_count"`
+	WritableSlots       int    `json:"writable_slots"`
+	ReadableSlots       int    `json:"readable_slots"`
+	SettledSlots        int    `json:"settled_slots"`
+	PendingSlots        int    `json:"pending_slots"`
+	OutboxEntries       int    `json:"outbox_entries"`
+	ActivePeerRefreshes int    `json:"active_peer_refreshes"`
+	HealthyNodes        int    `json:"healthy_nodes"`
+	SuspectNodes        int    `json:"suspect_nodes"`
+	DeadNodes           int    `json:"dead_nodes"`
 }
 
 type localSmokeLauncher interface {
@@ -198,12 +204,7 @@ func runLocalSmoke(ctx context.Context, runDir string, state RunState, manifest 
 	coordCfg := CoordinatorProcessConfig{
 		ManifestPath: state.ManifestPath,
 		DataDir:      filepath.Join(runDir, "local", "coordinator"),
-		Liveness: coordserver.LivenessPolicy{
-			SuspectAfter:  state.Profile.Cluster.SuspectAfter,
-			DeadAfter:     state.Profile.Cluster.DeadAfter,
-			FlapWindow:    maxDuration(state.Profile.Cluster.DeadAfter*4, 10*time.Second),
-			FlapThreshold: 8,
-		},
+		Liveness:     benchmarkCoordinatorLivenessPolicy(state.Profile.Cluster),
 		Reconfiguration: coordinator.ReconfigurationPolicy{
 			MaxChangedChains: state.Profile.Cluster.Reconfiguration.MaxChangedChains,
 		},
@@ -479,7 +480,7 @@ func waitForLocalRoutingReady(
 	handles []*localDaemonHandle,
 	progressLogPath string,
 ) (time.Time, routingProgress, error) {
-	logProgress("waiting for local coordinator routing state to become writable")
+	logProgress("waiting for local coordinator routing state to become fully settled")
 	if err := os.MkdirAll(filepath.Dir(progressLogPath), 0o755); err != nil {
 		return time.Time{}, routingProgress{}, err
 	}
@@ -514,31 +515,17 @@ func waitForLocalRoutingReady(
 				if encoded, marshalErr := json.Marshal(record); marshalErr == nil {
 					_, _ = file.Write(append(encoded, '\n'))
 				}
-				if progress.slotCount > 0 && progress.writableSlots == progress.slotCount {
-					logProgress("local coordinator routing state is writable")
+				if routingProgressReady(progress) {
+					logProgress("local coordinator routing state is fully settled")
 					return time.Now().UTC(), progress, nil
 				}
 				if routingProgressChanged(lastProgress, progress) {
 					stallDeadline = time.Now().Add(stallTimeout)
-					logProgress(
-						"routing progress: writable=%d/%d readable=%d pending=%d version=%d",
-						progress.writableSlots,
-						progress.slotCount,
-						progress.readableSlots,
-						progress.pendingSlots,
-						progress.version,
-					)
+					logProgress("routing progress: %s", routingProgressSummary(progress))
 					lastLogged = time.Now()
 					lastProgress = progress
 				} else if lastLogged.IsZero() || time.Since(lastLogged) >= 15*time.Second {
-					logProgress(
-						"still waiting for writable routing: writable=%d/%d readable=%d pending=%d version=%d",
-						progress.writableSlots,
-						progress.slotCount,
-						progress.readableSlots,
-						progress.pendingSlots,
-						progress.version,
-					)
+					logProgress("still waiting for settled routing: %s", routingProgressSummary(progress))
 					lastLogged = time.Now()
 				}
 			}
@@ -568,22 +555,15 @@ func waitForLocalRoutingReady(
 	}
 	progressSummary := ""
 	if lastProgress.slotCount > 0 {
-		progressSummary = fmt.Sprintf(
-			"last routing progress: writable=%d/%d readable=%d pending=%d version=%d; ",
-			lastProgress.writableSlots,
-			lastProgress.slotCount,
-			lastProgress.readableSlots,
-			lastProgress.pendingSlots,
-			lastProgress.version,
-		)
+		progressSummary = fmt.Sprintf("last routing progress: %s; ", routingProgressSummary(lastProgress))
 	}
 	switch {
 	case diag != "":
-		return time.Time{}, lastProgress, fmt.Errorf("timed out waiting for writable routing state after %s; %slast coordinator state: %s", overallTimeout, progressSummary, diag)
+		return time.Time{}, lastProgress, fmt.Errorf("timed out waiting for settled routing state after %s; %slast coordinator state: %s", overallTimeout, progressSummary, diag)
 	case lastErr != nil:
-		return time.Time{}, lastProgress, fmt.Errorf("timed out waiting for writable routing state after %s; %slast poll error: %w", overallTimeout, progressSummary, lastErr)
+		return time.Time{}, lastProgress, fmt.Errorf("timed out waiting for settled routing state after %s; %slast poll error: %w", overallTimeout, progressSummary, lastErr)
 	default:
-		return time.Time{}, lastProgress, fmt.Errorf("timed out waiting for writable routing state after %s; %s", overallTimeout, progressSummary)
+		return time.Time{}, lastProgress, fmt.Errorf("timed out waiting for settled routing state after %s; %s", overallTimeout, progressSummary)
 	}
 }
 
@@ -665,7 +645,7 @@ func summarizeCoordinatorAdminState(data []byte) string {
 	}
 
 	return fmt.Sprintf(
-		"version=%d ready=%v health=%v liveness=%v pending=%d pendingByNode=%v pendingByKind=%v firstPendingSlots=%v outbox=%d outboxByNode=%v outboxByKind=%v chains(one=%d two=%d three=%d) activeByNode=%v joiningByNode=%v recent=%v",
+		"version=%d ready=%v health=%v liveness=%v pending=%d pendingByNode=%v pendingByKind=%v firstPendingSlots=%v outbox=%d activePeerRefreshes=%d outboxByNode=%v outboxByKind=%v chains(one=%d two=%d three=%d) activeByNode=%v joiningByNode=%v recent=%v",
 		state.Current.Version,
 		readyNodes,
 		state.Current.Cluster.NodeHealthByID,
@@ -675,6 +655,7 @@ func summarizeCoordinatorAdminState(data []byte) string {
 		pendingByKind,
 		pendingSlots,
 		len(state.Current.Outbox),
+		state.ActivePeerRefreshes,
 		outboxByNode,
 		outboxByKind,
 		oneActive,
@@ -927,19 +908,18 @@ func waitForWritableRoutingIncludingNodes(
 	}
 }
 
-func maxDuration(a time.Duration, b time.Duration) time.Duration {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 func localSmokeProgress(progress routingProgress) LocalSmokeProgress {
 	return LocalSmokeProgress{
-		Version:       progress.version,
-		SlotCount:     progress.slotCount,
-		WritableSlots: progress.writableSlots,
-		ReadableSlots: progress.readableSlots,
-		PendingSlots:  progress.pendingSlots,
+		Version:             progress.version,
+		SlotCount:           progress.slotCount,
+		WritableSlots:       progress.writableSlots,
+		ReadableSlots:       progress.readableSlots,
+		SettledSlots:        progress.settledSlots,
+		PendingSlots:        progress.pendingSlots,
+		OutboxEntries:       progress.outboxEntries,
+		ActivePeerRefreshes: progress.activePeerRefreshes,
+		HealthyNodes:        progress.healthyNodes,
+		SuspectNodes:        progress.suspectNodes,
+		DeadNodes:           progress.deadNodes,
 	}
 }
