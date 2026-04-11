@@ -183,10 +183,9 @@ func RunStorageProcess(ctx context.Context, cfg StorageProcessConfig) error {
 	node, err := storage.OpenNode(
 		ctx,
 		storage.Config{
-			NodeID:                    nodeCfg.ID,
-			RPCAddress:                nodeCfg.RPCAddress,
-			FailureDomains:            nodeCfg.FailureDomains,
-			AutoActivateEmptyReplicas: true,
+			NodeID:         nodeCfg.ID,
+			RPCAddress:     nodeCfg.RPCAddress,
+			FailureDomains: nodeCfg.FailureDomains,
 		},
 		store.Backend(),
 		store.LocalStateStore(),
@@ -363,14 +362,14 @@ func lifecycleWorkerCount(slotCount int) int {
 	if slotCount <= 1 {
 		return slotCount
 	}
-	// Cap at 4 to limit concurrent progress reports to the coordinator,
-	// preventing runtime lock contention that starves the dispatch loop.
+	// Cap at 16 so startup can activate replicas in parallel without
+	// overwhelming the coordinator on smaller local runs.
 	workers := runtime.GOMAXPROCS(0)
 	if workers < 2 {
 		workers = 2
 	}
-	if workers > 4 {
-		workers = 4
+	if workers > 16 {
+		workers = 16
 	}
 	if workers > slotCount {
 		return slotCount
