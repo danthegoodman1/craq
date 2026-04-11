@@ -400,7 +400,7 @@ func TestNonHACrashAfterReadyProgressBeforeMarkLeavingResumesRepairAndRestoresDa
 	if leavingNodeID == "" {
 		t.Fatal("failed to determine active tail before ready progress")
 	}
-	delete(server.nodes, leavingNodeID)
+	server.deleteNodeClient(leavingNodeID)
 
 	if err := h.adapters["d"].DeliverNextProgress(ctx); err == nil {
 		t.Fatal("DeliverNextProgress unexpectedly succeeded without leaving-node client")
@@ -491,7 +491,7 @@ func TestNonHACrashAfterAddTailAckBeforeReadyProgressDoesNotRedispatchAndRestore
 	}
 	h.seedBootstrap(t, server, 8, 3, []string{"a", "b", "c"})
 	wrapper := newFaultInjectingNodeClient(h.adapters["d"])
-	server.nodes["d"] = wrapper
+	server.setNodeClient("d", wrapper)
 
 	if _, err := server.AddNode(ctx, reconfigureCommand("add-d", 1, coordinator.Event{
 		Kind: coordinator.EventKindAddNode,
@@ -508,7 +508,7 @@ func TestNonHACrashAfterAddTailAckBeforeReadyProgressDoesNotRedispatchAndRestore
 
 	reopenedStore, reopened := h.openServer(t, "a", "b", "c", "d")
 	defer h.closeServer(t, reopened, reopenedStore)
-	reopened.nodes["d"] = wrapper
+	reopened.setNodeClient("d", wrapper)
 	if err := h.adapters["d"].Node().ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: slot}); err != nil {
 		t.Fatalf("ActivateReplica(d) returned error: %v", err)
 	}
@@ -548,7 +548,7 @@ func TestNonHACrashAfterMarkLeavingAckBeforeRemovedProgressDoesNotRedispatchAndR
 		t.Fatal("failed to find leaving node before mark-leaving ack crash")
 	}
 	wrapper := newFaultInjectingNodeClient(h.adapters[leavingNodeID])
-	server.nodes[leavingNodeID] = wrapper
+	server.setNodeClient(leavingNodeID, wrapper)
 	if err := h.adapters["d"].Node().ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: slot}); err != nil {
 		t.Fatalf("ActivateReplica(d) returned error: %v", err)
 	}
@@ -560,7 +560,7 @@ func TestNonHACrashAfterMarkLeavingAckBeforeRemovedProgressDoesNotRedispatchAndR
 
 	reopenedStore, reopened := h.openServer(t, "a", "b", "c", "d")
 	defer h.closeServer(t, reopened, reopenedStore)
-	reopened.nodes[leavingNodeID] = wrapper
+	reopened.setNodeClient(leavingNodeID, wrapper)
 	if got, want := wrapper.markLeavingCallCount(), 1; got != want {
 		t.Fatalf("mark-leaving calls after reopen = %d, want no redispatch yet", got)
 	}

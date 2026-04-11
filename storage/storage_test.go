@@ -190,6 +190,35 @@ func TestAutoActivateEmptyReplicaDoesNotDuplicateReadyProgressUnderConcurrentAct
 	}
 }
 
+func TestAutoActivateEmptyReplicaDetachedFromShortDispatchDeadline(t *testing.T) {
+	transport := NewInMemoryReplicationTransport()
+	backend := NewInMemoryBackend()
+	coord := &slowReadyCoordinatorClient{
+		inner:      NewInMemoryCoordinatorClient(),
+		readyDelay: 20 * time.Millisecond,
+	}
+	node := mustNewNode(t, context.Background(), Config{
+		NodeID:                    "node-a",
+		AutoActivateEmptyReplicas: true,
+	}, backend, coord, transport)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	if err := node.AddReplicaAsTail(ctx, AddReplicaAsTailCommand{
+		Assignment: ReplicaAssignment{
+			Slot:         1,
+			ChainVersion: 1,
+			Role:         ReplicaRoleSingle,
+		},
+	}); err != nil {
+		t.Fatalf("AddReplicaAsTail returned error: %v", err)
+	}
+
+	if got, want := node.State().Replicas[1].State, ReplicaStateActive; got != want {
+		t.Fatalf("replica state = %q, want %q", got, want)
+	}
+}
+
 func TestNodeAddReplicaAsTailFailsCleanlyWhenSourceUnavailable(t *testing.T) {
 	ctx := context.Background()
 	transport := NewInMemoryReplicationTransport()
@@ -770,6 +799,11 @@ type countingCoordinatorClient struct {
 	readyCalls    int
 }
 
+type slowReadyCoordinatorClient struct {
+	inner      *InMemoryCoordinatorClient
+	readyDelay time.Duration
+}
+
 func (c *countingCoordinatorClient) RegisterNode(ctx context.Context, reg NodeRegistration) error {
 	c.mu.Lock()
 	c.registerCalls++
@@ -793,6 +827,33 @@ func (c *countingCoordinatorClient) ReportNodeRecovered(ctx context.Context, rep
 }
 
 func (c *countingCoordinatorClient) ReportNodeHeartbeat(ctx context.Context, status NodeStatus) error {
+	return c.inner.ReportNodeHeartbeat(ctx, status)
+}
+
+func (c *slowReadyCoordinatorClient) RegisterNode(ctx context.Context, reg NodeRegistration) error {
+	return c.inner.RegisterNode(ctx, reg)
+}
+
+func (c *slowReadyCoordinatorClient) ReportReplicaReady(ctx context.Context, slot int, epoch uint64) error {
+	timer := time.NewTimer(c.readyDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+	}
+	return c.inner.ReportReplicaReady(ctx, slot, epoch)
+}
+
+func (c *slowReadyCoordinatorClient) ReportReplicaRemoved(ctx context.Context, slot int, epoch uint64) error {
+	return c.inner.ReportReplicaRemoved(ctx, slot, epoch)
+}
+
+func (c *slowReadyCoordinatorClient) ReportNodeRecovered(ctx context.Context, report NodeRecoveryReport) error {
+	return c.inner.ReportNodeRecovered(ctx, report)
+}
+
+func (c *slowReadyCoordinatorClient) ReportNodeHeartbeat(ctx context.Context, status NodeStatus) error {
 	return c.inner.ReportNodeHeartbeat(ctx, status)
 }
 

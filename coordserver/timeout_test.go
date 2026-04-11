@@ -60,7 +60,7 @@ func TestReportNodeHeartbeatDoesNotInlineDispatchLargeOutbox(t *testing.T) {
 
 	timeoutWrapper := newFaultInjectingNodeClient(h.adapters["d"])
 	timeoutWrapper.addTailTimeouts = 1
-	h.server.nodes["d"] = timeoutWrapper
+	h.server.setNodeClient("d", timeoutWrapper)
 
 	_, err := h.server.AddNode(ctx, reconfigureCommand("add-d", 1, coordinator.Event{
 		Kind: coordinator.EventKindAddNode,
@@ -74,10 +74,10 @@ func TestReportNodeHeartbeatDoesNotInlineDispatchLargeOutbox(t *testing.T) {
 	}
 
 	for _, nodeID := range []string{"a", "b", "c", "d"} {
-		h.server.nodes[nodeID] = &slowNodeClient{
+		h.server.setNodeClient(nodeID, &slowNodeClient{
 			delegate: h.adapters[nodeID],
 			delay:    25 * time.Millisecond,
-		}
+		})
 	}
 
 	hbCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
@@ -105,7 +105,7 @@ func TestReportReplicaReadyDoesNotInlineDispatchLargeOutbox(t *testing.T) {
 
 	timeoutWrapper := newFaultInjectingNodeClient(h.adapters["d"])
 	timeoutWrapper.addTailTimeouts = 1
-	h.server.nodes["d"] = timeoutWrapper
+	h.server.setNodeClient("d", timeoutWrapper)
 
 	_, err := h.server.AddNode(ctx, reconfigureCommand("add-d", 1, coordinator.Event{
 		Kind: coordinator.EventKindAddNode,
@@ -120,10 +120,10 @@ func TestReportReplicaReadyDoesNotInlineDispatchLargeOutbox(t *testing.T) {
 
 	slot := mustPendingSlotForNode(t, h.server.Pending(), "d", pendingKindReady)
 	for _, nodeID := range []string{"a", "b", "c", "d"} {
-		h.server.nodes[nodeID] = &slowNodeClient{
+		h.server.setNodeClient(nodeID, &slowNodeClient{
 			delegate: h.adapters[nodeID],
 			delay:    25 * time.Millisecond,
-		}
+		})
 	}
 
 	readyCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
@@ -146,7 +146,7 @@ func TestStartupScaleProgressAndHeartbeatStayBoundedUnderLargeOutbox(t *testing.
 
 	timeoutWrapper := newFaultInjectingNodeClient(h.adapters["d"])
 	timeoutWrapper.addTailTimeouts = 1
-	h.server.nodes["d"] = timeoutWrapper
+	h.server.setNodeClient("d", timeoutWrapper)
 
 	_, err := h.server.AddNode(ctx, reconfigureCommand("add-d", 1, coordinator.Event{
 		Kind: coordinator.EventKindAddNode,
@@ -161,10 +161,10 @@ func TestStartupScaleProgressAndHeartbeatStayBoundedUnderLargeOutbox(t *testing.
 
 	slot := mustPendingSlotForNode(t, h.server.Pending(), "d", pendingKindReady)
 	for _, nodeID := range []string{"a", "b", "c", "d"} {
-		h.server.nodes[nodeID] = &slowNodeClient{
+		h.server.setNodeClient(nodeID, &slowNodeClient{
 			delegate: h.adapters[nodeID],
 			delay:    10 * time.Millisecond,
-		}
+		})
 	}
 
 	heartbeatCtx, heartbeatCancel := context.WithTimeout(ctx, 150*time.Millisecond)
@@ -200,7 +200,7 @@ func TestCloudShapeStartupScaleProgressAndHeartbeatStayBoundedUnderLargeOutbox(t
 
 	timeoutWrapper := newFaultInjectingNodeClient(h.adapters["d"])
 	timeoutWrapper.addTailTimeouts = 1
-	h.server.nodes["d"] = timeoutWrapper
+	h.server.setNodeClient("d", timeoutWrapper)
 
 	_, err := h.server.AddNode(ctx, reconfigureCommand("add-d", 1, coordinator.Event{
 		Kind: coordinator.EventKindAddNode,
@@ -215,10 +215,10 @@ func TestCloudShapeStartupScaleProgressAndHeartbeatStayBoundedUnderLargeOutbox(t
 
 	slot := mustPendingSlotForNode(t, h.server.Pending(), "d", pendingKindReady)
 	for _, nodeID := range []string{"a", "b", "c", "d"} {
-		h.server.nodes[nodeID] = &slowNodeClient{
+		h.server.setNodeClient(nodeID, &slowNodeClient{
 			delegate: h.adapters[nodeID],
 			delay:    10 * time.Millisecond,
-		}
+		})
 	}
 
 	heartbeatCtx, heartbeatCancel := context.WithTimeout(ctx, 150*time.Millisecond)
@@ -381,7 +381,7 @@ func TestAsyncStartupLeavesFirstWaveAndMakesForwardProgress(t *testing.T) {
 	updateWrappers := map[string]*faultInjectingNodeClient{}
 	for _, nodeID := range []string{"a", "b", "c"} {
 		wrapper := newFaultInjectingNodeClient(h.adapters[nodeID])
-		h.server.nodes[nodeID] = wrapper
+		h.server.setNodeClient(nodeID, wrapper)
 		updateWrappers[nodeID] = wrapper
 		node := uniqueNode(nodeID)
 		if _, err := h.server.RegisterNode(ctx, storage.NodeRegistration{
@@ -504,7 +504,7 @@ func TestAsyncRemovedProgressKeepsRoutingBlockedUntilPeerRefreshRetrySucceeds(t 
 	}
 	updateWrapper := newFaultInjectingNodeClient(h.adapters[updateNodes[0]])
 	updateWrapper.updatePeersTimeouts = 1
-	h.server.nodes[updateNodes[0]] = updateWrapper
+	h.server.setNodeClient(updateNodes[0], updateWrapper)
 
 	if err := h.adapters[leavingNodeID].Node().RemoveReplica(ctx, storage.RemoveReplicaCommand{Slot: slot}); err != nil {
 		t.Fatalf("RemoveReplica(%q) returned error: %v", leavingNodeID, err)
@@ -529,7 +529,7 @@ func TestAsyncRemovedProgressKeepsRoutingBlockedUntilPeerRefreshRetrySucceeds(t 
 		t.Fatalf("route while peer refresh retry is outstanding = %#v, want blocked", snapshot.Slots[slot])
 	}
 
-	h.server.nodes[updateNodes[0]] = h.adapters[updateNodes[0]]
+	h.server.setNodeClient(updateNodes[0], h.adapters[updateNodes[0]])
 	h.server.runBackgroundDispatchOnce()
 
 	snapshot, err = h.server.RoutingSnapshot(ctx)
@@ -629,7 +629,7 @@ func TestAsyncStartupReadyKeepsRoutingWritableViaPreviousServingChainWhilePeerRe
 
 	updateWrapper := newFaultInjectingNodeClient(h.adapters["a"])
 	updateWrapper.updatePeersTimeouts = 1
-	h.server.nodes["a"] = updateWrapper
+	h.server.setNodeClient("a", updateWrapper)
 
 	if _, err := h.server.ReportReplicaReady(ctx, "c", 0, 0, "ready-c"); err != nil {
 		t.Fatalf("ReportReplicaReady returned error: %v", err)
@@ -821,7 +821,7 @@ func TestAddNodeDispatchTimeoutThenRetryCompletesRepairAndRestoresDataPlane(t *t
 
 	wrapper := newFaultInjectingNodeClient(h.adapters["d"])
 	wrapper.addTailTimeouts = 1
-	h.server.nodes["d"] = wrapper
+	h.server.setNodeClient("d", wrapper)
 
 	_, err := h.server.AddNode(ctx, reconfigureCommand("add-d", 1, coordinator.Event{
 		Kind: coordinator.EventKindAddNode,
@@ -888,14 +888,14 @@ func TestAddNodePartialOutboxSuccessThenRetryDoesNotRedispatchCompletedPeerUpdat
 	}
 	slot := preview.ChangedSlots[0].Slot
 	addTailWrapper := newFaultInjectingNodeClient(h.adapters["d"])
-	h.server.nodes["d"] = addTailWrapper
+	h.server.setNodeClient("d", addTailWrapper)
 	updateWrappers := map[string]*faultInjectingNodeClient{
 		"a": newFaultInjectingNodeClient(h.adapters["a"]),
 		"b": newFaultInjectingNodeClient(h.adapters["b"]),
 		"c": newFaultInjectingNodeClient(h.adapters["c"]),
 	}
 	for nodeID, wrapper := range updateWrappers {
-		h.server.nodes[nodeID] = wrapper
+		h.server.setNodeClient(nodeID, wrapper)
 	}
 
 	_, err = h.server.AddNode(ctx, reconfigureCommand("add-d", 1, coordinator.Event{
@@ -1040,7 +1040,7 @@ func TestMarkLeavingDispatchTimeoutThenRetryCompletesRepairAndRestoresDataPlane(
 	}
 	wrapper := newFaultInjectingNodeClient(h.adapters[leavingNodeID])
 	wrapper.markLeavingTimeouts = 1
-	h.server.nodes[leavingNodeID] = wrapper
+	h.server.setNodeClient(leavingNodeID, wrapper)
 
 	if err := h.adapters["d"].DeliverNextProgress(ctx); err == nil {
 		t.Fatal("DeliverNextProgress unexpectedly succeeded")
@@ -1106,10 +1106,10 @@ func TestMarkLeavingPartialOutboxSuccessThenRetryDoesNotRedispatchCompletedPeerU
 		t.Fatal("no peer-update nodes found before mark-leaving timeout")
 	}
 	updateWrapper := newFaultInjectingNodeClient(h.adapters[updateNodes[0]])
-	h.server.nodes[updateNodes[0]] = updateWrapper
+	h.server.setNodeClient(updateNodes[0], updateWrapper)
 	leavingWrapper := newFaultInjectingNodeClient(h.adapters[leavingNodeID])
 	leavingWrapper.markLeavingTimeouts = 1
-	h.server.nodes[leavingNodeID] = leavingWrapper
+	h.server.setNodeClient(leavingNodeID, leavingWrapper)
 
 	if err := h.adapters["d"].DeliverNextProgress(ctx); err == nil {
 		t.Fatal("DeliverNextProgress unexpectedly succeeded")
@@ -1157,7 +1157,7 @@ func TestLivenessTriggeredDeadRepairTimeoutThenRetryCompletesRepairAndRestoresDa
 
 	wrapper := newFaultInjectingNodeClient(h.adapters["d"])
 	wrapper.addTailTimeouts = 1
-	h.server.nodes["d"] = wrapper
+	h.server.setNodeClient("d", wrapper)
 
 	if err := h.server.ReportNodeHeartbeat(ctx, storage.NodeStatus{NodeID: "b", ReplicaCount: 1, ActiveCount: 1}); err != nil {
 		t.Fatalf("ReportNodeHeartbeat returned error: %v", err)

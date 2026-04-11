@@ -504,7 +504,7 @@ func shouldFailoverCoordinator(err error) bool {
 	if errors.As(err, &authErr) {
 		return false
 	}
-	return true
+	return false
 }
 
 type DynamicNodeClientFactory struct {

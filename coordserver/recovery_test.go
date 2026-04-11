@@ -69,7 +69,7 @@ func TestReportNodeRecoveredRetryAfterPartialFailureCompletesAndThenBecomesStabl
 	repl.RegisterNode("b", recoveredB.Node())
 	wrapper := newFaultInjectingNodeClient(recoveredB)
 	wrapper.dropTimeouts = 1
-	server.nodes["b"] = wrapper
+	server.setNodeClient("b", wrapper)
 	recoveredB.BindServer(server)
 
 	assignment, ok := currentAssignmentForNode(server.Current(), "b", 0)

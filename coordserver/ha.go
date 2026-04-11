@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -79,6 +80,11 @@ func (s *Server) runHALoop() {
 }
 
 func (s *Server) StepHA(ctx context.Context) (bool, error) {
+	if s.dispatchEngine != nil && !contextInCoordinatorEngine(ctx) {
+		return submitEngineCall(ctx, s.dispatchEngine, func(engineCtx context.Context) (bool, error) {
+			return s.StepHA(engineCtx)
+		})
+	}
 	if s.ha == nil {
 		return true, nil
 	}
@@ -124,43 +130,47 @@ func (s *Server) StepHA(ctx context.Context) (bool, error) {
 }
 
 func (s *Server) syncFromHASnapshot(snapshot HASnapshot) {
-	s.replaceRuntime(coordruntime.OpenInMemoryFromState(snapshot.State))
-	s.syncViewsFromRuntime()
+	normalized := normalizeHASnapshot(snapshot)
+	s.replaceRuntime(coordruntime.OpenInMemoryFromState(normalized.State))
+	current := s.currentStateView()
+	heartbeats := make(map[string]storage.NodeStatus, len(normalized.Heartbeats))
+	for nodeID, status := range normalized.Heartbeats {
+		heartbeats[nodeID] = cloneNodeStatus(status)
+	}
+	for nodeID, record := range current.NodeLivenessByID {
+		if _, ok := heartbeats[nodeID]; ok || isZeroNodeStatus(record.LastStatus) {
+			continue
+		}
+		heartbeats[nodeID] = cloneNodeStatus(record.LastStatus)
+	}
+	activePeerRefresh := make(map[int]activePeerRefreshState, len(normalized.ActivePeerRefresh))
+	for slot, state := range normalized.ActivePeerRefresh {
+		if isZeroHAActivePeerRefreshState(state) && !haOutboxHasActivePeerRefreshForSlot(normalized.Outbox, slot) {
+			continue
+		}
+		activePeerRefresh[slot] = activePeerRefreshStateFromSnapshot(state)
+	}
 	s.activePeerRefreshMu.Lock()
-	s.activePeerRefresh = map[int]activePeerRefreshState{}
+	s.activePeerRefresh = activePeerRefresh
 	s.activePeerRefreshMu.Unlock()
 	s.viewMu.Lock()
-	heartbeats := make(map[string]storage.NodeStatus, len(s.heartbeats)+len(snapshot.Heartbeats))
-	for nodeID, status := range s.heartbeats {
-		heartbeats[nodeID] = cloneNodeStatus(status)
-	}
-	for nodeID, status := range snapshot.Heartbeats {
-		heartbeats[nodeID] = cloneNodeStatus(status)
-	}
-	liveness := make(map[string]coordruntime.NodeLivenessRecord, len(s.liveness)+len(snapshot.Liveness))
-	for nodeID, record := range s.liveness {
-		liveness[nodeID] = cloneLivenessRecord(record)
-	}
-	for nodeID, record := range snapshot.Liveness {
-		liveness[nodeID] = cloneLivenessRecord(record)
-	}
 	s.heartbeats = heartbeats
-	s.liveness = liveness
-	s.pending = make(map[int]PendingWork, len(snapshot.Pending))
-	for slot, pending := range snapshot.Pending {
-		s.pending[slot] = pending
+	s.liveness = mergeLivenessRecords(nil, current.NodeLivenessByID)
+	s.pending = pendingFromHASnapshot(normalized)
+	s.completed = make(map[int][]coordruntime.CompletedProgressRecord, len(current.CompletedProgressBySlot))
+	for slot, records := range current.CompletedProgressBySlot {
+		s.completed[slot] = append([]coordruntime.CompletedProgressRecord(nil), records...)
 	}
-	s.lastPolicy = snapshot.LastPolicy
-	s.unavailableReplicas = make(map[string]map[int]bool, len(snapshot.UnavailableReplicas))
-	for nodeID, slots := range snapshot.UnavailableReplicas {
-		cloned := make(map[int]bool, len(slots))
-		for slot, unavailable := range slots {
-			cloned[slot] = unavailable
-		}
-		s.unavailableReplicas[nodeID] = cloned
+	s.runtimeVersion = current.Version
+	s.runtimeOutbox = cloneRuntimeOutbox(current.Outbox)
+	s.lastPolicy = current.LastPolicy
+	s.startupBudgetActive = normalized.StartupBudgetActive
+	if normalized.SnapshotVersion == 0 && !isRuntimeInitialized(normalized.State) && s.startupMaxChangedChains > 0 {
+		s.startupBudgetActive = true
 	}
-	s.lastRecoveryReports = make(map[string]storage.NodeRecoveryReport, len(snapshot.LastRecoveryReports))
-	for nodeID, report := range snapshot.LastRecoveryReports {
+	s.unavailableReplicas = cloneUnavailableReplicasMap(normalized.UnavailableReplicas)
+	s.lastRecoveryReports = make(map[string]storage.NodeRecoveryReport, len(normalized.LastRecoveryReports))
+	for nodeID, report := range normalized.LastRecoveryReports {
 		s.lastRecoveryReports[nodeID] = cloneRecoveryReport(report)
 	}
 	s.viewMu.Unlock()
@@ -172,19 +182,21 @@ func (s *Server) currentHASnapshot() HASnapshot {
 	snapshot.State = s.currentState()
 	s.viewMu.RLock()
 	defer s.viewMu.RUnlock()
-	snapshot.Pending = make(map[int]PendingWork, len(s.pending))
+	snapshot.PendingEpochBySlot = make(map[int]uint64, len(s.pending))
 	for slot, pending := range s.pending {
-		snapshot.Pending[slot] = pending
+		if pending.Epoch != 0 {
+			snapshot.PendingEpochBySlot[slot] = pending.Epoch
+		}
 	}
 	snapshot.Heartbeats = make(map[string]storage.NodeStatus, len(s.heartbeats))
 	for nodeID, status := range s.heartbeats {
 		snapshot.Heartbeats[nodeID] = cloneNodeStatus(status)
 	}
-	snapshot.Liveness = make(map[string]coordruntime.NodeLivenessRecord, len(s.liveness))
-	for nodeID, record := range s.liveness {
-		snapshot.Liveness[nodeID] = cloneLivenessRecord(record)
+	snapshot.ActivePeerRefresh = make(map[int]HAActivePeerRefreshState, len(s.activePeerRefresh))
+	for slot, state := range s.activePeerRefresh {
+		snapshot.ActivePeerRefresh[slot] = snapshotHAActivePeerRefreshState(state)
 	}
-	snapshot.LastPolicy = s.lastPolicy
+	snapshot.StartupBudgetActive = s.startupBudgetActive
 	snapshot.UnavailableReplicas = make(map[string]map[int]bool, len(s.unavailableReplicas))
 	for nodeID, slots := range s.unavailableReplicas {
 		cloned := make(map[int]bool, len(slots))
@@ -272,172 +284,6 @@ func commandIDForOutbox(kind OutboxCommandKind, nodeID string, slot int, epoch u
 	return fmt.Sprintf("%s-%s-%d-e%d", kind, nodeID, slot, epoch)
 }
 
-func plannerNodeClients(state coordruntime.State) map[string]*haPlanningNodeClient {
-	clients := make(map[string]*haPlanningNodeClient, len(state.Cluster.NodesByID))
-	for nodeID := range state.Cluster.NodesByID {
-		clients[nodeID] = &haPlanningNodeClient{nodeID: nodeID}
-	}
-	return clients
-}
-
-func plannerNodeMap(clients map[string]*haPlanningNodeClient) map[string]StorageNodeClient {
-	out := make(map[string]StorageNodeClient, len(clients))
-	for nodeID, client := range clients {
-		out[nodeID] = client
-	}
-	return out
-}
-
-func (s *Server) newPlannerServer(snapshot HASnapshot) *Server {
-	planner := &Server{
-		rt:                     coordruntime.OpenInMemoryFromState(snapshot.State),
-		nodes:                  map[string]StorageNodeClient{},
-		heartbeats:             map[string]storage.NodeStatus{},
-		liveness:               map[string]coordruntime.NodeLivenessRecord{},
-		pending:                map[int]PendingWork{},
-		completed:              map[int][]coordruntime.CompletedProgressRecord{},
-		activePeerRefresh:      map[int]activePeerRefreshState{},
-		unavailableReplicas:    map[string]map[int]bool{},
-		lastRecoveryReports:    map[string]storage.NodeRecoveryReport{},
-		livenessPolicy:         s.livenessPolicy,
-		clock:                  s.clock,
-		dispatchTimeout:        s.dispatchTimeout,
-		recoveryCommandTimeout: s.recoveryCommandTimeout,
-		logger:                 s.logger,
-		metrics:                nil,
-		events:                 newServerEventRecorder(),
-		closeCh:                make(chan struct{}),
-	}
-	for slot, pending := range snapshot.Pending {
-		planner.pending[slot] = pending
-	}
-	for nodeID, slots := range snapshot.UnavailableReplicas {
-		cloned := make(map[int]bool, len(slots))
-		for slot, unavailable := range slots {
-			cloned[slot] = unavailable
-		}
-		planner.unavailableReplicas[nodeID] = cloned
-	}
-	for nodeID, report := range snapshot.LastRecoveryReports {
-		planner.lastRecoveryReports[nodeID] = cloneRecoveryReport(report)
-	}
-	planner.lastPolicy = snapshot.LastPolicy
-	planner.syncViewsFromRuntime()
-	planner.viewMu.Lock()
-	heartbeats := make(map[string]storage.NodeStatus, len(planner.heartbeats)+len(snapshot.Heartbeats))
-	for nodeID, status := range planner.heartbeats {
-		heartbeats[nodeID] = cloneNodeStatus(status)
-	}
-	for nodeID, status := range snapshot.Heartbeats {
-		heartbeats[nodeID] = cloneNodeStatus(status)
-	}
-	liveness := make(map[string]coordruntime.NodeLivenessRecord, len(planner.liveness)+len(snapshot.Liveness))
-	for nodeID, record := range planner.liveness {
-		liveness[nodeID] = cloneLivenessRecord(record)
-	}
-	for nodeID, record := range snapshot.Liveness {
-		liveness[nodeID] = cloneLivenessRecord(record)
-	}
-	planner.heartbeats = heartbeats
-	planner.liveness = liveness
-	planner.viewMu.Unlock()
-	planner.rebuildRoutingSnapshot()
-	return planner
-}
-
-type haPlanningNodeClient struct {
-	nodeID  string
-	mu      sync.Mutex
-	entries []OutboxEntry
-}
-
-func (c *haPlanningNodeClient) AddReplicaAsTail(_ context.Context, cmd storage.AddReplicaAsTailCommand) error {
-	assignment := cloneReplicaAssignment(cmd.Assignment)
-	c.mu.Lock()
-	c.entries = append(c.entries, OutboxEntry{
-		NodeID:      c.nodeID,
-		Slot:        cmd.Assignment.Slot,
-		SlotVersion: cmd.Assignment.ChainVersion,
-		Kind:        OutboxCommandAddReplicaAsTail,
-		Assignment:  &assignment,
-	})
-	c.mu.Unlock()
-	return nil
-}
-
-func (c *haPlanningNodeClient) ActivateReplica(_ context.Context, cmd storage.ActivateReplicaCommand) error {
-	return nil
-}
-
-func (c *haPlanningNodeClient) MarkReplicaLeaving(_ context.Context, cmd storage.MarkReplicaLeavingCommand) error {
-	c.mu.Lock()
-	c.entries = append(c.entries, OutboxEntry{
-		NodeID: c.nodeID,
-		Slot:   cmd.Slot,
-		Kind:   OutboxCommandMarkReplicaLeaving,
-	})
-	c.mu.Unlock()
-	return nil
-}
-
-func (c *haPlanningNodeClient) RemoveReplica(_ context.Context, cmd storage.RemoveReplicaCommand) error {
-	return nil
-}
-
-func (c *haPlanningNodeClient) UpdateChainPeers(_ context.Context, cmd storage.UpdateChainPeersCommand) error {
-	assignment := cloneReplicaAssignment(cmd.Assignment)
-	c.mu.Lock()
-	c.entries = append(c.entries, OutboxEntry{
-		NodeID:      c.nodeID,
-		Slot:        cmd.Assignment.Slot,
-		SlotVersion: cmd.Assignment.ChainVersion,
-		Kind:        OutboxCommandUpdateChainPeers,
-		Assignment:  &assignment,
-	})
-	c.mu.Unlock()
-	return nil
-}
-
-func (c *haPlanningNodeClient) ResumeRecoveredReplica(_ context.Context, cmd storage.ResumeRecoveredReplicaCommand) error {
-	assignment := cloneReplicaAssignment(cmd.Assignment)
-	c.mu.Lock()
-	c.entries = append(c.entries, OutboxEntry{
-		NodeID:      c.nodeID,
-		Slot:        cmd.Assignment.Slot,
-		SlotVersion: cmd.Assignment.ChainVersion,
-		Kind:        OutboxCommandResumeRecovered,
-		Assignment:  &assignment,
-	})
-	c.mu.Unlock()
-	return nil
-}
-
-func (c *haPlanningNodeClient) RecoverReplica(_ context.Context, cmd storage.RecoverReplicaCommand) error {
-	assignment := cloneReplicaAssignment(cmd.Assignment)
-	c.mu.Lock()
-	c.entries = append(c.entries, OutboxEntry{
-		NodeID:       c.nodeID,
-		Slot:         cmd.Assignment.Slot,
-		SlotVersion:  cmd.Assignment.ChainVersion,
-		Kind:         OutboxCommandRecoverReplica,
-		Assignment:   &assignment,
-		SourceNodeID: cmd.SourceNodeID,
-	})
-	c.mu.Unlock()
-	return nil
-}
-
-func (c *haPlanningNodeClient) DropRecoveredReplica(_ context.Context, cmd storage.DropRecoveredReplicaCommand) error {
-	c.mu.Lock()
-	c.entries = append(c.entries, OutboxEntry{
-		NodeID: c.nodeID,
-		Slot:   cmd.Slot,
-		Kind:   OutboxCommandDropRecovered,
-	})
-	c.mu.Unlock()
-	return nil
-}
-
 func rewriteSnapshotEpoch(snapshot HASnapshot, epoch uint64) (HASnapshot, bool) {
 	changed := false
 	cloned := cloneHASnapshot(snapshot)
@@ -448,38 +294,6 @@ func rewriteSnapshotEpoch(snapshot HASnapshot, epoch uint64) (HASnapshot, bool) 
 		}
 	}
 	return cloned, changed
-}
-
-func (s *Server) plannerEntries(clients map[string]*haPlanningNodeClient, epoch uint64) []OutboxEntry {
-	var entries []OutboxEntry
-	for _, client := range clients {
-		client.mu.Lock()
-		clientEntries := append([]OutboxEntry(nil), client.entries...)
-		client.mu.Unlock()
-		for _, entry := range clientEntries {
-			cloned := cloneOutboxEntry(entry)
-			cloned.Epoch = epoch
-			if cloned.CommandID == "" {
-				cloned.CommandID = commandIDForOutbox(cloned.Kind, cloned.NodeID, cloned.Slot, epoch)
-			}
-			if cloned.ID == "" {
-				cloned.ID = fmt.Sprintf("%s-%s", cloned.CommandID, cloned.Kind)
-			}
-			entries = append(entries, cloned)
-		}
-	}
-	return entries
-}
-
-func appendOutbox(base []OutboxEntry, added []OutboxEntry) []OutboxEntry {
-	out := make([]OutboxEntry, 0, len(base)+len(added))
-	for _, entry := range base {
-		out = append(out, cloneOutboxEntry(entry))
-	}
-	for _, entry := range added {
-		out = append(out, cloneOutboxEntry(entry))
-	}
-	return out
 }
 
 func removeOutboxEntry(entries []OutboxEntry, id string) []OutboxEntry {
@@ -502,112 +316,25 @@ func isRecoveryOutboxKind(kind OutboxCommandKind) bool {
 	}
 }
 
-func (s *Server) applyHAWithPlanner(
-	ctx context.Context,
-	seedNodes []string,
-	apply func(*Server) (coordruntime.State, error),
-) (coordruntime.State, error) {
-	if err := s.ensureLeader(ctx); err != nil {
-		return coordruntime.State{}, err
-	}
-	snapshot, err := s.loadCurrentHASnapshot(ctx)
-	if err != nil {
-		return coordruntime.State{}, fmt.Errorf("err in s.loadCurrentHASnapshot: %w", err)
-	}
-	planner := s.newPlannerServer(snapshot)
-	clients := plannerNodeClients(snapshot.State)
-	for _, nodeID := range seedNodes {
-		if nodeID == "" {
-			continue
-		}
-		if _, ok := clients[nodeID]; !ok {
-			clients[nodeID] = &haPlanningNodeClient{nodeID: nodeID}
-		}
-	}
-	planner.nodes = plannerNodeMap(clients)
-	state, err := apply(planner)
-	if err != nil {
-		return coordruntime.State{}, err
-	}
-	next := planner.currentHASnapshot()
-	lease, _ := s.ha.currentLease()
-	planned := s.plannerEntries(clients, lease.Epoch)
-	next.Outbox = appendOutbox(snapshot.Outbox, planned)
-	for slot, pending := range next.Pending {
-		if pending.Epoch != 0 {
-			continue
-		}
-		for _, entry := range planned {
-			if entry.Slot != slot {
-				continue
-			}
-			switch {
-			case pending.Kind == pendingKindReady && entry.Kind == OutboxCommandAddReplicaAsTail:
-				pending.Epoch = entry.Epoch
-			case pending.Kind == pendingKindRemoved && entry.Kind == OutboxCommandMarkReplicaLeaving:
-				pending.Epoch = entry.Epoch
-			}
-		}
-		next.Pending[slot] = pending
-	}
-	for _, entry := range planned {
-		if isRecoveryOutboxKind(entry.Kind) {
-			slots := next.UnavailableReplicas[entry.NodeID]
-			if slots == nil {
-				slots = map[int]bool{}
-				next.UnavailableReplicas[entry.NodeID] = slots
-			}
-			slots[entry.Slot] = true
-		}
-	}
-	if err := s.saveHASnapshot(ctx, snapshot.SnapshotVersion, next); err != nil {
-		return coordruntime.State{}, err
-	}
-	return state, nil
+func isZeroHAActivePeerRefreshState(state HAActivePeerRefreshState) bool {
+	return !state.UseFallbackRoute &&
+		!state.AllowWhilePending &&
+		len(state.FallbackServingChain.Replicas) == 0 &&
+		len(state.AssignmentChain.Replicas) == 0 &&
+		len(state.RemainingNodeIDs) == 0
 }
 
-func (s *Server) dispatchOutbox(ctx context.Context) error {
-	if s.ha == nil {
-		return nil
-	}
-	if _, isLeader := s.ha.currentLease(); !isLeader {
-		return nil
-	}
-	snapshot, err := s.loadCurrentHASnapshot(ctx)
-	if err != nil {
-		return fmt.Errorf("err in s.loadCurrentHASnapshot: %w", err)
-	}
-	for _, entry := range snapshot.Outbox {
-		dispatchCtx, cancel := deriveDeadlineContext(ctx, s.haDispatchTimeout(entry.Kind))
-		err := s.dispatchOutboxEntry(dispatchCtx, entry)
-		cancel()
-		if err != nil {
-			return err
+func haOutboxHasActivePeerRefreshForSlot(entries []OutboxEntry, slot int) bool {
+	prefix := fmt.Sprintf("ha-peer-refresh-slot%d-", slot)
+	for _, entry := range entries {
+		if entry.Kind != OutboxCommandUpdateChainPeers {
+			continue
 		}
-		current, err := s.loadCurrentHASnapshot(ctx)
-		if err != nil {
-			return fmt.Errorf("err in s.loadCurrentHASnapshot(ack): %w", err)
-		}
-		next := cloneHASnapshot(current)
-		next.Outbox = removeOutboxEntry(current.Outbox, entry.ID)
-		if isRecoveryOutboxKind(entry.Kind) {
-			s.clearUnavailable(entry.NodeID, entry.Slot)
-			s.viewMu.RLock()
-			next.UnavailableReplicas = make(map[string]map[int]bool, len(s.unavailableReplicas))
-			for nodeID, slots := range s.unavailableReplicas {
-				cloned := make(map[int]bool, len(slots))
-				for slot, unavailable := range slots {
-					cloned[slot] = unavailable
-				}
-				next.UnavailableReplicas[nodeID] = cloned
-			}
-			s.viewMu.RUnlock()
-		}
-		if err := s.saveHASnapshot(ctx, current.SnapshotVersion, next); err != nil {
-			return err
+		if strings.HasPrefix(entry.ID, prefix) {
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 func (s *Server) haDispatchTimeout(kind OutboxCommandKind) time.Duration {

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -77,6 +78,62 @@ func TestAddReplicaAsTailConcurrentReplayIsIdempotent(t *testing.T) {
 	replica := node.State().Replicas[1]
 	if got, want := replica.State, ReplicaStateCatchingUp; got != want {
 		t.Fatalf("replica state = %q, want %q", got, want)
+	}
+}
+
+func TestAddReplicaAsTailReplaySucceedsFromPersistedReplica(t *testing.T) {
+	ctx := context.Background()
+	backend := NewInMemoryBackend()
+	local := NewInMemoryLocalStateStore()
+	node := mustOpenNode(t, ctx, Config{NodeID: "node-a"}, backend, local, NewInMemoryCoordinatorClient(), NewInMemoryReplicationTransport())
+	cmd := AddReplicaAsTailCommand{
+		Assignment: ReplicaAssignment{Slot: 1, ChainVersion: 3, Role: ReplicaRoleSingle},
+		Epoch:      5,
+	}
+	if err := node.AddReplicaAsTail(ctx, cmd); err != nil {
+		t.Fatalf("first AddReplicaAsTail returned error: %v", err)
+	}
+
+	node.deleteReplicaRecord(cmd.Assignment.Slot)
+
+	replay := cmd
+	replay.Epoch = 6
+	if err := node.AddReplicaAsTail(ctx, replay); err != nil {
+		t.Fatalf("replayed AddReplicaAsTail returned error: %v", err)
+	}
+
+	reopened := mustOpenNode(t, ctx, Config{NodeID: "node-a"}, backend, local, NewInMemoryCoordinatorClient(), NewInMemoryReplicationTransport())
+	replica := reopened.State().Replicas[cmd.Assignment.Slot]
+	if got, want := replica.Assignment, cmd.Assignment; got != want {
+		t.Fatalf("reopened assignment = %#v, want %#v", got, want)
+	}
+}
+
+func TestAddReplicaAsTailReplayRejectsConflictingPersistedAssignment(t *testing.T) {
+	ctx := context.Background()
+	backend := NewInMemoryBackend()
+	local := NewInMemoryLocalStateStore()
+	node := mustOpenNode(t, ctx, Config{NodeID: "node-a"}, backend, local, NewInMemoryCoordinatorClient(), NewInMemoryReplicationTransport())
+	cmd := AddReplicaAsTailCommand{
+		Assignment: ReplicaAssignment{Slot: 1, ChainVersion: 3, Role: ReplicaRoleSingle},
+		Epoch:      5,
+	}
+	if err := node.AddReplicaAsTail(ctx, cmd); err != nil {
+		t.Fatalf("first AddReplicaAsTail returned error: %v", err)
+	}
+
+	node.deleteReplicaRecord(cmd.Assignment.Slot)
+
+	conflict := AddReplicaAsTailCommand{
+		Assignment: ReplicaAssignment{Slot: 1, ChainVersion: 4, Role: ReplicaRoleTail},
+		Epoch:      6,
+	}
+	err := node.AddReplicaAsTail(ctx, conflict)
+	if err == nil {
+		t.Fatal("conflicting replay unexpectedly succeeded")
+	}
+	if !errors.Is(err, ErrReplicaExists) {
+		t.Fatalf("error = %v, want ErrReplicaExists", err)
 	}
 }
 

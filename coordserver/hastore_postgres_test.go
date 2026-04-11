@@ -58,23 +58,21 @@ func TestPostgresHAStoreRoundTripsComplexSnapshot(t *testing.T) {
 		t.Fatal("coord-a did not become leader")
 	}
 
-	snapshot := coordserver.HASnapshot{
-		State: coordruntime.State{
-			Version:                 7,
-			LastLogIndex:            7,
-			Cluster:                 coordinator.ClusterState{SlotCount: 1},
-			SlotVersions:            map[int]uint64{0: 3},
-			CompletedProgressBySlot: map[int][]coordruntime.CompletedProgressRecord{0: {{NodeID: "d", Kind: coordruntime.CompletedProgressKindReady, SlotVersion: 3}}},
-			NodeLivenessByID:        map[string]coordruntime.NodeLivenessRecord{"d": {State: coordruntime.NodeLivenessStateHealthy, LastHeartbeatUnixNano: now.UnixNano()}},
-			PendingBySlot:           map[int]coordruntime.PendingWork{0: {Slot: 0, NodeID: "d", Kind: coordruntime.PendingKindRemoved, SlotVersion: 3, CommandID: "cmd-1"}},
-			AppliedCommands:         map[string]coordruntime.AppliedCommand{},
-		},
-		Pending: map[int]coordserver.PendingWork{
-			0: {Slot: 0, NodeID: "d", Kind: "removed", SlotVersion: 3, Epoch: lease.Epoch, CommandID: "cmd-1"},
-		},
-		LastPolicy:          coordinator.ReconfigurationPolicy{MaxChangedChains: 4},
-		UnavailableReplicas: map[string]map[int]bool{"c": {0: true}},
-		LastRecoveryReports: map[string]storage.NodeRecoveryReport{
+		snapshot := coordserver.HASnapshot{
+			State: coordruntime.State{
+				Version:                 7,
+				LastLogIndex:            7,
+				Cluster:                 coordinator.ClusterState{SlotCount: 1},
+				SlotVersions:            map[int]uint64{0: 3},
+				CompletedProgressBySlot: map[int][]coordruntime.CompletedProgressRecord{0: {{NodeID: "d", Kind: coordruntime.CompletedProgressKindReady, SlotVersion: 3}}},
+				NodeLivenessByID:        map[string]coordruntime.NodeLivenessRecord{"d": {State: coordruntime.NodeLivenessStateHealthy, LastHeartbeatUnixNano: now.UnixNano()}},
+				PendingBySlot:           map[int]coordruntime.PendingWork{0: {Slot: 0, NodeID: "d", Kind: coordruntime.PendingKindRemoved, SlotVersion: 3, CommandID: "cmd-1"}},
+				LastPolicy:              coordinator.ReconfigurationPolicy{MaxChangedChains: 4},
+				AppliedCommands:         map[string]coordruntime.AppliedCommand{},
+			},
+			PendingEpochBySlot:  map[int]uint64{0: lease.Epoch},
+			UnavailableReplicas: map[string]map[int]bool{"c": {0: true}},
+			LastRecoveryReports: map[string]storage.NodeRecoveryReport{
 			"d": {NodeID: "d", Replicas: []storage.RecoveredReplica{{
 				Assignment:               storage.ReplicaAssignment{Slot: 0, ChainVersion: 3, Role: storage.ReplicaRoleTail},
 				LastKnownState:           storage.ReplicaStateActive,

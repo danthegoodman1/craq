@@ -473,7 +473,7 @@ func TestFactoryCachedClientsDoNotBypassIdentityAndTombstoneSafety(t *testing.T)
 	if got, want := h.factory.callCount("b"), 1; got != want {
 		t.Fatalf("factory call count for b = %d, want %d", got, want)
 	}
-	if got, want := len(server.nodes), 1; got != want {
+	if got, want := server.nodeClientCount(), 1; got != want {
 		t.Fatalf("cached server nodes = %d, want %d", got, want)
 	}
 
@@ -508,7 +508,7 @@ func TestFactoryCachedClientsDoNotBypassIdentityAndTombstoneSafety(t *testing.T)
 	if got, want := h.factory.callCount("d"), 1; got != want {
 		t.Fatalf("factory call count for d after repair dispatch = %d, want %d", got, want)
 	}
-	if got, ok := server.nodes["b"]; !ok || got != firstClient {
+	if got, ok := server.nodeClient("b"); !ok || got != firstClient {
 		t.Fatalf("cached client for b changed after tombstone\ngot=%#v\nwant=%#v", got, firstClient)
 	}
 	if err := h.adapters["b"].Node().ReportHeartbeat(ctx); err == nil {

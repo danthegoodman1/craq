@@ -241,9 +241,9 @@ func (s *Server) AdminState(ctx context.Context) AdminState {
 	if s.ha != nil {
 		if published, err := s.readHASnapshot(ctx); err == nil {
 			current = published.State
-			pending = published.Pending
+			pending = pendingFromHASnapshot(published)
 			heartbeats = published.Heartbeats
-			liveness = published.Liveness
+			liveness = mergeLivenessRecords(nil, published.State.NodeLivenessByID)
 			unavailable = make(map[string][]int, len(published.UnavailableReplicas))
 			for nodeID, slots := range published.UnavailableReplicas {
 				nodeSlots := make([]int, 0, len(slots))
@@ -279,8 +279,8 @@ func (s *Server) RoutingStatus(ctx context.Context) RoutingStatus {
 	if s.ha != nil {
 		if published, err := s.readHASnapshot(ctx); err == nil {
 			current = published.State
-			pendingCount = len(published.Pending)
-			liveness = mergeLivenessRecords(nil, published.Liveness)
+			pendingCount = len(published.State.PendingBySlot)
+			liveness = mergeLivenessRecords(nil, published.State.NodeLivenessByID)
 			outboxCount = len(published.Outbox)
 		}
 	} else {

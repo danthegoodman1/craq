@@ -547,7 +547,7 @@ func TestReconfigureAndApplyProgressPersistAndRecover(t *testing.T) {
 	store := NewInMemoryStore()
 	rt := mustOpenRuntime(t, store)
 
-	state, err := rt.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 8, 3, "a", "b", "c"))
+	state, err := rt.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 16, 3, "a", "b", "c"))
 	if err != nil {
 		t.Fatalf("Bootstrap returned error: %v", err)
 	}
@@ -606,7 +606,7 @@ func TestReconcileAfterRemovedProgressMovesPendingOffCompletedSlot(t *testing.T)
 	store := NewInMemoryStore()
 	rt := mustOpenRuntime(t, store)
 
-	state, err := rt.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 8, 3, "a", "b", "c"))
+	state, err := rt.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 16, 3, "a", "b", "c"))
 	if err != nil {
 		t.Fatalf("Bootstrap returned error: %v", err)
 	}
@@ -1021,6 +1021,114 @@ func TestDuplicateOutboxAcknowledgeIsIdempotentBeforeAndAfterReopen(t *testing.T
 	}
 	if !reflect.DeepEqual(reopenedDuplicate, acked) {
 		t.Fatalf("reopened duplicate ack snapshot mismatch\nreopened=%#v\nacked=%#v", reopenedDuplicate, acked)
+	}
+}
+
+func TestDuplicateBatchedOutboxAcknowledgeIsIdempotentBeforeAndAfterReopen(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryStore()
+	rt := mustOpenRuntime(t, store)
+
+	state, err := rt.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 8, 3, "a", "b", "c"))
+	if err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	_, state, err = rt.Reconfigure(ctx, Command{
+		ID:              "add-d",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindReconfigure,
+		Reconfigure: &ReconfigureCommand{
+			Events: []coordinator.Event{{Kind: coordinator.EventKindAddNode, Node: uniqueNode("d")}},
+			Policy: coordinator.ReconfigurationPolicy{MaxChangedChains: 2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconfigure(add-d) returned error: %v", err)
+	}
+	if got := len(state.Outbox); got < 2 {
+		t.Fatalf("outbox size = %d, want at least 2", got)
+	}
+
+	entryIDs := []string{state.Outbox[1].ID, state.Outbox[0].ID}
+	ack := Command{
+		ID:              "ack-outbox-batch-1",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindAcknowledgeOutbox,
+		AcknowledgeOutbox: &AcknowledgeOutboxCommand{
+			EntryIDs: append([]string(nil), entryIDs...),
+		},
+	}
+	acked, err := rt.AcknowledgeOutbox(ctx, ack)
+	if err != nil {
+		t.Fatalf("AcknowledgeOutbox(batch) returned error: %v", err)
+	}
+	duplicate, err := rt.AcknowledgeOutbox(ctx, ack)
+	if err != nil {
+		t.Fatalf("duplicate batched AcknowledgeOutbox returned error: %v", err)
+	}
+	if !reflect.DeepEqual(duplicate, acked) {
+		t.Fatalf("duplicate batch ack snapshot mismatch\nduplicate=%#v\nacked=%#v", duplicate, acked)
+	}
+
+	reopened := mustOpenRuntime(t, store)
+	reopenedDuplicate, err := reopened.AcknowledgeOutbox(ctx, ack)
+	if err != nil {
+		t.Fatalf("reopened duplicate batched AcknowledgeOutbox returned error: %v", err)
+	}
+	if !reflect.DeepEqual(reopenedDuplicate, acked) {
+		t.Fatalf("reopened duplicate batch ack snapshot mismatch\nreopened=%#v\nacked=%#v", reopenedDuplicate, acked)
+	}
+}
+
+func TestDuplicateCommandConflictForDifferentBatchedOutboxEntries(t *testing.T) {
+	ctx := context.Background()
+	rt := mustOpenRuntime(t, NewInMemoryStore())
+
+	state, err := rt.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 8, 3, "a", "b", "c"))
+	if err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	_, state, err = rt.Reconfigure(ctx, Command{
+		ID:              "add-d",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindReconfigure,
+		Reconfigure: &ReconfigureCommand{
+			Events: []coordinator.Event{{Kind: coordinator.EventKindAddNode, Node: uniqueNode("d")}},
+			Policy: coordinator.ReconfigurationPolicy{MaxChangedChains: 2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconfigure(add-d) returned error: %v", err)
+	}
+	if got := len(state.Outbox); got < 2 {
+		t.Fatalf("outbox size = %d, want at least 2", got)
+	}
+
+	first := Command{
+		ID:              "ack-outbox-batch-conflict",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindAcknowledgeOutbox,
+		AcknowledgeOutbox: &AcknowledgeOutboxCommand{
+			EntryIDs: []string{state.Outbox[0].ID},
+		},
+	}
+	if _, err := rt.AcknowledgeOutbox(ctx, first); err != nil {
+		t.Fatalf("AcknowledgeOutbox(first batch) returned error: %v", err)
+	}
+
+	_, err = rt.AcknowledgeOutbox(ctx, Command{
+		ID:              first.ID,
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindAcknowledgeOutbox,
+		AcknowledgeOutbox: &AcknowledgeOutboxCommand{
+			EntryIDs: []string{state.Outbox[0].ID, state.Outbox[1].ID},
+		},
+	})
+	if err == nil {
+		t.Fatal("conflicting duplicate batch ack unexpectedly succeeded")
+	}
+	if !errors.Is(err, ErrCommandConflict) {
+		t.Fatalf("error = %v, want command conflict", err)
 	}
 }
 

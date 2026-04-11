@@ -335,7 +335,7 @@ func TestHAFailoverAfterAddTailAckBeforeReadyProgressDoesNotRedispatchAndRestore
 
 	h.mustStepLeader(t)
 	h.mustBind(t, h.leader)
-	h.leader.nodes["d"] = wrapper
+	h.leader.setNodeClient("d", wrapper)
 	if _, err := h.leader.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 8, 3, "a", "b", "c")); err != nil {
 		t.Fatalf("Bootstrap returned error: %v", err)
 	}
@@ -352,7 +352,7 @@ func TestHAFailoverAfterAddTailAckBeforeReadyProgressDoesNotRedispatchAndRestore
 	h.clock.Advance(3 * time.Second)
 	h.mustStepStandby(t)
 	h.mustBind(t, h.standby)
-	h.standby.nodes["d"] = wrapper
+	h.standby.setNodeClient("d", wrapper)
 	if got, want := wrapper.addTailCallCount(), 1; got != want {
 		t.Fatalf("add-tail calls after failover = %d, want no redispatch", got)
 	}
@@ -392,13 +392,13 @@ func TestHAFailoverAfterPartialAddTailOutboxSuccessRetriesRemainingPeerUpdatesOn
 	slot := preview.ChangedSlots[0].Slot
 
 	addTailWrapper := newFaultInjectingNodeClient(h.adapters["d"])
-	h.leader.nodes["d"] = addTailWrapper
+	h.leader.setNodeClient("d", addTailWrapper)
 	updateWrappers := map[string]*faultInjectingNodeClient{
 		"a": newFaultInjectingNodeClient(h.adapters["a"]),
 		"b": newFaultInjectingNodeClient(h.adapters["b"]),
 	}
 	for nodeID, wrapper := range updateWrappers {
-		h.leader.nodes[nodeID] = wrapper
+		h.leader.setNodeClient(nodeID, wrapper)
 	}
 
 	if _, err = h.leader.AddNode(ctx, reconfigureCommand("add-d", 1, uniqueAddNodeEvent("d"), noBudgetPolicy())); err != nil {
@@ -413,10 +413,7 @@ func TestHAFailoverAfterPartialAddTailOutboxSuccessRetriesRemainingPeerUpdatesOn
 	if err := h.leader.dispatchOutboxEntry(ctx, addTailEntry); err != nil {
 		t.Fatalf("dispatchOutboxEntry(add tail) returned error: %v", err)
 	}
-	snapshot.Outbox = removeOutboxEntry(snapshot.Outbox, addTailEntry.ID)
-	if err := h.leader.saveHASnapshot(ctx, snapshot.SnapshotVersion, snapshot); err != nil {
-		t.Fatalf("saveHASnapshot(after add tail) returned error: %v", err)
-	}
+	h.mustAckOutboxEntry(t, h.leader, addTailEntry)
 	if got, want := addTailWrapper.addTailCallCount(), 1; got != want {
 		t.Fatalf("add-tail calls after manual dispatch = %d, want %d", got, want)
 	}
@@ -435,10 +432,7 @@ func TestHAFailoverAfterPartialAddTailOutboxSuccessRetriesRemainingPeerUpdatesOn
 		if err != nil {
 			t.Fatalf("LoadSnapshot after pre-ready update peers %q returned error: %v", entry.NodeID, err)
 		}
-		snapshot.Outbox = removeOutboxEntry(snapshot.Outbox, entry.ID)
-		if err := h.leader.saveHASnapshot(ctx, snapshot.SnapshotVersion, snapshot); err != nil {
-			t.Fatalf("saveHASnapshot(after pre-ready update peers %q) returned error: %v", entry.NodeID, err)
-		}
+		h.mustAckOutboxEntry(t, h.leader, entry)
 	}
 	baselineCalls := map[string]int{
 		"a": updateWrappers["a"].updatePeersCallCount(),
@@ -475,10 +469,7 @@ func TestHAFailoverAfterPartialAddTailOutboxSuccessRetriesRemainingPeerUpdatesOn
 		if err != nil {
 			t.Fatalf("LoadSnapshot after update peers %q returned error: %v", nodeID, err)
 		}
-		snapshot.Outbox = removeOutboxEntry(snapshot.Outbox, entry.ID)
-		if err := h.leader.saveHASnapshot(ctx, snapshot.SnapshotVersion, snapshot); err != nil {
-			t.Fatalf("saveHASnapshot(after update peers %q) returned error: %v", nodeID, err)
-		}
+		h.mustAckOutboxEntry(t, h.leader, entry)
 		var got int
 		if nodeID == "d" {
 			got = addTailWrapper.updatePeersCallCount()
@@ -500,9 +491,9 @@ func TestHAFailoverAfterPartialAddTailOutboxSuccessRetriesRemainingPeerUpdatesOn
 
 	h.clock.Advance(3 * time.Second)
 	h.mustBind(t, h.standby)
-	h.standby.nodes["d"] = addTailWrapper
+	h.standby.setNodeClient("d", addTailWrapper)
 	for nodeID, wrapper := range updateWrappers {
-		h.standby.nodes[nodeID] = wrapper
+		h.standby.setNodeClient(nodeID, wrapper)
 	}
 	h.mustStepStandby(t)
 	if err := h.standby.dispatchOutbox(ctx); err != nil {
@@ -586,7 +577,7 @@ func TestHAFailoverAfterPartialRecoveryOutboxSuccessRetriesRemainingCommandOnlyA
 	h.repl.RegisterNode("b", recoveredB.Node())
 	h.mustBind(t, h.leader)
 	wrapper := newFaultInjectingNodeClient(recoveredB)
-	h.leader.nodes["b"] = wrapper
+	h.leader.setNodeClient("b", wrapper)
 
 	report := storage.NodeRecoveryReport{
 		NodeID: "b",
@@ -626,16 +617,7 @@ func TestHAFailoverAfterPartialRecoveryOutboxSuccessRetriesRemainingCommandOnlyA
 	if err != nil {
 		t.Fatalf("LoadSnapshot returned error: %v", err)
 	}
-	snapshot.Outbox = removeOutboxEntry(snapshot.Outbox, recoverEntry.ID)
-	if slots := snapshot.UnavailableReplicas["b"]; slots != nil {
-		delete(slots, 0)
-		if len(slots) == 0 {
-			delete(snapshot.UnavailableReplicas, "b")
-		}
-	}
-	if err := h.leader.saveHASnapshot(ctx, snapshot.SnapshotVersion, snapshot); err != nil {
-		t.Fatalf("saveHASnapshot(after recover) returned error: %v", err)
-	}
+	h.mustAckOutboxEntry(t, h.leader, recoverEntry)
 	if got, want := wrapper.recoverCallCount(), 1; got != want {
 		t.Fatalf("recover calls after manual dispatch = %d, want %d", got, want)
 	}
@@ -649,7 +631,7 @@ func TestHAFailoverAfterPartialRecoveryOutboxSuccessRetriesRemainingCommandOnlyA
 	}
 
 	h.clock.Advance(3 * time.Second)
-	h.standby.nodes["b"] = wrapper
+	h.standby.setNodeClient("b", wrapper)
 	h.mustStepStandby(t)
 	h.mustBind(t, h.standby)
 	if err := h.standby.dispatchOutbox(ctx); err != nil {
@@ -744,7 +726,7 @@ func TestHAFailoverAfterRecoveryAckBeforeNextStepDoesNotRedispatchRecoveredComma
 	h.repl.RegisterNode("b", recoveredB.Node())
 	h.mustBind(t, h.leader)
 	wrapper := newFaultInjectingNodeClient(recoveredB)
-	h.leader.nodes["b"] = wrapper
+	h.leader.setNodeClient("b", wrapper)
 
 	report := storage.NodeRecoveryReport{
 		NodeID: "b",
@@ -784,22 +766,13 @@ func TestHAFailoverAfterRecoveryAckBeforeNextStepDoesNotRedispatchRecoveredComma
 	if err != nil {
 		t.Fatalf("LoadSnapshot returned error: %v", err)
 	}
-	snapshot.Outbox = removeOutboxEntry(snapshot.Outbox, recoverEntry.ID)
-	if slots := snapshot.UnavailableReplicas["b"]; slots != nil {
-		delete(slots, 0)
-		if len(slots) == 0 {
-			delete(snapshot.UnavailableReplicas, "b")
-		}
-	}
-	if err := h.leader.saveHASnapshot(ctx, snapshot.SnapshotVersion, snapshot); err != nil {
-		t.Fatalf("saveHASnapshot(after recover ack) returned error: %v", err)
-	}
+	h.mustAckOutboxEntry(t, h.leader, recoverEntry)
 	if got, want := wrapper.recoverCallCount(), 1; got != want {
 		t.Fatalf("recover calls after manual ack = %d, want %d", got, want)
 	}
 
 	h.clock.Advance(3 * time.Second)
-	h.standby.nodes["b"] = wrapper
+	h.standby.setNodeClient("b", wrapper)
 	h.mustStepStandby(t)
 	h.mustBind(t, h.standby)
 	if err := h.standby.dispatchOutbox(ctx); err != nil {
@@ -1061,6 +1034,66 @@ func TestHANoopStepDoesNotChurnSettledState(t *testing.T) {
 	}
 }
 
+func TestHAMarkDeadThenReplacementRegisterAfterFailover(t *testing.T) {
+	ctx := context.Background()
+	h := newHAInMemoryHarness(t, []string{"a", "b", "d"})
+
+	h.mustStepLeader(t)
+	h.mustBind(t, h.leader)
+	if _, err := h.leader.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 1, 1)); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	if _, err := h.leader.RegisterNode(ctx, storage.NodeRegistration{
+		NodeID:         "a",
+		RPCAddress:     "127.0.0.1:7411",
+		FailureDomains: map[string]string{"host": "h1"},
+	}); err != nil {
+		t.Fatalf("RegisterNode(a) returned error: %v", err)
+	}
+
+	h.clock.Advance(3 * time.Second)
+	h.mustStepStandby(t)
+	h.mustBind(t, h.standby)
+
+	if _, err := h.standby.RegisterNode(ctx, storage.NodeRegistration{
+		NodeID:         "a",
+		RPCAddress:     "127.0.0.1:7999",
+		FailureDomains: map[string]string{"host": "h1"},
+	}); err == nil {
+		t.Fatal("conflicting RegisterNode(a) unexpectedly succeeded after failover")
+	}
+
+	current := h.standby.Current()
+	if _, err := h.standby.MarkNodeDead(ctx, reconfigureCommand("dead-a", current.Version, coordinator.Event{
+		Kind:   coordinator.EventKindMarkNodeDead,
+		NodeID: "a",
+	}, coordinator.ReconfigurationPolicy{})); err != nil {
+		t.Fatalf("MarkNodeDead returned error: %v", err)
+	}
+
+	if _, err := h.standby.RegisterNode(ctx, storage.NodeRegistration{
+		NodeID:         "d",
+		RPCAddress:     "127.0.0.1:7414",
+		FailureDomains: map[string]string{"host": "h4"},
+	}); err != nil {
+		t.Fatalf("RegisterNode(d) returned error: %v", err)
+	}
+
+	snapshot, err := h.store.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("LoadSnapshot returned error: %v", err)
+	}
+	if _, ok := snapshot.State.Cluster.NodesByID["d"]; !ok {
+		t.Fatalf("snapshot missing replacement node d after registration: %#v", snapshot.State.Cluster.NodesByID)
+	}
+	if err := h.standby.ReportNodeHeartbeat(ctx, storage.NodeStatus{NodeID: "d", ReplicaCount: 1}); err != nil {
+		t.Fatalf("ReportNodeHeartbeat(d) returned error: %v", err)
+	}
+	if !h.standby.Current().Cluster.ReadyNodeIDs["d"] {
+		t.Fatalf("standby cluster did not mark d ready after replacement join: %#v", h.standby.Current().Cluster.ReadyNodeIDs)
+	}
+}
+
 func TestHACurrentReadDoesNotSyncStandbyState(t *testing.T) {
 	ctx := context.Background()
 	h := newHAInMemoryHarness(t, []string{"a"})
@@ -1077,7 +1110,13 @@ func TestHACurrentReadDoesNotSyncStandbyState(t *testing.T) {
 		t.Fatalf("LoadSnapshot returned error: %v", err)
 	}
 	pending := PendingWork{Slot: 0, NodeID: "a", Kind: pendingKindReady, SlotVersion: 1}
-	snapshot.Pending[0] = pending
+	snapshot.State.PendingBySlot[0] = coordruntime.PendingWork{
+		Slot:        pending.Slot,
+		NodeID:      pending.NodeID,
+		Kind:        coordruntime.PendingKind(pending.Kind),
+		SlotVersion: pending.SlotVersion,
+		CommandID:   pending.CommandID,
+	}
 	if err := h.leader.saveHASnapshot(ctx, snapshot.SnapshotVersion, snapshot); err != nil {
 		t.Fatalf("saveHASnapshot returned error: %v", err)
 	}
@@ -1106,7 +1145,13 @@ func TestHAAdminStateUsesPublishedSnapshotWithoutMutatingStandbyViews(t *testing
 		t.Fatalf("LoadSnapshot returned error: %v", err)
 	}
 	pending := PendingWork{Slot: 0, NodeID: "a", Kind: pendingKindReady, SlotVersion: 1}
-	snapshot.Pending[0] = pending
+	snapshot.State.PendingBySlot[0] = coordruntime.PendingWork{
+		Slot:        pending.Slot,
+		NodeID:      pending.NodeID,
+		Kind:        coordruntime.PendingKind(pending.Kind),
+		SlotVersion: pending.SlotVersion,
+		CommandID:   pending.CommandID,
+	}
 	snapshot.Heartbeats["a"] = storage.NodeStatus{NodeID: "a", ReplicaCount: 1, ActiveCount: 1}
 	if err := h.leader.saveHASnapshot(ctx, snapshot.SnapshotVersion, snapshot); err != nil {
 		t.Fatalf("saveHASnapshot returned error: %v", err)
@@ -1262,7 +1307,17 @@ func TestHAConcurrentHeartbeatsAndStepHandoffsConvergeAfterFailover(t *testing.T
 	}
 	route := snapshot.Slots[slot]
 	if !route.Readable {
-		t.Fatalf("route after failover churn = %#v, want readable", route)
+		persisted, loadErr := h.store.LoadSnapshot(ctx)
+		if loadErr != nil {
+			t.Fatalf("route after failover churn = %#v, want readable (LoadSnapshot failed: %v)", route, loadErr)
+		}
+		t.Fatalf(
+			"route after failover churn = %#v, want readable (active_peer_refresh=%#v pending=%#v outbox=%#v)",
+			route,
+			persisted.ActivePeerRefresh[slot],
+			persisted.State.PendingBySlot[slot],
+			persisted.Outbox,
+		)
 	}
 	if got := h.adapters["d"].PendingProgress(); got != 0 {
 		t.Fatalf("queued ready progress after standby handoff = %d, want 0", got)
@@ -1621,6 +1676,21 @@ func (h *haInMemoryHarness) mustFindOutbox(t *testing.T, kind OutboxCommandKind,
 	}
 	t.Fatalf("outbox entry %q node=%s slot=%d not found", kind, nodeID, slot)
 	return OutboxEntry{}
+}
+
+func (h *haInMemoryHarness) mustAckOutboxEntry(t *testing.T, server *Server, entry OutboxEntry) {
+	t.Helper()
+	snapshot, err := h.store.LoadSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("LoadSnapshot returned error: %v", err)
+	}
+	next, err := server.ackHAOutboxEntry(snapshot, entry)
+	if err != nil {
+		t.Fatalf("ackHAOutboxEntry returned error: %v", err)
+	}
+	if err := server.saveHASnapshot(context.Background(), snapshot.SnapshotVersion, next); err != nil {
+		t.Fatalf("saveHASnapshot returned error: %v", err)
+	}
 }
 
 func runHAFailoverRepairHistory(t *testing.T) haHistoryResult {

@@ -30,12 +30,13 @@ type SmokeLocalOptions struct {
 }
 
 type LocalSmokeReport struct {
-	RunID          string             `json:"run_id"`
-	StartedAt      time.Time          `json:"started_at"`
-	RoutingReadyAt time.Time          `json:"routing_ready_at"`
-	FinishedAt     time.Time          `json:"finished_at"`
-	Sanity         LocalSmokeSanity   `json:"sanity"`
-	LastProgress   LocalSmokeProgress `json:"last_progress"`
+	RunID          string                 `json:"run_id"`
+	StartedAt      time.Time              `json:"started_at"`
+	RoutingReadyAt time.Time              `json:"routing_ready_at"`
+	FinishedAt     time.Time              `json:"finished_at"`
+	Sanity         LocalSmokeSanity       `json:"sanity"`
+	LastProgress   LocalSmokeProgress     `json:"last_progress"`
+	RoutingSummary RoutingProgressSummary `json:"routing_summary"`
 }
 
 type LocalSmokeSanity struct {
@@ -282,6 +283,11 @@ func runLocalSmoke(ctx context.Context, runDir string, state RunState, manifest 
 		_ = collectLocalSmokeArtifacts(manifest, artifactsDir, LocalSmokeReport{RunID: state.RunID, StartedAt: startedAt, LastProgress: localSmokeProgress(lastProgress)})
 		return LocalSmokeReport{}, err
 	}
+	progressRecords, err := readRoutingProgressRecords(progressLogPath)
+	if err != nil {
+		_ = collectLocalSmokeArtifacts(manifest, artifactsDir, LocalSmokeReport{RunID: state.RunID, StartedAt: startedAt, LastProgress: localSmokeProgress(lastProgress)})
+		return LocalSmokeReport{}, fmt.Errorf("read routing progress log: %w", err)
+	}
 
 	sanity, err := runLocalSmokeSanity(processCtx, manifest)
 	report := LocalSmokeReport{
@@ -291,6 +297,7 @@ func runLocalSmoke(ctx context.Context, runDir string, state RunState, manifest 
 		FinishedAt:     time.Now().UTC(),
 		Sanity:         sanity,
 		LastProgress:   localSmokeProgress(lastProgress),
+		RoutingSummary: summarizeRoutingProgressRecords(progressRecords),
 	}
 	if collectErr := collectLocalSmokeArtifacts(manifest, artifactsDir, report); collectErr != nil {
 		if err != nil {

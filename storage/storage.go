@@ -562,6 +562,7 @@ type Node struct {
 }
 
 const defaultWriteCommitTimeout = 5 * time.Second
+const defaultAutoActivationReadyTimeout = 30 * time.Second
 const writeCommitPollInterval = time.Millisecond
 
 type realClock struct{}
@@ -683,7 +684,7 @@ func OpenNode(
 		} else if !errors.Is(err, ErrUnknownReplica) {
 			return nil, fmt.Errorf("err in backend.HighestCommittedSequence: %w", err)
 		}
-		record = node.ensureProtocolState(record)
+		record = ensureProtocolReplicaState(record)
 
 		node.replicas[replica.Assignment.Slot] = record
 	}
@@ -754,7 +755,7 @@ func (n *Node) AddReplicaAsTail(ctx context.Context, cmd AddReplicaAsTailCommand
 		localDataPresent: true,
 		lastKnownState:   ReplicaStatePending,
 	}
-	record = n.ensureProtocolState(record)
+	record = ensureProtocolReplicaState(record)
 	n.setReplicaRecord(cmd.Assignment.Slot, record)
 
 	if sourceNodeID := cmd.Assignment.Peers.PredecessorNodeID; sourceNodeID != "" {
@@ -801,11 +802,13 @@ func (n *Node) AddReplicaAsTail(ctx context.Context, cmd AddReplicaAsTailCommand
 	// Release slot lock before auto-activation which re-acquires it
 	slotMu.Unlock()
 	if autoActivate && n.autoActivateEmptyReplicas {
-		if err := n.activateReplicaOnce(ctx, cmd.Assignment.Slot); err != nil &&
+		activateCtx, cancel := autoActivationReadyContext(ctx)
+		if err := n.activateReplicaOnce(activateCtx, cmd.Assignment.Slot); err != nil &&
 			!errors.Is(err, context.Canceled) &&
 			!errors.Is(err, context.DeadlineExceeded) {
 			n.events.record(n.logger, zerolog.WarnLevel, "auto_activate_failed", "storage replica auto-activation fell back to background activation", ops.IntPtr(cmd.Assignment.Slot), ops.Uint64Ptr(cmd.Assignment.ChainVersion), nil, "", "", err)
 		}
+		cancel()
 	}
 	return nil
 }
@@ -1105,7 +1108,7 @@ func (n *Node) RecoverReplica(ctx context.Context, cmd RecoverReplicaCommand) er
 		localDataPresent:         true,
 		lastKnownState:           ReplicaStateActive,
 	}
-	record = n.ensureProtocolState(record)
+	record = ensureProtocolReplicaState(record)
 	n.setReplicaRecord(cmd.Assignment.Slot, record)
 	if err := n.persistReplica(ctx, record); err != nil {
 		return fmt.Errorf("err in n.persistReplica: %w", err)
@@ -1320,27 +1323,28 @@ func (n *Node) HandleForwardWrite(ctx context.Context, req ForwardWriteRequest) 
 		}
 		return err
 	}
-	record = n.ensureProtocolState(record)
-	if err := validateForwardSource(record, req); err != nil {
+	record = ensureProtocolReplicaState(record)
+	reduction, err := reduceForwardWrite(record, req, slotProtocolBufferLimits{
+		perSlotLimit:    n.maxBufferedReplicaMessagesPerSlot,
+		perNodeLimit:    n.maxBufferedReplicaMessagesPerNode,
+		nodeBufferedNow: n.bufferedReplicaMessagesForNode(),
+	})
+	if err != nil {
 		slotMu.Unlock()
-		return err
-	}
-	if req.Operation.Sequence < record.nextSequence {
-		err := n.handlePastForward(record, req)
-		slotMu.Unlock()
-		return err
-	}
-	if req.Operation.Sequence > record.nextSequence {
-		record, err = n.bufferFutureForward(record, req)
-		if err != nil {
-			slotMu.Unlock()
+		if req.Operation.Sequence > record.nextSequence {
 			n.observeBackpressure(err)
 			if n.metrics != nil {
 				n.metrics.replicationForwards.WithLabelValues("buffer_error").Inc()
 			}
-			return err
 		}
-		n.setReplicaRecord(slot, record)
+		return err
+	}
+	switch reduction.Action {
+	case slotReducerActionIgnore:
+		slotMu.Unlock()
+		return nil
+	case slotReducerActionBuffer:
+		n.setReplicaRecord(slot, reduction.Record)
 		slotMu.Unlock()
 		n.refreshMetricGauges()
 		if n.metrics != nil {
@@ -1350,7 +1354,8 @@ func (n *Node) HandleForwardWrite(ctx context.Context, req ForwardWriteRequest) 
 	}
 
 	// In-order forward: apply state changes under lock, then RPC after unlock
-	err = n.applyForwardLocked(ctx, slotMu, record, req)
+	n.setReplicaRecord(slot, reduction.Record)
+	err = n.applyForwardLocked(ctx, slotMu, reduction.Record, req)
 	if n.metrics != nil {
 		label := "success"
 		if err != nil {
@@ -1376,27 +1381,28 @@ func (n *Node) HandleCommitWrite(ctx context.Context, req CommitWriteRequest) er
 		}
 		return err
 	}
-	record = n.ensureProtocolState(record)
-	if err := validateCommitSource(record, req); err != nil {
+	record = ensureProtocolReplicaState(record)
+	reduction, err := reduceCommitWrite(record, req, slotProtocolBufferLimits{
+		perSlotLimit:    n.maxBufferedReplicaMessagesPerSlot,
+		perNodeLimit:    n.maxBufferedReplicaMessagesPerNode,
+		nodeBufferedNow: n.bufferedReplicaMessagesForNode(),
+	})
+	if err != nil {
 		slotMu.Unlock()
-		return err
-	}
-	if req.Sequence <= record.highestCommittedSequence {
-		err := n.handlePastCommit(record, req)
-		slotMu.Unlock()
-		return err
-	}
-	if req.Sequence > record.highestCommittedSequence+1 || !n.hasCommittableSequence(record, req.Sequence) {
-		record, err = n.bufferFutureCommit(record, req)
-		if err != nil {
-			slotMu.Unlock()
+		if req.Sequence > record.highestCommittedSequence+1 || !reduceHasCommittableSequence(record, req.Sequence) {
 			n.observeBackpressure(err)
 			if n.metrics != nil {
 				n.metrics.replicationCommits.WithLabelValues("buffer_error").Inc()
 			}
-			return err
 		}
-		n.setReplicaRecord(req.Slot, record)
+		return err
+	}
+	switch reduction.Action {
+	case slotReducerActionIgnore:
+		slotMu.Unlock()
+		return nil
+	case slotReducerActionBuffer:
+		n.setReplicaRecord(req.Slot, reduction.Record)
 		slotMu.Unlock()
 		n.refreshMetricGauges()
 		if n.metrics != nil {
@@ -1406,7 +1412,7 @@ func (n *Node) HandleCommitWrite(ctx context.Context, req CommitWriteRequest) er
 	}
 
 	// In-order commit: apply state changes under lock, then RPC after unlock
-	err = n.applyCommitLocked(ctx, slotMu, record, req)
+	err = n.applyCommitLocked(ctx, slotMu, reduction.Record, req)
 	if n.metrics != nil {
 		label := "success"
 		if err != nil {
@@ -1521,7 +1527,7 @@ func (n *Node) StagedSequences(slot int) ([]uint64, error) {
 	if !ok {
 		return nil, fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
 	}
-	record = n.ensureProtocolState(record)
+	record = ensureProtocolReplicaState(record)
 	unique := map[uint64]struct{}{}
 	for sequence := range record.pendingWrites {
 		unique[sequence] = struct{}{}
@@ -1549,7 +1555,7 @@ func (n *Node) BufferedForwardSequences(slot int) ([]uint64, error) {
 	if !ok {
 		return nil, fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
 	}
-	record = n.ensureProtocolState(record)
+	record = ensureProtocolReplicaState(record)
 	sequences := make([]uint64, 0, len(record.bufferedForwards))
 	for sequence := range record.bufferedForwards {
 		sequences = append(sequences, sequence)
@@ -1563,7 +1569,7 @@ func (n *Node) BufferedCommitSequences(slot int) ([]uint64, error) {
 	if !ok {
 		return nil, fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
 	}
-	record = n.ensureProtocolState(record)
+	record = ensureProtocolReplicaState(record)
 	sequences := make([]uint64, 0, len(record.bufferedCommits))
 	for sequence := range record.bufferedCommits {
 		sequences = append(sequences, sequence)
@@ -1895,20 +1901,8 @@ func (n *Node) submitWrite(
 		Value:    value,
 		Metadata: n.nextObjectMetadata(found, current),
 	}
-	record = n.ensurePendingWrites(record)
-	opCopy := cloneWriteOperation(operation)
-	record.pendingWrites[operation.Sequence] = pendingWrite{
-		result: CommitResult{
-			Slot:     slot,
-			Sequence: operation.Sequence,
-			Applied:  true,
-			Metadata: cloneObjectMetadataPtr(&operation.Metadata),
-		},
-		operation: &opCopy,
-	}
-	record = n.addDirtyEntry(record, operation)
-
-	record.nextSequence++
+	submitReduction := reduceSubmitWrite(record, operation)
+	record = submitReduction.Record
 	n.replicas[slot] = record
 	role := record.assignment.Role
 	n.mu.Unlock()
@@ -1943,12 +1937,7 @@ func (n *Node) submitWrite(
 
 	n.releaseClientWrite(slot)
 	releasedAdmission = true
-	return CommitResult{
-		Slot:     slot,
-		Sequence: operation.Sequence,
-		Applied:  true,
-		Metadata: cloneObjectMetadataPtr(&operation.Metadata),
-	}, nil
+	return submitReduction.Result, nil
 }
 
 func (n *Node) activeReplicaRecord(slot int) (replicaRecord, error) {
@@ -2214,8 +2203,8 @@ func (n *Node) commitLocalSequence(ctx context.Context, slot int, sequence uint6
 	record := n.replicas[slot]
 	n.mu.RUnlock()
 
-	record = n.ensureProtocolState(record)
-	operation, err := n.committableOperation(record, sequence)
+	record = ensureProtocolReplicaState(record)
+	operation, err := reduceCommittableOperation(record, sequence)
 	if err != nil {
 		return err
 	}
@@ -2233,13 +2222,7 @@ func (n *Node) commitLocalSequence(ctx context.Context, slot int, sequence uint6
 			return fmt.Errorf("err in n.backend.ApplyCommitted: %w", applyErr)
 		}
 	}
-	record = applied
-	if staged, ok := record.stagedForwards[sequence]; ok {
-		delete(record.stagedForwards, sequence)
-		record = n.recordCommittedForward(record, staged)
-	}
-	delete(record.pendingWrites, sequence)
-	record = n.removeDirtyEntry(record, operation.Key, sequence)
+	record = reduceApplyCommittedSequence(applied, operation, sequence, n.maxBufferedReplicaMessagesPerSlot)
 
 	n.mu.Lock()
 	n.replicas[slot] = record
@@ -2251,34 +2234,18 @@ func (n *Node) commitLocalSequence(ctx context.Context, slot int, sequence uint6
 	return nil
 }
 
-func (n *Node) ensurePendingWrites(record replicaRecord) replicaRecord {
-	if record.pendingWrites == nil {
-		record.pendingWrites = map[uint64]pendingWrite{}
-	}
-	return record
+// Migration shims keep existing tests and call sites pointed at the reducer
+// implementation while storage moves toward slot-owned protocol state.
+func (n *Node) ensureProtocolState(record replicaRecord) replicaRecord {
+	return ensureProtocolReplicaState(record)
 }
 
-func (n *Node) ensureProtocolState(record replicaRecord) replicaRecord {
-	record = n.ensurePendingWrites(record)
-	if record.stagedForwards == nil {
-		record.stagedForwards = map[uint64]ForwardWriteRequest{}
-	}
-	if record.bufferedForwards == nil {
-		record.bufferedForwards = map[uint64]ForwardWriteRequest{}
-	}
-	if record.bufferedCommits == nil {
-		record.bufferedCommits = map[uint64]CommitWriteRequest{}
-	}
-	if record.recentCommittedForwards == nil {
-		record.recentCommittedForwards = map[uint64]ForwardWriteRequest{}
-	}
-	if record.recentCommittedCommits == nil {
-		record.recentCommittedCommits = map[uint64]CommitWriteRequest{}
-	}
-	if record.dirtyByKey == nil {
-		record.dirtyByKey = map[string][]dirtyReadEntry{}
-	}
-	return record
+func (n *Node) bufferFutureForward(record replicaRecord, req ForwardWriteRequest) (replicaRecord, error) {
+	return reduceBufferFutureForward(record, req, slotProtocolBufferLimits{
+		perSlotLimit:    n.maxBufferedReplicaMessagesPerSlot,
+		perNodeLimit:    n.maxBufferedReplicaMessagesPerNode,
+		nodeBufferedNow: n.bufferedReplicaMessagesForNode(),
+	})
 }
 
 func (n *Node) awaitWriteCompletion(ctx context.Context, slot int, sequence uint64) error {
@@ -2351,18 +2318,16 @@ func (n *Node) writeCommitted(slot int, sequence uint64) bool {
 	return record.highestCommittedSequence >= sequence
 }
 
-// applyForwardLocked stages a forward under the slot lock, releases the lock,
-// then sends the outbound RPC (ForwardWrite or CommitWrite) and drains any
-// buffered messages. The caller must hold slotMu; it is always released before
-// this method returns.
+// applyForwardLocked dispatches side effects for an in-order forward. Most
+// callers pass a reducer-updated record, but this helper also preserves the
+// older direct-call contract by staging the forward first when needed.
 func (n *Node) applyForwardLocked(ctx context.Context, slotMu *sync.Mutex, record replicaRecord, req ForwardWriteRequest) error {
 	slot := req.Operation.Slot
-	record = n.ensureProtocolState(record)
-	record.stagedForwards[req.Operation.Sequence] = cloneForwardRequest(req)
-	record = n.addDirtyEntry(record, req.Operation)
-	record.nextSequence++
-	n.setReplicaRecord(slot, record)
-
+	record = ensureProtocolReplicaState(record)
+	if _, ok := record.stagedForwards[req.Operation.Sequence]; !ok {
+		record = reduceStageForward(record, req)
+		n.setReplicaRecord(slot, record)
+	}
 	isTail := record.assignment.Peers.SuccessorNodeID == ""
 	if isTail {
 		if err := n.commitLocalSequence(ctx, slot, req.Operation.Sequence); err != nil {
@@ -2411,7 +2376,6 @@ func (n *Node) applyForwardLocked(ctx context.Context, slotMu *sync.Mutex, recor
 // then sends CommitWrite to the predecessor and drains any buffered messages.
 // The caller must hold slotMu; it is always released before this method returns.
 func (n *Node) applyCommitLocked(ctx context.Context, slotMu *sync.Mutex, record replicaRecord, req CommitWriteRequest) error {
-	record = n.ensureProtocolState(record)
 	if err := n.commitLocalSequence(ctx, req.Slot, req.Sequence); err != nil {
 		slotMu.Unlock()
 		return err
@@ -2422,13 +2386,7 @@ func (n *Node) applyCommitLocked(ctx context.Context, slotMu *sync.Mutex, record
 		slotMu.Unlock()
 		return nil
 	}
-	record = updated
-	record = n.ensureProtocolState(record)
-	record = n.recordCommittedCommit(record, req)
-	if pending, ok := record.pendingWrites[req.Sequence]; ok {
-		pending.completed = true
-		record.pendingWrites[req.Sequence] = pending
-	}
+	record = reduceRecordCommitApplied(updated, req, n.maxBufferedReplicaMessagesPerSlot)
 	n.setReplicaRecord(req.Slot, record)
 
 	predecessorNodeID := record.assignment.Peers.PredecessorNodeID
@@ -2460,9 +2418,9 @@ func (n *Node) drainBufferedReplicaMessages(ctx context.Context, slot int) error
 			slotMu.Unlock()
 			return nil
 		}
-		record = n.ensureProtocolState(record)
+		record = ensureProtocolReplicaState(record)
 		if req, ok := record.bufferedForwards[record.nextSequence]; ok {
-			delete(record.bufferedForwards, record.nextSequence)
+			record = reduceStageForward(record, req)
 			n.setReplicaRecord(slot, record)
 			if err := n.applyForwardLocked(ctx, slotMu, record, req); err != nil {
 				return err
@@ -2470,9 +2428,7 @@ func (n *Node) drainBufferedReplicaMessages(ctx context.Context, slot int) error
 			continue
 		}
 		nextCommit := record.highestCommittedSequence + 1
-		if req, ok := record.bufferedCommits[nextCommit]; ok && n.hasCommittableSequence(record, nextCommit) {
-			delete(record.bufferedCommits, nextCommit)
-			n.setReplicaRecord(slot, record)
+		if req, ok := record.bufferedCommits[nextCommit]; ok && reduceHasCommittableSequence(record, nextCommit) {
 			if err := n.applyCommitLocked(ctx, slotMu, record, req); err != nil {
 				return err
 			}
@@ -2483,118 +2439,8 @@ func (n *Node) drainBufferedReplicaMessages(ctx context.Context, slot int) error
 	}
 }
 
-func (n *Node) handlePastForward(record replicaRecord, req ForwardWriteRequest) error {
-	record = n.ensureProtocolState(record)
-	if staged, ok := record.stagedForwards[req.Operation.Sequence]; ok {
-		if sameForwardRequest(staged, req) {
-			return nil
-		}
-		return fmt.Errorf("%w: slot %d sequence %d forward payload conflict", ErrProtocolConflict, req.Operation.Slot, req.Operation.Sequence)
-	}
-	if committed, ok := record.recentCommittedForwards[req.Operation.Sequence]; ok {
-		if sameForwardRequest(committed, req) {
-			return nil
-		}
-		return fmt.Errorf("%w: slot %d sequence %d committed forward conflict", ErrProtocolConflict, req.Operation.Slot, req.Operation.Sequence)
-	}
-	return fmt.Errorf("%w: slot %d sequence %d is outside retained forward history", ErrSequenceMismatch, req.Operation.Slot, req.Operation.Sequence)
-}
-
-func (n *Node) handlePastCommit(record replicaRecord, req CommitWriteRequest) error {
-	record = n.ensureProtocolState(record)
-	if committed, ok := record.recentCommittedCommits[req.Sequence]; ok {
-		if sameCommitRequest(committed, req) {
-			return nil
-		}
-		return fmt.Errorf("%w: slot %d sequence %d committed ack conflict", ErrProtocolConflict, req.Slot, req.Sequence)
-	}
-	return fmt.Errorf("%w: slot %d sequence %d is outside retained commit history", ErrSequenceMismatch, req.Slot, req.Sequence)
-}
-
-func (n *Node) bufferFutureForward(record replicaRecord, req ForwardWriteRequest) (replicaRecord, error) {
-	record = n.ensureProtocolState(record)
-	if existing, ok := record.bufferedForwards[req.Operation.Sequence]; ok {
-		if sameForwardRequest(existing, req) {
-			return record, nil
-		}
-		return record, fmt.Errorf("%w: slot %d sequence %d buffered forward conflict", ErrProtocolConflict, req.Operation.Slot, req.Operation.Sequence)
-	}
-	if n.totalBufferedMessages(record) >= n.maxBufferedReplicaMessagesPerSlot {
-		return record, newReplicaBackpressureError(req.Operation.Slot, n.totalBufferedMessages(record), n.maxBufferedReplicaMessagesPerSlot)
-	}
-	if n.maxBufferedReplicaMessagesPerNode > 0 && n.bufferedReplicaMessagesForNode() >= n.maxBufferedReplicaMessagesPerNode {
-		return record, newReplicaBackpressureError(req.Operation.Slot, n.bufferedReplicaMessagesForNode(), n.maxBufferedReplicaMessagesPerNode)
-	}
-	record.bufferedForwards[req.Operation.Sequence] = cloneForwardRequest(req)
-	return record, nil
-}
-
-func (n *Node) bufferFutureCommit(record replicaRecord, req CommitWriteRequest) (replicaRecord, error) {
-	record = n.ensureProtocolState(record)
-	if existing, ok := record.bufferedCommits[req.Sequence]; ok {
-		if sameCommitRequest(existing, req) {
-			return record, nil
-		}
-		return record, fmt.Errorf("%w: slot %d sequence %d buffered commit conflict", ErrProtocolConflict, req.Slot, req.Sequence)
-	}
-	if n.totalBufferedMessages(record) >= n.maxBufferedReplicaMessagesPerSlot {
-		return record, newReplicaBackpressureError(req.Slot, n.totalBufferedMessages(record), n.maxBufferedReplicaMessagesPerSlot)
-	}
-	if n.maxBufferedReplicaMessagesPerNode > 0 && n.bufferedReplicaMessagesForNode() >= n.maxBufferedReplicaMessagesPerNode {
-		return record, newReplicaBackpressureError(req.Slot, n.bufferedReplicaMessagesForNode(), n.maxBufferedReplicaMessagesPerNode)
-	}
-	record.bufferedCommits[req.Sequence] = cloneCommitRequest(req)
-	return record, nil
-}
-
-func (n *Node) totalBufferedMessages(record replicaRecord) int {
-	return len(record.bufferedForwards) + len(record.bufferedCommits)
-}
-
-func (n *Node) addDirtyEntry(record replicaRecord, operation WriteOperation) replicaRecord {
-	record = n.ensureProtocolState(record)
-	entries := append([]dirtyReadEntry(nil), record.dirtyByKey[operation.Key]...)
-	for i, entry := range entries {
-		if entry.Sequence == operation.Sequence {
-			entries[i].Operation = cloneWriteOperation(operation)
-			record.dirtyByKey[operation.Key] = entries
-			return record
-		}
-	}
-	entries = append(entries, dirtyReadEntry{
-		Sequence:  operation.Sequence,
-		Operation: cloneWriteOperation(operation),
-	})
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Sequence < entries[j].Sequence
-	})
-	record.dirtyByKey[operation.Key] = entries
-	return record
-}
-
-func (n *Node) removeDirtyEntry(record replicaRecord, key string, sequence uint64) replicaRecord {
-	record = n.ensureProtocolState(record)
-	entries, ok := record.dirtyByKey[key]
-	if !ok {
-		return record
-	}
-	filtered := entries[:0]
-	for _, entry := range entries {
-		if entry.Sequence == sequence {
-			continue
-		}
-		filtered = append(filtered, entry)
-	}
-	if len(filtered) == 0 {
-		delete(record.dirtyByKey, key)
-		return record
-	}
-	record.dirtyByKey[key] = filtered
-	return record
-}
-
 func (n *Node) dirtyEntriesForKey(record replicaRecord, key string) []dirtyReadEntry {
-	record = n.ensureProtocolState(record)
+	record = ensureProtocolReplicaState(record)
 	entries := record.dirtyByKey[key]
 	cloned := make([]dirtyReadEntry, 0, len(entries))
 	for _, entry := range entries {
@@ -2607,57 +2453,8 @@ func (n *Node) dirtyEntriesForKey(record replicaRecord, key string) []dirtyReadE
 }
 
 func dirtyKeyCount(record replicaRecord) int {
+	record = ensureProtocolReplicaState(record)
 	return len(record.dirtyByKey)
-}
-
-func (n *Node) hasStagedForward(record replicaRecord, sequence uint64) bool {
-	record = n.ensureProtocolState(record)
-	_, ok := record.stagedForwards[sequence]
-	return ok
-}
-
-func (n *Node) hasCommittableSequence(record replicaRecord, sequence uint64) bool {
-	if n.hasStagedForward(record, sequence) {
-		return true
-	}
-	record = n.ensurePendingWrites(record)
-	_, ok := record.pendingWrites[sequence]
-	return ok
-}
-
-func (n *Node) committableOperation(record replicaRecord, sequence uint64) (WriteOperation, error) {
-	record = n.ensureProtocolState(record)
-	if pending, ok := record.pendingWrites[sequence]; ok && pending.operation != nil {
-		return cloneWriteOperation(*pending.operation), nil
-	}
-	if staged, ok := record.stagedForwards[sequence]; ok {
-		return cloneWriteOperation(staged.Operation), nil
-	}
-	return WriteOperation{}, fmt.Errorf("%w: slot %d sequence %d is not committable", ErrSequenceMismatch, record.assignment.Slot, sequence)
-}
-
-func (n *Node) recordCommittedForward(record replicaRecord, req ForwardWriteRequest) replicaRecord {
-	record = n.ensureProtocolState(record)
-	record.recentCommittedForwards[req.Operation.Sequence] = cloneForwardRequest(req)
-	record.recentForwardOrder = append(record.recentForwardOrder, req.Operation.Sequence)
-	for len(record.recentForwardOrder) > n.maxBufferedReplicaMessagesPerSlot {
-		evicted := record.recentForwardOrder[0]
-		record.recentForwardOrder = record.recentForwardOrder[1:]
-		delete(record.recentCommittedForwards, evicted)
-	}
-	return record
-}
-
-func (n *Node) recordCommittedCommit(record replicaRecord, req CommitWriteRequest) replicaRecord {
-	record = n.ensureProtocolState(record)
-	record.recentCommittedCommits[req.Sequence] = cloneCommitRequest(req)
-	record.recentCommitOrder = append(record.recentCommitOrder, req.Sequence)
-	for len(record.recentCommitOrder) > n.maxBufferedReplicaMessagesPerSlot {
-		evicted := record.recentCommitOrder[0]
-		record.recentCommitOrder = record.recentCommitOrder[1:]
-		delete(record.recentCommittedCommits, evicted)
-	}
-	return record
 }
 
 func sameForwardRequest(left ForwardWriteRequest, right ForwardWriteRequest) bool {
@@ -2860,7 +2657,33 @@ func (n *Node) waitForReplicaCreationReplay(ctx context.Context, assignment Repl
 		if exists && reflect.DeepEqual(existing.assignment, assignment) && existing.state != ReplicaStateRemoved {
 			return true
 		}
+		persisted, err := n.local.LoadNode(ctx, n.nodeID)
+		if err == nil && persistedReplicaMatchesAssignment(persisted, assignment) {
+			return true
+		}
 		time.Sleep(50 * time.Microsecond)
+	}
+	return false
+}
+
+func autoActivationReadyContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent != nil {
+		if _, ok := parent.Deadline(); !ok {
+			return parent, func() {}
+		}
+	}
+	return context.WithTimeout(context.Background(), defaultAutoActivationReadyTimeout)
+}
+
+func persistedReplicaMatchesAssignment(state PersistedNodeState, assignment ReplicaAssignment) bool {
+	for _, replica := range state.Replicas {
+		if replica.Assignment.Slot != assignment.Slot {
+			continue
+		}
+		if reflect.DeepEqual(replica.Assignment, assignment) && replica.LastKnownState != ReplicaStateRemoved {
+			return true
+		}
+		return false
 	}
 	return false
 }

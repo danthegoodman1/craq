@@ -46,9 +46,12 @@ func Run(t *testing.T, factory Factory) {
 		}
 
 		snapshot := coordserver.HASnapshot{
-			Pending: map[int]coordserver.PendingWork{
-				1: {Slot: 1, NodeID: "n1", Kind: "ready", SlotVersion: 4, Epoch: renewed.Epoch, CommandID: "cmd-1"},
+			State: coordruntime.State{
+				PendingBySlot: map[int]coordruntime.PendingWork{
+					1: {Slot: 1, NodeID: "n1", Kind: coordruntime.PendingKindReady, SlotVersion: 4, CommandID: "cmd-1"},
+				},
 			},
+			PendingEpochBySlot: map[int]uint64{1: renewed.Epoch},
 			Outbox: []coordserver.OutboxEntry{{
 				ID:        "outbox-1",
 				Epoch:     renewed.Epoch,
@@ -265,17 +268,17 @@ func coordserverCloneSnapshot(snapshot coordserver.HASnapshot) coordserver.HASna
 	if cloned.State.AppliedCommands == nil {
 		cloned.State.AppliedCommands = map[string]coordruntime.AppliedCommand{}
 	}
-	if cloned.Pending == nil {
-		cloned.Pending = map[int]coordserver.PendingWork{}
-	}
-	if cloned.Heartbeats == nil {
-		cloned.Heartbeats = map[string]storage.NodeStatus{}
-	}
-	if cloned.Liveness == nil {
-		cloned.Liveness = map[string]coordruntime.NodeLivenessRecord{}
-	}
-	if cloned.UnavailableReplicas == nil {
-		cloned.UnavailableReplicas = map[string]map[int]bool{}
+		if cloned.PendingEpochBySlot == nil {
+			cloned.PendingEpochBySlot = map[int]uint64{}
+		}
+		if cloned.Heartbeats == nil {
+			cloned.Heartbeats = map[string]storage.NodeStatus{}
+		}
+		if cloned.ActivePeerRefresh == nil {
+			cloned.ActivePeerRefresh = map[int]coordserver.HAActivePeerRefreshState{}
+		}
+		if cloned.UnavailableReplicas == nil {
+			cloned.UnavailableReplicas = map[string]map[int]bool{}
 	}
 	if cloned.LastRecoveryReports == nil {
 		cloned.LastRecoveryReports = map[string]storage.NodeRecoveryReport{}

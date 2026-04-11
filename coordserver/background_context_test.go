@@ -122,7 +122,7 @@ func TestBackgroundDispatchCancelsInFlightOutboxWorkOnServerClose(t *testing.T) 
 	}
 
 	observer := newObservingBlockingNodeClient()
-	server.nodes["d"] = observer
+	server.setNodeClient("d", observer)
 
 	dispatchDone := make(chan struct{})
 	go func() {
@@ -152,7 +152,7 @@ func TestHADispatchOutboxAppliesConfiguredDispatchTimeout(t *testing.T) {
 
 	blocking := newBlockingNodeClient("d")
 	blocking.blockAddTail = true
-	h.leader.nodes["d"] = blocking
+	h.leader.setNodeClient("d", blocking)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -179,7 +179,7 @@ func TestHAStepCancelsInFlightOutboxWorkOnServerClose(t *testing.T) {
 	stageHAAddNodeOutbox(t, h)
 
 	observer := newObservingBlockingNodeClient()
-	h.leader.nodes["d"] = observer
+	h.leader.setNodeClient("d", observer)
 
 	errCh := make(chan error, 1)
 	go func() {

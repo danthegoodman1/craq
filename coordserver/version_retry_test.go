@@ -80,7 +80,7 @@ func TestDispatchRuntimeOutboxAndHeartbeatsRetryRuntimeVersionMismatch(t *testin
 
 	timeoutWrapper := newFaultInjectingNodeClient(h.adapters["d"])
 	timeoutWrapper.addTailTimeouts = 1
-	server.nodes["d"] = timeoutWrapper
+	server.setNodeClient("d", timeoutWrapper)
 
 	_, err := server.AddNode(ctx, reconfigureCommand("add-d", 1, coordinator.Event{
 		Kind: coordinator.EventKindAddNode,
@@ -97,15 +97,15 @@ func TestDispatchRuntimeOutboxAndHeartbeatsRetryRuntimeVersionMismatch(t *testin
 	}
 
 	for _, nodeID := range []string{"a", "b", "c"} {
-		server.nodes[nodeID] = &slowNodeClient{
+		server.setNodeClient(nodeID, &slowNodeClient{
 			delegate: h.adapters[nodeID],
 			delay:    dispatchDelay,
-		}
+		})
 	}
-	server.nodes["d"] = &slowNodeClient{
+	server.setNodeClient("d", &slowNodeClient{
 		delegate: h.adapters["d"],
 		delay:    dispatchDelay,
-	}
+	})
 
 	done := make(chan struct{})
 	errCh := make(chan error, 32)

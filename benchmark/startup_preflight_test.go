@@ -2,13 +2,11 @@ package benchmark
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -590,24 +588,7 @@ func (c *latencyInjectingCoordinatorClient) sleep(ctx context.Context) error {
 }
 
 func loadRoutingProgressRecords(path string) ([]routingProgressRecord, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	records := make([]routingProgressRecord, 0, len(lines))
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		var record routingProgressRecord
-		if err := json.Unmarshal([]byte(line), &record); err != nil {
-			return nil, err
-		}
-		records = append(records, record)
-	}
-	return records, nil
+	return readRoutingProgressRecords(path)
 }
 
 func requireBenchmarkCloudShapeSoak(t *testing.T) {
@@ -704,6 +685,7 @@ func assertCloudShapeRoutingProgressHealthy(records []routingProgressRecord, slo
 	maxReadable := 0
 	readableFloor := max(16, slotCount/16)
 	writableFloor := max(8, slotCount/128)
+	pendingDroppedBelowAll := false
 	for _, record := range records {
 		if record.WritableSlots > maxWritable {
 			maxWritable = record.WritableSlots
@@ -711,7 +693,12 @@ func assertCloudShapeRoutingProgressHealthy(records []routingProgressRecord, slo
 		if record.ReadableSlots > maxReadable {
 			maxReadable = record.ReadableSlots
 		}
-		if maxReadable >= readableFloor && record.PendingSlots >= slotCount {
+		if maxReadable >= readableFloor {
+			if record.PendingSlots < slotCount {
+				pendingDroppedBelowAll = true
+			}
+		}
+		if maxReadable >= readableFloor && pendingDroppedBelowAll && record.PendingSlots >= slotCount {
 			return fmt.Errorf("pending work reset to all %d slots after readable routing reached %d", slotCount, maxReadable)
 		}
 		if maxWritable >= writableFloor && record.WritableSlots == 0 {
