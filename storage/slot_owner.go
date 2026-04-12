@@ -29,7 +29,22 @@ type slotRuntime struct {
 	exists bool
 	record replicaRecord
 
-	commitEffectInFlight bool
+	commitEffectInFlight   bool
+	upstreamCommitInFlight bool
+	catchupSyncInFlight    bool
+}
+
+type predecessorSyncPlan struct {
+	sourceNodeID   string
+	sourceTarget   string
+	chainVersion   uint64
+	currentHighest uint64
+}
+
+type predecessorSyncResult struct {
+	plan     predecessorSyncPlan
+	snapshot Snapshot
+	highest  uint64
 }
 
 type slotWriteWaiter struct {
@@ -246,6 +261,206 @@ func (rt *slotRuntime) activeRecord() (replicaRecord, error) {
 	return record, nil
 }
 
+func (rt *slotRuntime) replicationRecord() (replicaRecord, error) {
+	if !rt.exists {
+		return replicaRecord{}, fmt.Errorf("%w: slot %d", ErrUnknownReplica, rt.slot)
+	}
+	record := ensureProtocolReplicaState(rt.record)
+	if record.state != ReplicaStateActive && record.state != ReplicaStateCatchingUp {
+		return replicaRecord{}, fmt.Errorf("%w: slot %d is %q", ErrWriteRejected, rt.slot, record.state)
+	}
+	return record, nil
+}
+
+func (rt *slotRuntime) prepareActivation(ctx context.Context) error {
+	if !rt.exists {
+		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, rt.slot)
+	}
+	record := ensureProtocolReplicaState(rt.record)
+	if record.state != ReplicaStateCatchingUp {
+		return nil
+	}
+	return rt.syncFromPredecessor(ctx)
+}
+
+func (rt *slotRuntime) buildPredecessorSyncPlan() (predecessorSyncPlan, bool, error) {
+	if !rt.exists {
+		return predecessorSyncPlan{}, false, fmt.Errorf("%w: slot %d", ErrUnknownReplica, rt.slot)
+	}
+	record := ensureProtocolReplicaState(rt.record)
+	sourceNodeID := record.assignment.Peers.PredecessorNodeID
+	sourceTarget := record.assignment.Peers.PredecessorTarget
+	if sourceNodeID == "" {
+		return predecessorSyncPlan{}, false, nil
+	}
+	return predecessorSyncPlan{
+		sourceNodeID:   sourceNodeID,
+		sourceTarget:   sourceTarget,
+		chainVersion:   record.assignment.ChainVersion,
+		currentHighest: record.highestCommittedSequence,
+	}, true, nil
+}
+
+func (rt *slotRuntime) fetchPredecessorSnapshot(ctx context.Context, plan predecessorSyncPlan) (Snapshot, uint64, error) {
+	snapshot, highestCommittedSequence, err := rt.node.repl.FetchSnapshot(
+		ctx,
+		peerTransportTarget(plan.sourceTarget, plan.sourceNodeID),
+		rt.slot,
+	)
+	if err != nil {
+		return Snapshot{}, 0, fmt.Errorf("err in n.repl.FetchSnapshot: %w", err)
+	}
+	return snapshot, highestCommittedSequence, nil
+}
+
+func (rt *slotRuntime) reduceSyncedPredecessorState(record replicaRecord, highestCommittedSequence uint64) replicaRecord {
+	record = ensureProtocolReplicaState(record)
+	record.highestCommittedSequence = highestCommittedSequence
+	record.highestUpstreamConfirmedSequence = highestCommittedSequence
+	if nextSequence := highestCommittedSequence + 1; record.nextSequence < nextSequence {
+		record.nextSequence = nextSequence
+	}
+	for sequence := range record.pendingWrites {
+		if sequence <= highestCommittedSequence {
+			delete(record.pendingWrites, sequence)
+		}
+	}
+	for sequence := range record.stagedForwards {
+		if sequence <= highestCommittedSequence {
+			delete(record.stagedForwards, sequence)
+		}
+	}
+	for sequence := range record.bufferedForwards {
+		if sequence <= highestCommittedSequence {
+			delete(record.bufferedForwards, sequence)
+		}
+	}
+	for sequence := range record.bufferedCommits {
+		if sequence <= highestCommittedSequence {
+			delete(record.bufferedCommits, sequence)
+		}
+	}
+	record.dirtyByKey = map[string][]dirtyReadEntry{}
+	for _, pending := range record.pendingWrites {
+		if pending.operation != nil {
+			record = reduceAddDirtyEntry(record, *pending.operation)
+		}
+	}
+	for _, staged := range record.stagedForwards {
+		record = reduceAddDirtyEntry(record, staged.Operation)
+	}
+	return record
+}
+
+func (rt *slotRuntime) applyFetchedPredecessorSnapshot(ctx context.Context, result predecessorSyncResult) error {
+	if !rt.exists {
+		return nil
+	}
+	record := ensureProtocolReplicaState(rt.record)
+	if record.assignment.ChainVersion != result.plan.chainVersion ||
+		record.assignment.Peers.PredecessorNodeID != result.plan.sourceNodeID ||
+		record.assignment.Peers.PredecessorTarget != result.plan.sourceTarget {
+		return nil
+	}
+	if result.highest <= record.highestCommittedSequence {
+		return nil
+	}
+	if err := rt.node.backend.InstallSnapshot(rt.slot, result.snapshot); err != nil {
+		return fmt.Errorf("err in n.backend.InstallSnapshot: %w", err)
+	}
+	if err := rt.node.backend.SetHighestCommittedSequence(rt.slot, result.highest); err != nil {
+		return fmt.Errorf("err in n.backend.SetHighestCommittedSequence: %w", err)
+	}
+	record = rt.reduceSyncedPredecessorState(record, result.highest)
+	rt.setRecord(record)
+	if err := rt.node.persistReplica(ctx, record); err != nil {
+		return fmt.Errorf("err in n.persistReplica: %w", err)
+	}
+	return nil
+}
+
+func (rt *slotRuntime) syncFromPredecessor(ctx context.Context) error {
+	plan, ok, err := rt.buildPredecessorSyncPlan()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	snapshot, highestCommittedSequence, err := rt.fetchPredecessorSnapshot(ctx, plan)
+	if err != nil {
+		return err
+	}
+	if highestCommittedSequence <= plan.currentHighest {
+		return nil
+	}
+	return rt.applyFetchedPredecessorSnapshot(ctx, predecessorSyncResult{
+		plan:     plan,
+		snapshot: snapshot,
+		highest:  highestCommittedSequence,
+	})
+}
+
+func (rt *slotRuntime) hasBufferedGap() bool {
+	if !rt.exists {
+		return false
+	}
+	record := ensureProtocolReplicaState(rt.record)
+	if record.assignment.Peers.PredecessorNodeID == "" {
+		return false
+	}
+	nextSequence := record.highestCommittedSequence + 1
+	for sequence := range record.bufferedForwards {
+		if sequence > nextSequence {
+			return true
+		}
+	}
+	for sequence := range record.bufferedCommits {
+		if sequence > nextSequence {
+			return true
+		}
+	}
+	return false
+}
+
+func (rt *slotRuntime) ensureGapCatchup(ctx context.Context) {
+	if !rt.hasBufferedGap() || rt.catchupSyncInFlight {
+		return
+	}
+	plan, ok, err := rt.buildPredecessorSyncPlan()
+	if err != nil || !ok {
+		return
+	}
+	rt.catchupSyncInFlight = true
+	var result predecessorSyncResult
+	rt.runAsync(func() error {
+		snapshot, highest, err := rt.fetchPredecessorSnapshot(ctx, plan)
+		if err != nil {
+			return err
+		}
+		if highest <= plan.currentHighest {
+			return nil
+		}
+		result = predecessorSyncResult{
+			plan:     plan,
+			snapshot: snapshot,
+			highest:  highest,
+		}
+		return nil
+	}, func(runtime *slotRuntime, err error) {
+		runtime.catchupSyncInFlight = false
+		if err != nil {
+			return
+		}
+		if result.highest > 0 {
+			if err := runtime.applyFetchedPredecessorSnapshot(runtime.backgroundContext(), result); err != nil {
+				return
+			}
+		}
+		runtime.drainReadyBuffered(runtime.backgroundContext(), nil)
+	})
+}
+
 func (rt *slotRuntime) handleSubmitWrite(
 	ctx context.Context,
 	kind OperationKind,
@@ -311,7 +526,7 @@ func (rt *slotRuntime) handleSubmitWrite(
 	switch role {
 	case ReplicaRoleSingle:
 		commitResp := make(chan error, 1)
-		rt.startCommitEffect(ctx, operation.Sequence, commitResp)
+		rt.startCommitEffect(rt.backgroundContext(), ctx, operation.Sequence, commitResp)
 		go func() {
 			select {
 			case <-rt.node.done:
@@ -370,7 +585,7 @@ func (rt *slotRuntime) handleSubmitWrite(
 	}
 }
 
-func (rt *slotRuntime) startCommitEffect(ctx context.Context, sequence uint64, resp chan<- error) {
+func (rt *slotRuntime) startCommitEffect(applyCtx context.Context, resultCtx context.Context, sequence uint64, resp chan<- error) {
 	if !rt.exists {
 		if resp != nil {
 			resp <- fmt.Errorf("%w: slot %d", ErrUnknownReplica, rt.slot)
@@ -391,13 +606,19 @@ func (rt *slotRuntime) startCommitEffect(ctx context.Context, sequence uint64, r
 	if applied.state != ReplicaStateRecovered {
 		applied.lastKnownState = applied.state
 	}
+	applied.highestUpstreamConfirmedSequence = normalizeUpstreamConfirmedSequence(record)
 	persisted := persistedReplica(applied)
 	role := record.assignment.Role
 	stage, recordStage := writeCommitApplyStage(role)
+	commit := DurableCommit{
+		Operation:                 operation,
+		Persisted:                 persisted,
+		UpstreamConfirmedSequence: upstreamConfirmedSequenceForLocalCommit(record, sequence),
+	}
 	rt.commitEffectInFlight = true
 	rt.runAsync(func() error {
 		applyStarted := time.Now()
-		committed, err := rt.node.applyCommittedOperation(ctx, operation, persisted)
+		committed, err := rt.node.applyCommittedOperation(applyCtx, commit)
 		if recordStage {
 			rt.node.observeWriteStage(stage, role, writeStageResult(err), time.Since(applyStarted))
 		}
@@ -410,7 +631,7 @@ func (rt *slotRuntime) startCommitEffect(ctx context.Context, sequence uint64, r
 		return nil
 	}, func(runtime *slotRuntime, err error) {
 		runtime.commitEffectInFlight = false
-		runtime.handleCommitEffectResult(ctx, sequence, operation, nil, err, resp)
+		runtime.handleCommitEffectResult(resultCtx, sequence, operation, nil, err, resp)
 	})
 }
 
@@ -436,6 +657,10 @@ func (rt *slotRuntime) handleCommitEffectResult(
 		if commitReq != nil {
 			record = reduceRecordCommitApplied(record, *commitReq, rt.node.maxBufferedReplicaMessagesPerSlot)
 		}
+		if record.assignment.Peers.PredecessorNodeID == "" {
+			record.highestUpstreamConfirmedSequence = sequence
+			_ = rt.node.recordUpstreamCommitConfirmed(rt.slot, sequence)
+		}
 		rt.setRecord(record)
 		if pending.waiter != nil {
 			pending.waiter.complete(err)
@@ -456,6 +681,12 @@ func (rt *slotRuntime) handleCommitEffectResult(
 		return
 	}
 	record = ensureProtocolReplicaState(rt.record)
+	if ctx != nil && ctx.Err() != nil {
+		if resp != nil {
+			resp <- ctx.Err()
+		}
+		return
+	}
 	predecessorNodeID := record.assignment.Peers.PredecessorNodeID
 	predecessorTarget := record.assignment.Peers.PredecessorTarget
 	if predecessorNodeID == "" {
@@ -485,6 +716,12 @@ func (rt *slotRuntime) handleCommitEffectResult(
 			}
 			return
 		}
+		_ = runtime.node.recordUpstreamCommitConfirmed(runtime.slot, sequence)
+		if runtime.exists {
+			record := runtime.record
+			record.highestUpstreamConfirmedSequence = sequence
+			runtime.setRecord(record)
+		}
 		runtime.drainReadyBuffered(runtime.backgroundContext(), resp)
 	})
 }
@@ -494,7 +731,7 @@ func (rt *slotRuntime) handleForwardWrite(
 	req ForwardWriteRequest,
 	resp chan<- error,
 ) {
-	record, err := rt.activeRecord()
+	record, err := rt.replicationRecord()
 	if err != nil {
 		resp <- err
 		return
@@ -534,11 +771,65 @@ func (rt *slotRuntime) handleForwardWrite(
 	case slotReducerActionBuffer:
 		rt.setRecord(reduction.Record)
 		rt.node.refreshMetricGauges()
+		rt.ensureGapCatchup(rt.backgroundContext())
 		resp <- nil
 		return
 	}
 	rt.setRecord(reduction.Record)
 	rt.applyForward(ctx, req, resp)
+}
+
+func (rt *slotRuntime) handleForwardWriteAccepted(
+	ctx context.Context,
+	req ForwardWriteRequest,
+	resp chan<- error,
+) {
+	record, err := rt.replicationRecord()
+	if err != nil {
+		resp <- err
+		return
+	}
+	if record.assignment.Peers.SuccessorNodeID == "" && rt.commitEffectInFlight && req.Operation.Sequence == record.nextSequence {
+		buffered, err := reduceBufferFutureForward(record, req, slotProtocolBufferLimits{
+			perSlotLimit:    rt.node.maxBufferedReplicaMessagesPerSlot,
+			perNodeLimit:    rt.node.maxBufferedReplicaMessagesPerNode,
+			nodeBufferedNow: rt.node.bufferedReplicaMessagesForNode(),
+		})
+		if err != nil {
+			rt.node.observeBackpressure(err)
+			resp <- err
+			return
+		}
+		rt.setRecord(buffered)
+		rt.node.refreshMetricGauges()
+		resp <- nil
+		return
+	}
+	reduction, err := reduceForwardWrite(record, req, slotProtocolBufferLimits{
+		perSlotLimit:    rt.node.maxBufferedReplicaMessagesPerSlot,
+		perNodeLimit:    rt.node.maxBufferedReplicaMessagesPerNode,
+		nodeBufferedNow: rt.node.bufferedReplicaMessagesForNode(),
+	})
+	if err != nil {
+		if req.Operation.Sequence > record.nextSequence {
+			rt.node.observeBackpressure(err)
+		}
+		resp <- err
+		return
+	}
+	switch reduction.Action {
+	case slotReducerActionIgnore:
+		resp <- nil
+		return
+	case slotReducerActionBuffer:
+		rt.setRecord(reduction.Record)
+		rt.node.refreshMetricGauges()
+		rt.ensureGapCatchup(rt.backgroundContext())
+		resp <- nil
+		return
+	}
+	rt.setRecord(reduction.Record)
+	rt.applyForwardAccepted(ctx, req, resp)
 }
 
 func (rt *slotRuntime) applyForward(
@@ -552,7 +843,7 @@ func (rt *slotRuntime) applyForward(
 	}
 	record := ensureProtocolReplicaState(rt.record)
 	if record.assignment.Peers.SuccessorNodeID == "" {
-		rt.startCommitEffect(ctx, req.Operation.Sequence, resp)
+		rt.startCommitEffect(rt.backgroundContext(), ctx, req.Operation.Sequence, resp)
 		return
 	}
 	role := record.assignment.Role
@@ -583,7 +874,100 @@ func (rt *slotRuntime) applyForward(
 	})
 }
 
+func (rt *slotRuntime) applyForwardAccepted(
+	ctx context.Context,
+	req ForwardWriteRequest,
+	resp chan<- error,
+) {
+	if !rt.exists {
+		resp <- fmt.Errorf("%w: slot %d", ErrUnknownReplica, rt.slot)
+		return
+	}
+	record := ensureProtocolReplicaState(rt.record)
+	if record.assignment.Peers.SuccessorNodeID == "" {
+		rt.startCommitEffect(rt.backgroundContext(), rt.backgroundContext(), req.Operation.Sequence, nil)
+		resp <- nil
+		return
+	}
+	role := record.assignment.Role
+	successorNodeID := record.assignment.Peers.SuccessorNodeID
+	successorTarget := record.assignment.Peers.SuccessorTarget
+	forwardReq := ForwardWriteRequest{
+		Operation:    cloneWriteOperation(req.Operation),
+		FromNodeID:   rt.node.nodeID,
+		ChainVersion: record.assignment.ChainVersion,
+	}
+	rt.runAsync(func() error {
+		forwardStarted := time.Now()
+		err := rt.node.repl.ForwardWrite(
+			ctx,
+			peerTransportTarget(successorTarget, successorNodeID),
+			forwardReq,
+		)
+		rt.node.observeWriteStage(writeStageForwardAcceptRPC, role, writeStageResult(err), time.Since(forwardStarted))
+		return err
+	}, func(_ *slotRuntime, err error) {
+		if err != nil {
+			resp <- fmt.Errorf("err in n.repl.ForwardWrite: %w", err)
+			return
+		}
+		resp <- nil
+	})
+}
+
 func (rt *slotRuntime) handleCommitWrite(
+	ctx context.Context,
+	req CommitWriteRequest,
+	resp chan<- error,
+) {
+	record, err := rt.replicationRecord()
+	if err != nil {
+		resp <- err
+		return
+	}
+	if rt.commitEffectInFlight && req.Sequence == record.highestCommittedSequence+1 {
+		buffered, err := reduceBufferFutureCommit(record, req, slotProtocolBufferLimits{
+			perSlotLimit:    rt.node.maxBufferedReplicaMessagesPerSlot,
+			perNodeLimit:    rt.node.maxBufferedReplicaMessagesPerNode,
+			nodeBufferedNow: rt.node.bufferedReplicaMessagesForNode(),
+		})
+		if err != nil {
+			rt.node.observeBackpressure(err)
+			resp <- err
+			return
+		}
+		rt.setRecord(buffered)
+		rt.node.refreshMetricGauges()
+		resp <- nil
+		return
+	}
+	reduction, err := reduceCommitWrite(record, req, slotProtocolBufferLimits{
+		perSlotLimit:    rt.node.maxBufferedReplicaMessagesPerSlot,
+		perNodeLimit:    rt.node.maxBufferedReplicaMessagesPerNode,
+		nodeBufferedNow: rt.node.bufferedReplicaMessagesForNode(),
+	})
+	if err != nil {
+		if req.Sequence > record.highestCommittedSequence+1 || !reduceHasCommittableSequence(record, req.Sequence) {
+			rt.node.observeBackpressure(err)
+		}
+		resp <- err
+		return
+	}
+	switch reduction.Action {
+	case slotReducerActionIgnore:
+		resp <- nil
+		return
+	case slotReducerActionBuffer:
+		rt.setRecord(reduction.Record)
+		rt.node.refreshMetricGauges()
+		rt.ensureGapCatchup(rt.backgroundContext())
+		resp <- nil
+		return
+	}
+	rt.applyCommit(ctx, req, resp)
+}
+
+func (rt *slotRuntime) handleCommitWriteAccepted(
 	ctx context.Context,
 	req CommitWriteRequest,
 	resp chan<- error,
@@ -628,10 +1012,11 @@ func (rt *slotRuntime) handleCommitWrite(
 	case slotReducerActionBuffer:
 		rt.setRecord(reduction.Record)
 		rt.node.refreshMetricGauges()
+		rt.ensureGapCatchup(rt.backgroundContext())
 		resp <- nil
 		return
 	}
-	rt.applyCommit(ctx, req, resp)
+	rt.applyCommitAccepted(ctx, req, resp)
 }
 
 func (rt *slotRuntime) applyCommit(
@@ -659,14 +1044,20 @@ func (rt *slotRuntime) applyCommit(
 	if applied.state != ReplicaStateRecovered {
 		applied.lastKnownState = applied.state
 	}
+	applied.highestUpstreamConfirmedSequence = normalizeUpstreamConfirmedSequence(record)
 	persisted := persistedReplica(applied)
 	reqCopy := req
 	role := record.assignment.Role
 	stage, recordStage := writeCommitApplyStage(role)
+	commit := DurableCommit{
+		Operation:                 operation,
+		Persisted:                 persisted,
+		UpstreamConfirmedSequence: upstreamConfirmedSequenceForLocalCommit(record, req.Sequence),
+	}
 	rt.commitEffectInFlight = true
 	rt.runAsync(func() error {
 		applyStarted := time.Now()
-		committed, err := rt.node.applyCommittedOperation(ctx, operation, persisted)
+		committed, err := rt.node.applyCommittedOperation(rt.backgroundContext(), commit)
 		if recordStage {
 			rt.node.observeWriteStage(stage, role, writeStageResult(err), time.Since(applyStarted))
 		}
@@ -680,6 +1071,83 @@ func (rt *slotRuntime) applyCommit(
 	}, func(runtime *slotRuntime, err error) {
 		runtime.commitEffectInFlight = false
 		runtime.handleCommitEffectResult(ctx, req.Sequence, operation, &reqCopy, err, resp)
+	})
+}
+
+func (rt *slotRuntime) applyCommitAccepted(
+	ctx context.Context,
+	req CommitWriteRequest,
+	resp chan<- error,
+) {
+	if !rt.exists {
+		resp <- fmt.Errorf("%w: slot %d", ErrUnknownReplica, rt.slot)
+		return
+	}
+	record := ensureProtocolReplicaState(rt.record)
+	operation, err := reduceCommittableOperation(record, req.Sequence)
+	if err != nil {
+		resp <- err
+		return
+	}
+	applied := record
+	applied.highestCommittedSequence = req.Sequence
+	applied.localDataPresent = true
+	if applied.state != ReplicaStateRecovered {
+		applied.lastKnownState = applied.state
+	}
+	applied.highestUpstreamConfirmedSequence = normalizeUpstreamConfirmedSequence(record)
+	reqCopy := req
+	role := record.assignment.Role
+	stage, recordStage := writeCommitApplyStage(role)
+	commit := DurableCommit{
+		Operation:                 operation,
+		Persisted:                 persistedReplica(applied),
+		UpstreamConfirmedSequence: upstreamConfirmedSequenceForLocalCommit(record, req.Sequence),
+	}
+	rt.commitEffectInFlight = true
+	rt.runAsync(func() error {
+		applyStarted := time.Now()
+		committed, err := rt.node.applyCommittedOperation(rt.backgroundContext(), commit)
+		if recordStage {
+			rt.node.observeWriteStage(stage, role, writeStageResult(err), time.Since(applyStarted))
+		}
+		if committed && err != nil {
+			return err
+		}
+		if !committed {
+			return err
+		}
+		return nil
+	}, func(runtime *slotRuntime, err error) {
+		runtime.commitEffectInFlight = false
+		if !runtime.exists {
+			resp <- fmt.Errorf("%w: slot %d", ErrUnknownReplica, runtime.slot)
+			return
+		}
+		record := ensureProtocolReplicaState(runtime.record)
+		pending := record.pendingWrites[req.Sequence]
+		committed := err == nil || runtime.node.writeActuallyCommitted(runtime.slot, req.Sequence)
+		if committed {
+			record = reduceApplyCommittedSequence(record, operation, req.Sequence, runtime.node.maxBufferedReplicaMessagesPerSlot)
+			record = reduceRecordCommitApplied(record, reqCopy, runtime.node.maxBufferedReplicaMessagesPerSlot)
+			if record.assignment.Peers.PredecessorNodeID == "" {
+				record.highestUpstreamConfirmedSequence = req.Sequence
+				_ = runtime.node.recordUpstreamCommitConfirmed(runtime.slot, req.Sequence)
+			}
+			runtime.setRecord(record)
+			if pending.waiter != nil {
+				pending.waiter.complete(err)
+			}
+		} else if pending.waiter != nil {
+			pending.waiter.complete(err)
+		}
+		if err != nil {
+			resp <- err
+			return
+		}
+		resp <- nil
+		runtime.ensureUpstreamCommitReplay(runtime.backgroundContext())
+		runtime.drainReadyBuffered(runtime.backgroundContext(), nil)
 	})
 }
 
@@ -735,9 +1203,65 @@ func (rt *slotRuntime) drainReadyBuffered(ctx context.Context, resp chan<- error
 		rt.applyCommit(ctx, req, resp)
 		return
 	}
+	rt.ensureGapCatchup(rt.backgroundContext())
 	if resp != nil {
 		resp <- nil
 	}
+}
+
+func (rt *slotRuntime) ensureUpstreamCommitReplay(ctx context.Context) {
+	if !rt.exists || rt.upstreamCommitInFlight {
+		return
+	}
+	record := ensureProtocolReplicaState(rt.record)
+	if record.assignment.Peers.PredecessorNodeID == "" {
+		if record.highestUpstreamConfirmedSequence != record.highestCommittedSequence {
+			record.highestUpstreamConfirmedSequence = record.highestCommittedSequence
+			rt.setRecord(record)
+			_ = rt.node.recordUpstreamCommitConfirmed(rt.slot, record.highestCommittedSequence)
+		}
+		return
+	}
+	nextSequence := record.highestUpstreamConfirmedSequence + 1
+	if nextSequence == 0 || nextSequence > record.highestCommittedSequence {
+		return
+	}
+	predecessorNodeID := record.assignment.Peers.PredecessorNodeID
+	predecessorTarget := record.assignment.Peers.PredecessorTarget
+	role := record.assignment.Role
+	req := CommitWriteRequest{
+		Slot:         rt.slot,
+		Sequence:     nextSequence,
+		FromNodeID:   rt.node.nodeID,
+		ChainVersion: record.assignment.ChainVersion,
+	}
+	rt.upstreamCommitInFlight = true
+	rt.runAsync(func() error {
+		started := time.Now()
+		err := rt.node.repl.CommitWrite(
+			ctx,
+			peerTransportTarget(predecessorTarget, predecessorNodeID),
+			req,
+		)
+		rt.node.observeWriteStage(writeStageCommitUpstreamAcceptRPC, role, writeStageResult(err), time.Since(started))
+		return err
+	}, func(runtime *slotRuntime, err error) {
+		runtime.upstreamCommitInFlight = false
+		if err != nil {
+			runtime.node.events.record(runtime.node.logger, zerolog.ErrorLevel, "replication_commit_replay_failed", "storage upstream commit replay failed", &runtime.slot, nil, &nextSequence, predecessorNodeID, "", err)
+			return
+		}
+		_ = runtime.node.recordUpstreamCommitConfirmed(runtime.slot, nextSequence)
+		if !runtime.exists {
+			return
+		}
+		record := runtime.record
+		if nextSequence > record.highestUpstreamConfirmedSequence {
+			record.highestUpstreamConfirmedSequence = nextSequence
+			runtime.setRecord(record)
+		}
+		runtime.ensureUpstreamCommitReplay(runtime.backgroundContext())
+	})
 }
 
 func (rt *slotRuntime) releaseClientWrite() {
@@ -883,11 +1407,12 @@ func (rt *slotRuntime) addReplicaAsTail(ctx context.Context, cmd AddReplicaAsTai
 	}()
 
 	record := replicaRecord{
-		assignment:       cloneAssignment(cmd.Assignment),
-		state:            ReplicaStatePending,
-		nextSequence:     1,
-		localDataPresent: true,
-		lastKnownState:   ReplicaStatePending,
+		assignment:                       cloneAssignment(cmd.Assignment),
+		state:                            ReplicaStatePending,
+		nextSequence:                     1,
+		localDataPresent:                 true,
+		lastKnownState:                   ReplicaStatePending,
+		highestUpstreamConfirmedSequence: 0,
 	}
 	record = ensureProtocolReplicaState(record)
 	rt.setRecord(record)
@@ -911,6 +1436,7 @@ func (rt *slotRuntime) addReplicaAsTail(ctx context.Context, cmd AddReplicaAsTai
 			return false, fmt.Errorf("err in n.backend.SetHighestCommittedSequence: %w", err)
 		}
 		record.highestCommittedSequence = highestCommittedSequence
+		record.highestUpstreamConfirmedSequence = highestCommittedSequence
 		record.nextSequence = highestCommittedSequence + 1
 		autoActivate = len(snapshot) == 0 && highestCommittedSequence == 0
 	}
@@ -951,6 +1477,7 @@ func (rt *slotRuntime) activateReplicaReady(ctx context.Context) error {
 		return fmt.Errorf("err in n.persistReplica: %w", err)
 	}
 	rt.node.events.record(rt.node.logger, zerolog.InfoLevel, "activate_replica", "storage replica activated", &rt.slot, &record.assignment.ChainVersion, nil, "", "", nil)
+	rt.drainReadyBuffered(rt.backgroundContext(), nil)
 	return nil
 }
 
@@ -1009,6 +1536,9 @@ func (rt *slotRuntime) updateChainPeers(ctx context.Context, assignment ReplicaA
 	if reflect.DeepEqual(record.assignment, assignment) {
 		return nil
 	}
+	if record.assignment.ChainVersion != assignment.ChainVersion || record.assignment.Peers.PredecessorNodeID != assignment.Peers.PredecessorNodeID {
+		record.highestUpstreamConfirmedSequence = record.highestCommittedSequence
+	}
 	record.assignment = cloneAssignment(assignment)
 	if record.state != ReplicaStateRecovered {
 		record.lastKnownState = record.state
@@ -1017,7 +1547,13 @@ func (rt *slotRuntime) updateChainPeers(ctx context.Context, assignment ReplicaA
 	if err := rt.node.persistReplica(ctx, record); err != nil {
 		return fmt.Errorf("err in n.persistReplica: %w", err)
 	}
+	if record.highestUpstreamConfirmedSequence == record.highestCommittedSequence {
+		_ = rt.node.recordUpstreamCommitConfirmed(rt.slot, record.highestCommittedSequence)
+	}
 	rt.node.events.record(rt.node.logger, zerolog.InfoLevel, "update_chain_peers", "storage replica peers updated", &assignment.Slot, &assignment.ChainVersion, nil, "", "", nil)
+	if record.state == ReplicaStateActive {
+		rt.ensureUpstreamCommitReplay(rt.backgroundContext())
+	}
 	return nil
 }
 
@@ -1044,6 +1580,7 @@ func (rt *slotRuntime) resumeRecoveredReplica(ctx context.Context, cmd ResumeRec
 		return fmt.Errorf("err in n.persistReplica: %w", err)
 	}
 	rt.node.events.record(rt.node.logger, zerolog.InfoLevel, "resume_recovered_replica", "storage recovered replica resumed", &cmd.Assignment.Slot, &cmd.Assignment.ChainVersion, nil, "", "", nil)
+	rt.ensureUpstreamCommitReplay(rt.backgroundContext())
 	return nil
 }
 
@@ -1078,12 +1615,13 @@ func (rt *slotRuntime) recoverReplica(ctx context.Context, cmd RecoverReplicaCom
 		return fmt.Errorf("err in n.backend.SetHighestCommittedSequence: %w", err)
 	}
 	record := replicaRecord{
-		assignment:               cloneAssignment(cmd.Assignment),
-		state:                    ReplicaStateActive,
-		nextSequence:             highestCommittedSequence + 1,
-		highestCommittedSequence: highestCommittedSequence,
-		localDataPresent:         true,
-		lastKnownState:           ReplicaStateActive,
+		assignment:                       cloneAssignment(cmd.Assignment),
+		state:                            ReplicaStateActive,
+		nextSequence:                     highestCommittedSequence + 1,
+		highestCommittedSequence:         highestCommittedSequence,
+		highestUpstreamConfirmedSequence: highestCommittedSequence,
+		localDataPresent:                 true,
+		lastKnownState:                   ReplicaStateActive,
 	}
 	record = ensureProtocolReplicaState(record)
 	rt.setRecord(record)
@@ -1212,6 +1750,10 @@ func (n *Node) submitWriteOwned(
 	if response.waiter == nil {
 		return response.result, nil
 	}
+	if err := ctx.Err(); err != nil {
+		n.releaseClientWriteOwned(owner)
+		return CommitResult{}, fmt.Errorf("%w: %w", ErrWriteTimeout, err)
+	}
 	waitCtx, cancel := withDefaultTimeout(ctx, n.writeCommitTimeout)
 	defer cancel()
 	waitStarted := time.Now()
@@ -1259,11 +1801,91 @@ func (n *Node) handleForwardWriteOwned(ctx context.Context, req ForwardWriteRequ
 	}
 }
 
+func (n *Node) drainBufferedOwned(owner *slotOwner) error {
+	for attempt := 0; attempt < 64; attempt++ {
+		respCh := make(chan error, 1)
+		if err := owner.dispatch(n.runtimeCtx, func(runtime *slotRuntime) {
+			runtime.drainReadyBuffered(runtime.backgroundContext(), respCh)
+		}); err != nil {
+			return err
+		}
+		select {
+		case <-n.done:
+			return context.Canceled
+		case err := <-respCh:
+			if err != nil {
+				return err
+			}
+		}
+		type slotDrainStatus struct {
+			busy bool
+		}
+		statusCh := make(chan slotDrainStatus, 1)
+		if err := owner.dispatch(n.runtimeCtx, func(runtime *slotRuntime) {
+			record := ensureProtocolReplicaState(runtime.record)
+			statusCh <- slotDrainStatus{
+				busy: runtime.commitEffectInFlight ||
+					runtime.upstreamCommitInFlight ||
+					runtime.catchupSyncInFlight ||
+					len(record.bufferedForwards) > 0 ||
+					len(record.bufferedCommits) > 0,
+			}
+		}); err != nil {
+			return err
+		}
+		select {
+		case <-n.done:
+			return context.Canceled
+		case status := <-statusCh:
+			if !status.busy {
+				return nil
+			}
+		}
+		time.Sleep(50 * time.Microsecond)
+	}
+	return nil
+}
+
 func (n *Node) handleCommitWriteOwned(ctx context.Context, req CommitWriteRequest) error {
 	owner := n.ensureSlotOwner(req.Slot)
 	respCh := make(chan error, 1)
 	if err := owner.dispatch(n.runtimeCtx, func(runtime *slotRuntime) {
 		runtime.handleCommitWrite(ctx, req, respCh)
+	}); err != nil {
+		return err
+	}
+	select {
+	case <-n.done:
+		return context.Canceled
+	case err := <-respCh:
+		if err != nil {
+			return err
+		}
+		return n.drainBufferedOwned(owner)
+	}
+}
+
+func (n *Node) handleForwardWriteAcceptedOwned(ctx context.Context, req ForwardWriteRequest) error {
+	owner := n.ensureSlotOwner(req.Operation.Slot)
+	respCh := make(chan error, 1)
+	if err := owner.dispatch(n.runtimeCtx, func(runtime *slotRuntime) {
+		runtime.handleForwardWriteAccepted(ctx, req, respCh)
+	}); err != nil {
+		return err
+	}
+	select {
+	case <-n.done:
+		return context.Canceled
+	case err := <-respCh:
+		return err
+	}
+}
+
+func (n *Node) handleCommitWriteAcceptedOwned(ctx context.Context, req CommitWriteRequest) error {
+	owner := n.ensureSlotOwner(req.Slot)
+	respCh := make(chan error, 1)
+	if err := owner.dispatch(n.runtimeCtx, func(runtime *slotRuntime) {
+		runtime.handleCommitWriteAccepted(ctx, req, respCh)
 	}); err != nil {
 		return err
 	}
@@ -1308,16 +1930,30 @@ func (n *Node) addReplicaAsTailOwned(ctx context.Context, cmd AddReplicaAsTailCo
 
 func (n *Node) activateReplicaOwned(ctx context.Context, slot int) error {
 	if err := n.beginReplicaActivation(slot); err != nil {
-		if errors.Is(err, errReplicaAlreadyActive) {
+		if errors.Is(err, errReplicaAlreadyActive) || errors.Is(err, errReplicaActivationInFlight) {
 			return nil
 		}
 		return err
 	}
 	defer n.endReplicaActivation(slot)
+	owner := n.ensureSlotOwner(slot)
+	prepareCh := make(chan error, 1)
+	if err := owner.dispatch(n.runtimeCtx, func(runtime *slotRuntime) {
+		prepareCh <- runtime.prepareActivation(ctx)
+	}); err != nil {
+		return err
+	}
+	select {
+	case <-n.done:
+		return context.Canceled
+	case err := <-prepareCh:
+		if err != nil {
+			return err
+		}
+	}
 	if err := n.coord.ReportReplicaReady(ctx, slot, n.HighestAcceptedCoordinatorEpoch()); err != nil {
 		return fmt.Errorf("err in n.coord.ReportReplicaReady: %w", err)
 	}
-	owner := n.ensureSlotOwner(slot)
 	respCh := make(chan error, 1)
 	if err := owner.dispatch(n.runtimeCtx, func(runtime *slotRuntime) {
 		respCh <- runtime.activateReplicaReady(ctx)

@@ -306,6 +306,7 @@ func storageRPCPlane(fullMethod string) rpcPlane {
 		return rpcPlaneStorageControl
 	case "/craq.v1.StorageService/ForwardWrite",
 		"/craq.v1.StorageService/CommitWrite",
+		"/craq.v1.StorageService/Replicate",
 		"/craq.v1.StorageService/FetchSnapshot",
 		"/craq.v1.StorageService/FetchCommittedSequence":
 		return rpcPlaneStorageReplica

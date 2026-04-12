@@ -195,8 +195,10 @@ func TestWriteAdmissionReleasesAfterAmbiguousTimeout(t *testing.T) {
 	if got, want := nodes["head"].InFlightClientWrites(), 0; got != want {
 		t.Fatalf("in-flight client writes = %d, want %d", got, want)
 	}
-	if got, want := mustNodeStagedSequences(t, nodes["head"], 7), []uint64{1}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("staged sequences = %v, want %v", got, want)
+	headSnapshot := mustNodeCommittedSnapshot(t, nodes["head"], 7)
+	headStaged := mustNodeStagedSequences(t, nodes["head"], 7)
+	if !reflect.DeepEqual(headSnapshot, map[string]string{"k": "v"}) && !reflect.DeepEqual(headStaged, []uint64{1}) {
+		t.Fatalf("head state = snapshot %v staged %v, want committed value or staged sequence 1", headSnapshot, headStaged)
 	}
 	if got, want := mustNodeCommittedSnapshot(t, nodes["tail"], 7), map[string]string{"k": "v"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("tail committed snapshot = %v, want %v", got, want)

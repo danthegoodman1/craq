@@ -120,6 +120,21 @@ type Backend interface {
 	Close() error
 }
 
+type batchCommitBackend interface {
+	ApplyCommittedBatch(ctx context.Context, nodeID string, commits []DurableCommit) error
+}
+
+type upstreamConfirmationBackend interface {
+	HighestUpstreamConfirmedSequence(slot int) (uint64, error)
+	SetHighestUpstreamConfirmedSequence(slot int, sequence uint64) error
+}
+
+type DurableCommit struct {
+	Operation                 WriteOperation
+	Persisted                 PersistedReplica
+	UpstreamConfirmedSequence uint64
+}
+
 type LocalStateStore interface {
 	LoadNode(ctx context.Context, nodeID string) (PersistedNodeState, error)
 	UpsertReplica(ctx context.Context, nodeID string, replica PersistedReplica) error
@@ -435,10 +450,11 @@ type NodeStatus struct {
 }
 
 type PersistedReplica struct {
-	Assignment               ReplicaAssignment
-	LastKnownState           ReplicaState
-	HighestCommittedSequence uint64
-	HasCommittedData         bool
+	Assignment                       ReplicaAssignment
+	LastKnownState                   ReplicaState
+	HighestCommittedSequence         uint64
+	HighestUpstreamConfirmedSequence uint64
+	HasCommittedData                 bool
 }
 
 type PersistedNodeState struct {
@@ -501,22 +517,24 @@ type DropRecoveredReplicaCommand struct {
 }
 
 type replicaRecord struct {
-	assignment               ReplicaAssignment
-	state                    ReplicaState
-	nextSequence             uint64
-	highestCommittedSequence uint64
-	localDataPresent         bool
-	lastKnownState           ReplicaState
-	pendingWrites            map[uint64]pendingWrite
-	stagedForwards           map[uint64]ForwardWriteRequest
-	bufferedForwards         map[uint64]ForwardWriteRequest
-	bufferedCommits          map[uint64]CommitWriteRequest
-	recentCommittedForwards  map[uint64]ForwardWriteRequest
-	recentCommittedCommits   map[uint64]CommitWriteRequest
-	recentForwardOrder       []uint64
-	recentCommitOrder        []uint64
-	dirtyByKey               map[string][]dirtyReadEntry
-	inFlightClientWrites     int
+	assignment                       ReplicaAssignment
+	state                            ReplicaState
+	nextSequence                     uint64
+	highestCommittedSequence         uint64
+	highestUpstreamConfirmedSequence uint64
+	localDataPresent                 bool
+	lastKnownState                   ReplicaState
+	pendingWrites                    map[uint64]pendingWrite
+	expectedCommitSources            map[uint64]expectedCommitSource
+	stagedForwards                   map[uint64]ForwardWriteRequest
+	bufferedForwards                 map[uint64]ForwardWriteRequest
+	bufferedCommits                  map[uint64]CommitWriteRequest
+	recentCommittedForwards          map[uint64]ForwardWriteRequest
+	recentCommittedCommits           map[uint64]CommitWriteRequest
+	recentForwardOrder               []uint64
+	recentCommitOrder                []uint64
+	dirtyByKey                       map[string][]dirtyReadEntry
+	inFlightClientWrites             int
 }
 
 type pendingWrite struct {
@@ -524,6 +542,11 @@ type pendingWrite struct {
 	result    CommitResult
 	operation *WriteOperation
 	waiter    *slotWriteWaiter
+}
+
+type expectedCommitSource struct {
+	FromNodeID   string
+	ChainVersion uint64
 }
 
 type dirtyReadEntry struct {
@@ -569,6 +592,7 @@ type Node struct {
 	metrics                           *nodeMetrics
 	events                            *eventRecorder
 	autoActivateEmptyReplicas         bool
+	commitEngine                      *durableCommitEngine
 }
 
 const defaultWriteCommitTimeout = 5 * time.Second
@@ -665,6 +689,7 @@ func OpenNode(
 		done:                              make(chan struct{}),
 	}
 	node.runtimeCtx, node.runtimeCancel = context.WithCancel(context.Background())
+	node.commitEngine = newDurableCommitEngine(node)
 	if node.maxBufferedReplicaMessagesPerSlot == 0 {
 		node.maxBufferedReplicaMessagesPerSlot = 64
 	}
@@ -682,12 +707,13 @@ func OpenNode(
 	node.highestAcceptedCoordinatorEpoch = persisted.HighestAcceptedCoordinatorEpoch
 	for _, replica := range persisted.Replicas {
 		record := replicaRecord{
-			assignment:               cloneAssignment(replica.Assignment),
-			state:                    ReplicaStateRecovered,
-			nextSequence:             replica.HighestCommittedSequence + 1,
-			highestCommittedSequence: replica.HighestCommittedSequence,
-			localDataPresent:         false,
-			lastKnownState:           replica.LastKnownState,
+			assignment:                       cloneAssignment(replica.Assignment),
+			state:                            ReplicaStateRecovered,
+			nextSequence:                     replica.HighestCommittedSequence + 1,
+			highestCommittedSequence:         replica.HighestCommittedSequence,
+			highestUpstreamConfirmedSequence: replica.HighestUpstreamConfirmedSequence,
+			localDataPresent:                 false,
+			lastKnownState:                   replica.LastKnownState,
 		}
 
 		if sequence, err := backend.HighestCommittedSequence(replica.Assignment.Slot); err == nil {
@@ -697,6 +723,15 @@ func OpenNode(
 		} else if !errors.Is(err, ErrUnknownReplica) {
 			return nil, fmt.Errorf("err in backend.HighestCommittedSequence: %w", err)
 		}
+		if upstreamBackend, ok := backend.(upstreamConfirmationBackend); ok {
+			sequence, err := upstreamBackend.HighestUpstreamConfirmedSequence(replica.Assignment.Slot)
+			if err == nil {
+				record.highestUpstreamConfirmedSequence = sequence
+			} else if !errors.Is(err, ErrUnknownReplica) {
+				return nil, fmt.Errorf("err in backend.HighestUpstreamConfirmedSequence: %w", err)
+			}
+		}
+		record.highestUpstreamConfirmedSequence = normalizeUpstreamConfirmedSequence(record)
 		record = ensureProtocolReplicaState(record)
 
 		node.publishReplicaSnapshotLocked(replica.Assignment.Slot, publishedReplicaFromRecord(record))
@@ -850,6 +885,9 @@ func (n *Node) Close() error {
 		if n.runtimeCancel != nil {
 			n.runtimeCancel()
 		}
+		if n.commitEngine != nil {
+			n.commitEngine.close()
+		}
 		if n.done != nil {
 			close(n.done)
 		}
@@ -999,6 +1037,21 @@ func (n *Node) HandleForwardWrite(ctx context.Context, req ForwardWriteRequest) 
 	return err
 }
 
+func (n *Node) AcceptForwardWrite(ctx context.Context, req ForwardWriteRequest) error {
+	err := n.handleForwardWriteAcceptedOwned(ctx, req)
+	if n.metrics != nil {
+		label := "success"
+		if err != nil {
+			label = "error"
+		}
+		n.metrics.replicationForwards.WithLabelValues(label).Inc()
+	}
+	if err != nil {
+		n.events.record(n.logger, zerolog.ErrorLevel, "replication_forward_failed", "storage forward write accept failed", ops.IntPtr(req.Operation.Slot), nil, ops.Uint64Ptr(req.Operation.Sequence), req.FromNodeID, "", err)
+	}
+	return err
+}
+
 func (n *Node) HandleCommitWrite(ctx context.Context, req CommitWriteRequest) error {
 	err := n.handleCommitWriteOwned(ctx, req)
 	if n.metrics != nil {
@@ -1010,6 +1063,21 @@ func (n *Node) HandleCommitWrite(ctx context.Context, req CommitWriteRequest) er
 	}
 	if err != nil {
 		n.events.record(n.logger, zerolog.ErrorLevel, "replication_commit_failed", "storage commit write failed", ops.IntPtr(req.Slot), nil, ops.Uint64Ptr(req.Sequence), req.FromNodeID, "", err)
+	}
+	return err
+}
+
+func (n *Node) AcceptCommitWrite(ctx context.Context, req CommitWriteRequest) error {
+	err := n.handleCommitWriteAcceptedOwned(ctx, req)
+	if n.metrics != nil {
+		label := "success"
+		if err != nil {
+			label = "error"
+		}
+		n.metrics.replicationCommits.WithLabelValues(label).Inc()
+	}
+	if err != nil {
+		n.events.record(n.logger, zerolog.ErrorLevel, "replication_commit_failed", "storage commit write accept failed", ops.IntPtr(req.Slot), nil, ops.Uint64Ptr(req.Sequence), req.FromNodeID, "", err)
 	}
 	return err
 }
@@ -1051,6 +1119,30 @@ func validateForwardSource(record replicaRecord, req ForwardWriteRequest) error 
 func validateCommitSource(record replicaRecord, req CommitWriteRequest) error {
 	expectedNodeID := record.assignment.Peers.SuccessorNodeID
 	expectedChainVersion := record.assignment.ChainVersion
+	if expected, ok := record.expectedCommitSources[req.Sequence]; ok && expected.FromNodeID != "" {
+		if expected.FromNodeID != req.FromNodeID {
+			return fmt.Errorf(
+				"%w: slot %d expected successor %q, got %q",
+				ErrPeerMismatch,
+				req.Slot,
+				expected.FromNodeID,
+				req.FromNodeID,
+			)
+		}
+		if expected.ChainVersion == req.ChainVersion {
+			return nil
+		}
+		if record.assignment.Peers.SuccessorNodeID == req.FromNodeID && record.assignment.ChainVersion == req.ChainVersion {
+			return nil
+		}
+		return fmt.Errorf(
+			"%w: slot %d expected chain version %d, got %d",
+			ErrPeerMismatch,
+			req.Slot,
+			expected.ChainVersion,
+			req.ChainVersion,
+		)
+	}
 	if existing, ok := record.bufferedCommits[req.Sequence]; ok {
 		expectedNodeID = existing.FromNodeID
 		expectedChainVersion = existing.ChainVersion

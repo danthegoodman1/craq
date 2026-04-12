@@ -49,6 +49,10 @@ func reduceSubmitWrite(record replicaRecord, operation WriteOperation) slotSubmi
 		},
 		operation: &opCopy,
 	}
+	record.expectedCommitSources[operation.Sequence] = expectedCommitSource{
+		FromNodeID:   record.assignment.Peers.SuccessorNodeID,
+		ChainVersion: record.assignment.ChainVersion,
+	}
 	record = reduceAddDirtyEntry(record, operation)
 	record.nextSequence++
 	return slotSubmitReduction{
@@ -131,6 +135,7 @@ func reduceApplyCommittedSequence(
 		delete(record.stagedForwards, sequence)
 		record = reduceRecordCommittedForward(record, staged, retentionLimit)
 	}
+	delete(record.expectedCommitSources, sequence)
 	delete(record.pendingWrites, sequence)
 	record = reduceRemoveDirtyEntry(record, operation.Key, sequence)
 	return record
@@ -143,6 +148,10 @@ func reduceStageForward(record replicaRecord, req ForwardWriteRequest) replicaRe
 		return record
 	}
 	record.stagedForwards[req.Operation.Sequence] = cloneForwardRequest(req)
+	record.expectedCommitSources[req.Operation.Sequence] = expectedCommitSource{
+		FromNodeID:   record.assignment.Peers.SuccessorNodeID,
+		ChainVersion: record.assignment.ChainVersion,
+	}
 	record = reduceAddDirtyEntry(record, req.Operation)
 	record.nextSequence++
 	return record
@@ -166,6 +175,9 @@ func reduceRecordCommitApplied(
 func ensureProtocolReplicaState(record replicaRecord) replicaRecord {
 	if record.pendingWrites == nil {
 		record.pendingWrites = map[uint64]pendingWrite{}
+	}
+	if record.expectedCommitSources == nil {
+		record.expectedCommitSources = map[uint64]expectedCommitSource{}
 	}
 	if record.stagedForwards == nil {
 		record.stagedForwards = map[uint64]ForwardWriteRequest{}

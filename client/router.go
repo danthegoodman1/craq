@@ -146,6 +146,16 @@ func (r *Router) getWithSnapshot(
 	}
 	readReplicaCount := routeReadReplicaCount(route)
 	if !route.Readable || readReplicaCount == 0 {
+		if allowRefresh {
+			if refreshErr := r.Refresh(ctx); refreshErr != nil {
+				return storage.ReadResult{}, refreshErr
+			}
+			refreshed, loadErr := r.loadedSnapshot()
+			if loadErr != nil {
+				return storage.ReadResult{}, loadErr
+			}
+			return r.getWithSnapshot(ctx, key, consistency, refreshed, false)
+		}
 		return storage.ReadResult{}, fmt.Errorf("%w: slot %d is not readable", ErrNoRoute, route.Slot)
 	}
 	start := r.nextReadStart(route.Slot, readReplicaCount)
@@ -239,6 +249,16 @@ func (r *Router) putWithSnapshot(
 		return storage.CommitResult{}, err
 	}
 	if !route.Writable || route.HeadNodeID == "" {
+		if allowRefresh {
+			if refreshErr := r.Refresh(ctx); refreshErr != nil {
+				return storage.CommitResult{}, refreshErr
+			}
+			refreshed, loadErr := r.loadedSnapshot()
+			if loadErr != nil {
+				return storage.CommitResult{}, loadErr
+			}
+			return r.putWithSnapshot(ctx, key, value, conditions, refreshed, false)
+		}
 		return storage.CommitResult{}, fmt.Errorf("%w: slot %d is not writable", ErrNoRoute, route.Slot)
 	}
 	result, err := r.transport.Put(ctx, routeTarget(route.HeadEndpoint, route.HeadNodeID), storage.ClientPutRequest{
@@ -276,6 +296,16 @@ func (r *Router) deleteWithSnapshot(
 		return storage.CommitResult{}, err
 	}
 	if !route.Writable || route.HeadNodeID == "" {
+		if allowRefresh {
+			if refreshErr := r.Refresh(ctx); refreshErr != nil {
+				return storage.CommitResult{}, refreshErr
+			}
+			refreshed, loadErr := r.loadedSnapshot()
+			if loadErr != nil {
+				return storage.CommitResult{}, loadErr
+			}
+			return r.deleteWithSnapshot(ctx, key, conditions, refreshed, false)
+		}
 		return storage.CommitResult{}, fmt.Errorf("%w: slot %d is not writable", ErrNoRoute, route.Slot)
 	}
 	result, err := r.transport.Delete(ctx, routeTarget(route.HeadEndpoint, route.HeadNodeID), storage.ClientDeleteRequest{

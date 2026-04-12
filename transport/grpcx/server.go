@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"sync"
 
 	"github.com/danthegoodman1/craq/coordinator"
 	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
@@ -13,7 +15,9 @@ import (
 	"github.com/danthegoodman1/craq/storage"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 type CoordinatorGRPCServer struct {
@@ -453,6 +457,86 @@ func (s *StorageGRPCServer) CommitWrite(ctx context.Context, req *grpcproto.Comm
 		return nil, encodeError(err)
 	}
 	return &grpcproto.Empty{}, nil
+}
+
+func (s *StorageGRPCServer) Replicate(stream grpcproto.StorageService_ReplicateServer) error {
+	var sendMu sync.Mutex
+	var workers sync.WaitGroup
+	defer workers.Wait()
+
+	sendAck := func(requestID uint64, err error) error {
+		frame := &grpcproto.ReplicationFrame{
+			RequestId: requestID,
+			Payload: &grpcproto.ReplicationFrame_Ack{
+				Ack: &grpcproto.ReplicationAck{
+					Success:      err == nil,
+					EncodedError: marshalEncodedError(err),
+				},
+			},
+		}
+		sendMu.Lock()
+		defer sendMu.Unlock()
+		return stream.Send(frame)
+	}
+
+	for {
+		frame, err := stream.Recv()
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		workers.Add(1)
+		go func(frame *grpcproto.ReplicationFrame) {
+			defer workers.Done()
+			var handleErr error
+			switch payload := frame.GetPayload().(type) {
+			case *grpcproto.ReplicationFrame_ForwardWrite:
+				req := payload.ForwardWrite
+				if s.authorizer != nil {
+					if authErr := s.authorizer.requireStorageIdentityMatch(stream.Context(), req.FromNodeId); authErr != nil {
+						handleErr = authErr
+						break
+					}
+				}
+				handleErr = s.node.AcceptForwardWrite(stream.Context(), storage.ForwardWriteRequest{
+					Operation: storage.WriteOperation{
+						Slot:     int(req.Operation.Slot),
+						Sequence: req.Operation.Sequence,
+						Kind:     storage.OperationKind(req.Operation.Kind),
+						Key:      req.Operation.Key,
+						Value:    req.Operation.Value,
+						Metadata: derefObjectMetadata(fromProtoObjectMetadata(req.Operation.Metadata)),
+					},
+					FromNodeID:   req.FromNodeId,
+					ChainVersion: req.ChainVersion,
+				})
+			case *grpcproto.ReplicationFrame_CommitWrite:
+				req := payload.CommitWrite
+				if s.authorizer != nil {
+					if authErr := s.authorizer.requireStorageIdentityMatch(stream.Context(), req.FromNodeId); authErr != nil {
+						handleErr = authErr
+						break
+					}
+				}
+				handleErr = s.node.AcceptCommitWrite(stream.Context(), storage.CommitWriteRequest{
+					Slot:         int(req.Slot),
+					Sequence:     req.Sequence,
+					FromNodeID:   req.FromNodeId,
+					ChainVersion: req.ChainVersion,
+				})
+			default:
+				handleErr = status.Error(codes.InvalidArgument, "replication frame payload required")
+			}
+			if ackErr := sendAck(frame.GetRequestId(), handleErr); ackErr != nil && !errors.Is(ackErr, context.Canceled) {
+				s.logger.Debug().Err(ackErr).Msg("replication stream ack failed")
+			}
+		}(frame)
+	}
 }
 
 func (s *StorageGRPCServer) FetchSnapshot(req *grpcproto.FetchSnapshotRequest, stream grpcproto.StorageService_FetchSnapshotServer) error {

@@ -15,9 +15,10 @@ type stagedOperation struct {
 }
 
 type replicaData struct {
-	committed        Snapshot
-	staged           map[uint64]stagedOperation
-	highestCommitted uint64
+	committed                Snapshot
+	staged                   map[uint64]stagedOperation
+	highestCommitted         uint64
+	highestUpstreamConfirmed uint64
 }
 
 type InMemoryBackend struct {
@@ -91,44 +92,75 @@ func (b *InMemoryBackend) SetHighestCommittedSequence(slot int, sequence uint64)
 		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
 	}
 	replica.highestCommitted = sequence
+	replica.highestUpstreamConfirmed = sequence
 	replica.staged = map[uint64]stagedOperation{}
 	return nil
 }
 
 func (b *InMemoryBackend) ApplyCommitted(ctx context.Context, nodeID string, operation WriteOperation, persisted *PersistedReplica) error {
+	upstreamConfirmed := operation.Sequence
+	if persisted != nil {
+		upstreamConfirmed = persisted.HighestUpstreamConfirmedSequence
+	}
+	return b.ApplyCommittedBatch(ctx, nodeID, []DurableCommit{{
+		Operation:                 operation,
+		UpstreamConfirmedSequence: upstreamConfirmed,
+	}})
+}
+
+func (b *InMemoryBackend) ApplyCommittedBatch(_ context.Context, _ string, commits []DurableCommit) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	replica, exists := b.replicas[operation.Slot]
+	for _, commit := range commits {
+		replica, exists := b.replicas[commit.Operation.Slot]
+		if !exists {
+			return fmt.Errorf("%w: slot %d", ErrUnknownReplica, commit.Operation.Slot)
+		}
+		if commit.Operation.Sequence != replica.highestCommitted+1 {
+			return fmt.Errorf(
+				"%w: slot %d expected commit sequence %d, got %d",
+				ErrSequenceMismatch,
+				commit.Operation.Slot,
+				replica.highestCommitted+1,
+				commit.Operation.Sequence,
+			)
+		}
+		switch commit.Operation.Kind {
+		case OperationKindPut:
+			replica.committed[commit.Operation.Key] = CommittedObject{
+				Value:    commit.Operation.Value,
+				Metadata: cloneObjectMetadata(commit.Operation.Metadata),
+			}
+		case OperationKindDelete:
+			delete(replica.committed, commit.Operation.Key)
+		default:
+			return fmt.Errorf("%w: unsupported operation kind %q", ErrInvalidConfig, commit.Operation.Kind)
+		}
+		delete(replica.staged, commit.Operation.Sequence)
+		replica.highestCommitted = commit.Operation.Sequence
+		replica.highestUpstreamConfirmed = commit.UpstreamConfirmedSequence
+	}
+	return nil
+}
+
+func (b *InMemoryBackend) HighestUpstreamConfirmedSequence(slot int) (uint64, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	replica, exists := b.replicas[slot]
 	if !exists {
-		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, operation.Slot)
+		return 0, fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
 	}
-	if operation.Sequence != replica.highestCommitted+1 {
-		return fmt.Errorf(
-			"%w: slot %d expected commit sequence %d, got %d",
-			ErrSequenceMismatch,
-			operation.Slot,
-			replica.highestCommitted+1,
-			operation.Sequence,
-		)
+	return replica.highestUpstreamConfirmed, nil
+}
+
+func (b *InMemoryBackend) SetHighestUpstreamConfirmedSequence(slot int, sequence uint64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	replica, exists := b.replicas[slot]
+	if !exists {
+		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
 	}
-	switch operation.Kind {
-	case OperationKindPut:
-		replica.committed[operation.Key] = CommittedObject{
-			Value:    operation.Value,
-			Metadata: cloneObjectMetadata(operation.Metadata),
-		}
-	case OperationKindDelete:
-		delete(replica.committed, operation.Key)
-	default:
-		return fmt.Errorf("%w: unsupported operation kind %q", ErrInvalidConfig, operation.Kind)
-	}
-	delete(replica.staged, operation.Sequence)
-	replica.highestCommitted = operation.Sequence
-	if persisted != nil && b.local != nil {
-		if err := b.local.UpsertReplica(ctx, nodeID, *persisted); err != nil {
-			return fmt.Errorf("err in b.local.UpsertReplica: %w", err)
-		}
-	}
+	replica.highestUpstreamConfirmed = sequence
 	return nil
 }
 
@@ -217,6 +249,7 @@ func (b *InMemoryBackend) CommitSequence(slot int, sequence uint64) error {
 	}
 	delete(replica.staged, sequence)
 	replica.highestCommitted = sequence
+	replica.highestUpstreamConfirmed = sequence
 	return nil
 }
 
@@ -789,10 +822,11 @@ func (t *QueuedInMemoryReplicationTransport) DeliverAll(ctx context.Context) err
 
 func clonePersistedReplica(replica PersistedReplica) PersistedReplica {
 	return PersistedReplica{
-		Assignment:               cloneAssignment(replica.Assignment),
-		LastKnownState:           replica.LastKnownState,
-		HighestCommittedSequence: replica.HighestCommittedSequence,
-		HasCommittedData:         replica.HasCommittedData,
+		Assignment:                       cloneAssignment(replica.Assignment),
+		LastKnownState:                   replica.LastKnownState,
+		HighestCommittedSequence:         replica.HighestCommittedSequence,
+		HighestUpstreamConfirmedSequence: replica.HighestUpstreamConfirmedSequence,
+		HasCommittedData:                 replica.HasCommittedData,
 	}
 }
 

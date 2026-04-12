@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -741,6 +742,7 @@ func runReplicationHistory(t *testing.T) replicationHistory {
 }
 
 type scriptedTransport struct {
+	mu         sync.Mutex
 	forwardErr error
 	commitErr  error
 	forwards   []ForwardWriteRequest
@@ -756,17 +758,23 @@ func (t *scriptedTransport) FetchCommittedSequence(_ context.Context, _ string, 
 }
 
 func (t *scriptedTransport) ForwardWrite(_ context.Context, _ string, req ForwardWriteRequest) error {
+	t.mu.Lock()
 	t.forwards = append(t.forwards, req)
-	if t.forwardErr != nil {
-		return t.forwardErr
+	err := t.forwardErr
+	t.mu.Unlock()
+	if err != nil {
+		return err
 	}
 	return nil
 }
 
 func (t *scriptedTransport) CommitWrite(_ context.Context, _ string, req CommitWriteRequest) error {
+	t.mu.Lock()
 	t.commits = append(t.commits, req)
-	if t.commitErr != nil {
-		return t.commitErr
+	err := t.commitErr
+	t.mu.Unlock()
+	if err != nil {
+		return err
 	}
 	return nil
 }

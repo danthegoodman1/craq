@@ -298,7 +298,7 @@ func TestCRAQBufferedFutureForwardIsNotReadVisibleUntilContiguousAndTailCommitte
 	}); err != nil {
 		t.Fatalf("contiguous HandleForwardWrite returned error: %v", err)
 	}
-	if err := repl.DeliverNext(ctx); err != nil {
+	if err := deliverQueuedForward(t, ctx, repl, "tail", 16, 2); err != nil {
 		t.Fatalf("DeliverNext(seq2 to tail) returned error: %v", err)
 	}
 

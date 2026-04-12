@@ -3,41 +3,44 @@ package storage
 import "sort"
 
 type publishedReplicaSnapshot struct {
-	assignment               ReplicaAssignment
-	state                    ReplicaState
-	lastKnownState           ReplicaState
-	highestCommittedSequence uint64
-	localDataPresent         bool
-	inFlightClientWrites     int
-	bufferedForwards         int
-	bufferedCommits          int
-	dirtyKeyCount            int
+	assignment                       ReplicaAssignment
+	state                            ReplicaState
+	lastKnownState                   ReplicaState
+	highestCommittedSequence         uint64
+	highestUpstreamConfirmedSequence uint64
+	localDataPresent                 bool
+	inFlightClientWrites             int
+	bufferedForwards                 int
+	bufferedCommits                  int
+	dirtyKeyCount                    int
 }
 
 func publishedReplicaFromRecord(record replicaRecord) publishedReplicaSnapshot {
 	record = ensureProtocolReplicaState(record)
 	return publishedReplicaSnapshot{
-		assignment:               cloneAssignment(record.assignment),
-		state:                    record.state,
-		lastKnownState:           record.lastKnownState,
-		highestCommittedSequence: record.highestCommittedSequence,
-		localDataPresent:         record.localDataPresent,
-		inFlightClientWrites:     record.inFlightClientWrites,
-		bufferedForwards:         len(record.bufferedForwards),
-		bufferedCommits:          len(record.bufferedCommits),
-		dirtyKeyCount:            dirtyKeyCount(record),
+		assignment:                       cloneAssignment(record.assignment),
+		state:                            record.state,
+		lastKnownState:                   record.lastKnownState,
+		highestCommittedSequence:         record.highestCommittedSequence,
+		highestUpstreamConfirmedSequence: record.highestUpstreamConfirmedSequence,
+		localDataPresent:                 record.localDataPresent,
+		inFlightClientWrites:             record.inFlightClientWrites,
+		bufferedForwards:                 len(record.bufferedForwards),
+		bufferedCommits:                  len(record.bufferedCommits),
+		dirtyKeyCount:                    dirtyKeyCount(record),
 	}
 }
 
 func replicaRecordFromPublished(snapshot publishedReplicaSnapshot) replicaRecord {
 	return ensureProtocolReplicaState(replicaRecord{
-		assignment:               cloneAssignment(snapshot.assignment),
-		state:                    snapshot.state,
-		nextSequence:             snapshot.highestCommittedSequence + 1,
-		highestCommittedSequence: snapshot.highestCommittedSequence,
-		localDataPresent:         snapshot.localDataPresent,
-		lastKnownState:           snapshot.lastKnownState,
-		inFlightClientWrites:     snapshot.inFlightClientWrites,
+		assignment:                       cloneAssignment(snapshot.assignment),
+		state:                            snapshot.state,
+		nextSequence:                     snapshot.highestCommittedSequence + 1,
+		highestCommittedSequence:         snapshot.highestCommittedSequence,
+		highestUpstreamConfirmedSequence: snapshot.highestUpstreamConfirmedSequence,
+		localDataPresent:                 snapshot.localDataPresent,
+		lastKnownState:                   snapshot.lastKnownState,
+		inFlightClientWrites:             snapshot.inFlightClientWrites,
 	})
 }
 

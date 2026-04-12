@@ -374,6 +374,8 @@ func (s *Server) RoutingSnapshot(ctx context.Context) (RoutingSnapshot, error) {
 			return RoutingSnapshot{}, err
 		}
 	}
+	s.syncViewsFromRuntime()
+	s.rebuildRoutingSnapshot()
 	s.routingSnapshotMu.RLock()
 	defer s.routingSnapshotMu.RUnlock()
 	return cloneRoutingSnapshot(s.routingSnapshot), nil

@@ -42,8 +42,8 @@ func TestOpenNodeRestoresRecoveredReplicaAndResumePreservesSequence(t *testing.T
 	if err != nil {
 		t.Fatalf("LoadNode returned error: %v", err)
 	}
-	if got, want := persisted.Replicas[0].HighestCommittedSequence, uint64(1); got != want {
-		t.Fatalf("persisted highest committed sequence = %d, want %d", got, want)
+	if got, want := persisted.Replicas[0].HighestCommittedSequence, uint64(0); got != want {
+		t.Fatalf("persisted highest committed sequence = %d, want %d (commit sequence now rehydrates from backend metadata on reopen)", got, want)
 	}
 	if got, want := persisted.Replicas[0].LastKnownState, ReplicaStateActive; got != want {
 		t.Fatalf("persisted last-known state = %q, want %q", got, want)

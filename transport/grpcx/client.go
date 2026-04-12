@@ -526,14 +526,20 @@ func (f *DynamicNodeClientFactory) ClientForNode(node coordinator.Node) (coordse
 }
 
 type ReplicationTransport struct {
-	pool *ConnPool
+	pool     *ConnPool
+	mu       sync.Mutex
+	sessions map[string]*replicationPeerSession
+	nextID   uint64
 }
 
 func NewReplicationTransport(pool *ConnPool) *ReplicationTransport {
 	if pool == nil {
 		pool = NewConnPool()
 	}
-	return &ReplicationTransport{pool: pool}
+	return &ReplicationTransport{
+		pool:     pool,
+		sessions: map[string]*replicationPeerSession{},
+	}
 }
 
 func (t *ReplicationTransport) FetchSnapshot(ctx context.Context, fromTarget string, slot int) (storage.Snapshot, uint64, error) {
@@ -581,37 +587,11 @@ func (t *ReplicationTransport) FetchCommittedSequence(ctx context.Context, fromT
 }
 
 func (t *ReplicationTransport) ForwardWrite(ctx context.Context, toTarget string, req storage.ForwardWriteRequest) error {
-	conn, err := t.pool.DialContext(ctx, toTarget)
-	if err != nil {
-		return err
-	}
-	_, err = grpcproto.NewStorageServiceClient(conn).ForwardWrite(ctx, &grpcproto.ForwardWriteRequest{
-		Operation: &grpcproto.WriteOperation{
-			Slot:     int32(req.Operation.Slot),
-			Sequence: req.Operation.Sequence,
-			Kind:     string(req.Operation.Kind),
-			Key:      req.Operation.Key,
-			Value:    req.Operation.Value,
-			Metadata: protoObjectMetadata(&req.Operation.Metadata),
-		},
-		FromNodeId:   req.FromNodeID,
-		ChainVersion: req.ChainVersion,
-	})
-	return decodeError(err)
+	return t.submitReplicationRequest(ctx, toTarget, replicationForwardPayload{req: req})
 }
 
 func (t *ReplicationTransport) CommitWrite(ctx context.Context, toTarget string, req storage.CommitWriteRequest) error {
-	conn, err := t.pool.DialContext(ctx, toTarget)
-	if err != nil {
-		return err
-	}
-	_, err = grpcproto.NewStorageServiceClient(conn).CommitWrite(ctx, &grpcproto.CommitWriteRequest{
-		Slot:         int32(req.Slot),
-		Sequence:     req.Sequence,
-		FromNodeId:   req.FromNodeID,
-		ChainVersion: req.ChainVersion,
-	})
-	return decodeError(err)
+	return t.submitReplicationRequest(ctx, toTarget, replicationCommitPayload{req: req})
 }
 
 type ClientTransport struct {

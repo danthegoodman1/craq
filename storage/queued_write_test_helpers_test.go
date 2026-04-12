@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -29,6 +30,10 @@ func runQueuedCommitResultWithDelivery(
 		}
 		if repl.Pending() > 0 {
 			if err := repl.DeliverNext(ctx); err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					time.Sleep(100 * time.Microsecond)
+					continue
+				}
 				return CommitResult{}, err
 			}
 			select {

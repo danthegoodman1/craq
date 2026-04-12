@@ -27,6 +27,12 @@ func cloneReplicaRecord(record replicaRecord) replicaRecord {
 			cloned.stagedForwards[sequence] = cloneForwardRequest(req)
 		}
 	}
+	if record.expectedCommitSources != nil {
+		cloned.expectedCommitSources = make(map[uint64]expectedCommitSource, len(record.expectedCommitSources))
+		for sequence, source := range record.expectedCommitSources {
+			cloned.expectedCommitSources[sequence] = source
+		}
+	}
 	if record.bufferedForwards != nil {
 		cloned.bufferedForwards = make(map[uint64]ForwardWriteRequest, len(record.bufferedForwards))
 		for sequence, req := range record.bufferedForwards {
@@ -90,27 +96,51 @@ func (n *Node) persistReplica(ctx context.Context, record replicaRecord) error {
 
 func persistedReplica(record replicaRecord) PersistedReplica {
 	return PersistedReplica{
-		Assignment:               cloneAssignment(record.assignment),
-		LastKnownState:           record.lastKnownState,
-		HighestCommittedSequence: record.highestCommittedSequence,
-		HasCommittedData:         record.localDataPresent,
+		Assignment:                       cloneAssignment(record.assignment),
+		LastKnownState:                   record.lastKnownState,
+		HighestCommittedSequence:         record.highestCommittedSequence,
+		HighestUpstreamConfirmedSequence: normalizeUpstreamConfirmedSequence(record),
+		HasCommittedData:                 record.localDataPresent,
 	}
 }
 
-func (n *Node) applyCommittedOperation(
-	ctx context.Context,
-	operation WriteOperation,
-	persisted PersistedReplica,
-) (bool, error) {
-	applyErr := n.backend.ApplyCommitted(ctx, n.nodeID, operation, &persisted)
-	if applyErr != nil {
-		highestCommitted, err := n.backend.HighestCommittedSequence(operation.Slot)
-		if err != nil || highestCommitted != operation.Sequence {
-			return false, fmt.Errorf("err in n.backend.ApplyCommitted: %w", applyErr)
-		}
-		return true, fmt.Errorf("err in n.backend.ApplyCommitted: %w", applyErr)
+func normalizeUpstreamConfirmedSequence(record replicaRecord) uint64 {
+	if record.assignment.Role == ReplicaRoleHead || record.assignment.Role == ReplicaRoleSingle || record.assignment.Peers.PredecessorNodeID == "" {
+		return record.highestCommittedSequence
 	}
-	return true, nil
+	if record.highestUpstreamConfirmedSequence > record.highestCommittedSequence {
+		return record.highestCommittedSequence
+	}
+	return record.highestUpstreamConfirmedSequence
+}
+
+func upstreamConfirmedSequenceForLocalCommit(record replicaRecord, sequence uint64) uint64 {
+	if record.assignment.Role == ReplicaRoleHead || record.assignment.Role == ReplicaRoleSingle || record.assignment.Peers.PredecessorNodeID == "" {
+		return sequence
+	}
+	confirmed := normalizeUpstreamConfirmedSequence(record)
+	if confirmed > sequence {
+		return sequence
+	}
+	return confirmed
+}
+
+func (n *Node) applyCommittedOperation(ctx context.Context, commit DurableCommit) (bool, error) {
+	if commit.UpstreamConfirmedSequence > commit.Operation.Sequence {
+		commit.UpstreamConfirmedSequence = commit.Operation.Sequence
+	}
+	if commit.UpstreamConfirmedSequence == 0 && (commit.Persisted.Assignment.Role == ReplicaRoleHead || commit.Persisted.Assignment.Role == ReplicaRoleSingle || commit.Persisted.Assignment.Peers.PredecessorNodeID == "") {
+		commit.UpstreamConfirmedSequence = commit.Operation.Sequence
+	}
+	committed, applyErr := n.commitEngine.submit(ctx, commit)
+	if applyErr != nil {
+		highestCommitted, err := n.backend.HighestCommittedSequence(commit.Operation.Slot)
+		if err != nil || highestCommitted != commit.Operation.Sequence {
+			return committed, fmt.Errorf("err in n.commitEngine.submit: %w", applyErr)
+		}
+		return true, fmt.Errorf("err in n.commitEngine.submit: %w", applyErr)
+	}
+	return committed, nil
 }
 
 func (n *Node) writeActuallyCommitted(slot int, sequence uint64) bool {
@@ -119,6 +149,17 @@ func (n *Node) writeActuallyCommitted(slot int, sequence uint64) bool {
 		return false
 	}
 	return highestCommitted >= sequence
+}
+
+func (n *Node) recordUpstreamCommitConfirmed(slot int, sequence uint64) error {
+	backend, ok := n.backend.(upstreamConfirmationBackend)
+	if !ok {
+		return nil
+	}
+	if err := backend.SetHighestUpstreamConfirmedSequence(slot, sequence); err != nil && !errors.Is(err, ErrUnknownReplica) {
+		return fmt.Errorf("err in backend.SetHighestUpstreamConfirmedSequence: %w", err)
+	}
+	return nil
 }
 
 func (n *Node) ensureBackendReplica(slot int) error {

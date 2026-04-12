@@ -279,13 +279,17 @@ func (n *Node) ResourceUsage() ResourceUsage {
 type writeStage string
 
 const (
-	writeStageHeadGetCommitted  writeStage = "head_get_committed"
-	writeStageHeadStageOp       writeStage = "head_stage_operation"
+	writeStageHeadGetCommitted      writeStage = "head_get_committed"
+	writeStageHeadStageOp           writeStage = "head_stage_operation"
+	writeStageForwardAcceptRPC      writeStage = "forward_accept_rpc"
+	writeStageHeadWaitForCommit     writeStage = "head_wait_for_commit"
+	writeStageTailApplyCommit       writeStage = "tail_apply_committed"
+	writeStageCommitUpstreamAcceptRPC writeStage = "commit_upstream_accept_rpc"
+	writeStageCommitBatchWait       writeStage = "commit_batch_wait"
+	writeStageSingleApplyCommit     writeStage = "single_apply_committed"
+
 	writeStageHeadForwardRPC    writeStage = "head_forward_rpc"
-	writeStageHeadWaitForCommit writeStage = "head_wait_for_commit"
-	writeStageTailApplyCommit   writeStage = "tail_apply_committed"
 	writeStageCommitUpstreamRPC writeStage = "commit_upstream_rpc"
-	writeStageSingleApplyCommit writeStage = "single_apply_committed"
 )
 
 const (

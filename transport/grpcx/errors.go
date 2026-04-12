@@ -9,8 +9,10 @@ import (
 	"github.com/danthegoodman1/craq/coordserver"
 	grpcproto "github.com/danthegoodman1/craq/proto/craq/v1"
 	"github.com/danthegoodman1/craq/storage"
+	spb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 var (
@@ -202,6 +204,32 @@ func decodeError(err error) error {
 		return context.Canceled
 	}
 	return err
+}
+
+func marshalEncodedError(err error) []byte {
+	if err == nil {
+		return nil
+	}
+	st, ok := status.FromError(encodeError(err))
+	if !ok {
+		return nil
+	}
+	encoded, marshalErr := proto.Marshal(st.Proto())
+	if marshalErr != nil {
+		return nil
+	}
+	return encoded
+}
+
+func unmarshalEncodedError(encoded []byte) error {
+	if len(encoded) == 0 {
+		return nil
+	}
+	protoStatus := &spb.Status{}
+	if err := proto.Unmarshal(encoded, protoStatus); err != nil {
+		return fmt.Errorf("unmarshal replication error status: %w", err)
+	}
+	return decodeError(status.ErrorProto(protoStatus))
 }
 
 func domainErrorDetail(err error) (*grpcproto.DomainErrorDetail, bool) {
