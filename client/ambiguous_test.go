@@ -40,6 +40,8 @@ func TestEndToEndAmbiguousWriteMayCommitLater(t *testing.T) {
 	if err := h.repl.DeliverNextForward(ctx); err != nil {
 		t.Fatalf("DeliverNextForward returned error: %v", err)
 	}
+	waitForCommittedSequence(t, h.head, 0, 1)
+	waitForCommittedSequence(t, h.tail, 0, 1)
 
 	readResult, err = h.router.Get(ctx, "k")
 	if err != nil {
@@ -79,6 +81,8 @@ func TestRetryAfterAmbiguousWriteIsANewWrite(t *testing.T) {
 	if err := h.repl.DeliverNextForward(ctx); err != nil {
 		t.Fatalf("DeliverNextForward returned error: %v", err)
 	}
+	waitForCommittedSequence(t, h.head, 0, 1)
+	waitForCommittedSequence(t, h.tail, 0, 1)
 
 	h.repl.SetBlockAwait(false)
 	result, err := routerPutWithDelivery(t, ctx, h.router, h.repl, "k", "v1")
@@ -113,6 +117,8 @@ func TestAmbiguousWriteHistoryIsDeterministic(t *testing.T) {
 		if err := h.repl.DeliverNextForward(ctx); err != nil {
 			t.Fatalf("DeliverNextForward returned error: %v", err)
 		}
+		waitForCommittedSequence(t, h.head, 0, 1)
+		waitForCommittedSequence(t, h.tail, 0, 1)
 		readResult, err := h.router.Get(ctx, "k")
 		if err != nil {
 			t.Fatalf("Get returned error: %v", err)
@@ -151,7 +157,7 @@ func newAmbiguousRouterHarness(t *testing.T, blockAwait bool) *ambiguousRouterHa
 	tailBackend := storage.NewInMemoryBackend()
 	head := mustNewStorageNode(t, context.Background(), storage.Config{
 		NodeID:             "head",
-		WriteCommitTimeout: time.Nanosecond,
+		WriteCommitTimeout: 5 * time.Millisecond,
 	}, headBackend, storage.NewInMemoryCoordinatorClient(), repl)
 	tail := mustNewStorageNode(t, context.Background(), storage.Config{
 		NodeID: "tail",
@@ -346,6 +352,18 @@ func (t *manualAmbiguousReplicationTransport) DeliverNextForward(ctx context.Con
 		return fmt.Errorf("%w: node %q", storage.ErrSnapshotSourceUnavailable, msg.toNodeID)
 	}
 	return node.HandleForwardWrite(ctx, msg.req)
+}
+
+func waitForCommittedSequence(t *testing.T, node *storage.Node, slot int, want uint64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := mustHighestCommittedSequence(t, node, slot); got >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for slot %d committed sequence >= %d", slot, want)
 }
 
 func mustNewStorageNode(

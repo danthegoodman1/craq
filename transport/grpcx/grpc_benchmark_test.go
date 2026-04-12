@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/danthegoodman1/craq/client"
@@ -116,6 +118,17 @@ func BenchmarkClientLatencyGRPC_Localhost(b *testing.B) {
 			}
 		}
 	})
+}
+
+func BenchmarkClientPutThroughputGRPC_Localhost(b *testing.B) {
+	for _, concurrency := range []int{32, 64, 128, 256} {
+		b.Run(fmt.Sprintf("three_replica_put_c%d", concurrency), func(b *testing.B) {
+			h := newLocalhostGRPCBenchmarkHarness(b, 3)
+			h.mustWarmConnections(b)
+			seedBenchmarkPutKeys(b, h.router, concurrency*8)
+			benchmarkRouterPutThroughput(b, h.router, concurrency, concurrency*8)
+		})
+	}
 }
 
 type localhostGRPCBenchmarkHarness struct {
@@ -327,4 +340,63 @@ func mustStartBenchmarkStorageServer(tb testing.TB, node *storage.Node, address 
 
 func benchmarkNodeID(index int) string {
 	return fmt.Sprintf("n%d", index)
+}
+
+func seedBenchmarkPutKeys(tb testing.TB, router *client.Router, count int) {
+	tb.Helper()
+	for i := 0; i < count; i++ {
+		key := fmt.Sprintf("bench-put-%06d", i)
+		if _, err := router.Put(context.Background(), key, "seed"); err != nil {
+			tb.Fatalf("seed Put(%q) returned error: %v", key, err)
+		}
+	}
+}
+
+func benchmarkRouterPutThroughput(b *testing.B, router *client.Router, concurrency int, keyCount int) {
+	if keyCount <= 0 {
+		keyCount = concurrency * 8
+	}
+	var next atomic.Uint64
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var (
+		errMu    sync.Mutex
+		firstErr error
+	)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for worker := 0; worker < concurrency; worker++ {
+		workerID := worker
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for {
+				index := int(next.Add(1) - 1)
+				if index >= b.N {
+					return
+				}
+				key := fmt.Sprintf("bench-put-%06d", index%keyCount)
+				value := fmt.Sprintf("value-%d-%d", workerID, index)
+				if _, err := router.Put(context.Background(), key, value); err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	b.StopTimer()
+	errMu.Lock()
+	defer errMu.Unlock()
+	if firstErr != nil {
+		b.Fatalf("Put returned error: %v", firstErr)
+	}
 }

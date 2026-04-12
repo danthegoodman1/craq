@@ -251,6 +251,10 @@ type StorageGRPCServer struct {
 	authorizer *rpcAuthorizer
 	logger     zerolog.Logger
 	observer   *grpcObserver
+
+	replicationStreamsMu   sync.Mutex
+	nextReplicationStream  uint64
+	replicationCreditSends map[uint64]func(int) error
 }
 
 func NewStorageGRPCServer(node *storage.Node) *StorageGRPCServer {
@@ -308,6 +312,42 @@ func (s *StorageGRPCServer) Close() error {
 		return s.lis.Close()
 	}
 	return nil
+}
+
+func (s *StorageGRPCServer) registerReplicationCreditSender(send func(int) error) func() {
+	s.replicationStreamsMu.Lock()
+	defer s.replicationStreamsMu.Unlock()
+	if s.replicationCreditSends == nil {
+		s.replicationCreditSends = map[uint64]func(int) error{}
+	}
+	s.nextReplicationStream++
+	id := s.nextReplicationStream
+	s.replicationCreditSends[id] = send
+	return func() {
+		s.replicationStreamsMu.Lock()
+		defer s.replicationStreamsMu.Unlock()
+		delete(s.replicationCreditSends, id)
+	}
+}
+
+func (s *StorageGRPCServer) broadcastSlotCredit(slot int) {
+	if slot < 0 {
+		return
+	}
+	s.replicationStreamsMu.Lock()
+	senders := make([]func(int) error, 0, len(s.replicationCreditSends))
+	for _, send := range s.replicationCreditSends {
+		senders = append(senders, send)
+	}
+	s.replicationStreamsMu.Unlock()
+	for _, send := range senders {
+		if err := send(slot); err != nil &&
+			!errors.Is(err, context.Canceled) &&
+			!errors.Is(err, io.EOF) &&
+			!errors.Is(err, net.ErrClosed) {
+			s.logger.Debug().Err(err).Msg("replication stream credit update failed")
+		}
+	}
 }
 
 func (s *StorageGRPCServer) Get(ctx context.Context, req *grpcproto.ClientGetRequest) (*grpcproto.ReadResult, error) {
@@ -462,7 +502,20 @@ func (s *StorageGRPCServer) CommitWrite(ctx context.Context, req *grpcproto.Comm
 func (s *StorageGRPCServer) Replicate(stream grpcproto.StorageService_ReplicateServer) error {
 	var sendMu sync.Mutex
 	var workers sync.WaitGroup
-	defer workers.Wait()
+	type replicationFrameTask struct {
+		frame *grpcproto.ReplicationFrame
+		slot  int
+	}
+	slotWorkersMu := sync.Mutex{}
+	slotWorkers := map[int]chan replicationFrameTask{}
+	defer func() {
+		slotWorkersMu.Lock()
+		for _, ch := range slotWorkers {
+			close(ch)
+		}
+		slotWorkersMu.Unlock()
+		workers.Wait()
+	}()
 
 	sendFrame := func(frame *grpcproto.ReplicationFrame) error {
 		sendMu.Lock()
@@ -495,6 +548,96 @@ func (s *StorageGRPCServer) Replicate(stream grpcproto.StorageService_ReplicateS
 			},
 		})
 	}
+	unregisterCreditSender := s.registerReplicationCreditSender(sendSlotCredit)
+	defer unregisterCreditSender()
+
+	handleFrame := func(frame *grpcproto.ReplicationFrame) {
+		var (
+			handleErr error
+			slot      = -1
+		)
+		switch payload := frame.GetPayload().(type) {
+		case *grpcproto.ReplicationFrame_ForwardWrite:
+			req := payload.ForwardWrite
+			slot = int(req.Operation.Slot)
+			if s.authorizer != nil {
+				if authErr := s.authorizer.requireStorageIdentityMatch(stream.Context(), req.FromNodeId); authErr != nil {
+					handleErr = authErr
+					break
+				}
+			}
+			handleErr = s.node.AcceptForwardWrite(stream.Context(), storage.ForwardWriteRequest{
+				Operation: storage.WriteOperation{
+					Slot:     int(req.Operation.Slot),
+					Sequence: req.Operation.Sequence,
+					Kind:     storage.OperationKind(req.Operation.Kind),
+					Key:      req.Operation.Key,
+					Value:    req.Operation.Value,
+					Metadata: derefObjectMetadata(fromProtoObjectMetadata(req.Operation.Metadata)),
+				},
+				FromNodeID:   req.FromNodeId,
+				ChainVersion: req.ChainVersion,
+			})
+		case *grpcproto.ReplicationFrame_CommitWrite:
+			req := payload.CommitWrite
+			slot = int(req.Slot)
+			if s.authorizer != nil {
+				if authErr := s.authorizer.requireStorageIdentityMatch(stream.Context(), req.FromNodeId); authErr != nil {
+					handleErr = authErr
+					break
+				}
+			}
+			handleErr = s.node.AcceptCommitWrite(stream.Context(), storage.CommitWriteRequest{
+				Slot:         int(req.Slot),
+				Sequence:     req.Sequence,
+				FromNodeID:   req.FromNodeId,
+				ChainVersion: req.ChainVersion,
+			})
+		default:
+			handleErr = status.Error(codes.InvalidArgument, "replication frame payload required")
+		}
+		if ackErr := sendAck(frame.GetRequestId(), handleErr); ackErr != nil && !errors.Is(ackErr, context.Canceled) {
+			s.logger.Debug().Err(ackErr).Msg("replication stream ack failed")
+		}
+		s.broadcastSlotCredit(slot)
+	}
+
+	workerForSlot := func(slot int) chan replicationFrameTask {
+		slotWorkersMu.Lock()
+		defer slotWorkersMu.Unlock()
+		if ch, ok := slotWorkers[slot]; ok {
+			return ch
+		}
+		ch := make(chan replicationFrameTask, 128)
+		slotWorkers[slot] = ch
+		workers.Add(1)
+		go func(tasks <-chan replicationFrameTask) {
+			defer workers.Done()
+			for task := range tasks {
+				handleFrame(task.frame)
+			}
+		}(ch)
+		return ch
+	}
+
+	dispatchFrame := func(frame *grpcproto.ReplicationFrame) {
+		slot := -1
+		switch payload := frame.GetPayload().(type) {
+		case *grpcproto.ReplicationFrame_ForwardWrite:
+			slot = int(payload.ForwardWrite.Operation.Slot)
+		case *grpcproto.ReplicationFrame_CommitWrite:
+			slot = int(payload.CommitWrite.Slot)
+		}
+		if slot < 0 {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				handleFrame(frame)
+			}()
+			return
+		}
+		workerForSlot(slot) <- replicationFrameTask{frame: frame, slot: slot}
+	}
 
 	for {
 		frame, err := stream.Recv()
@@ -507,60 +650,7 @@ func (s *StorageGRPCServer) Replicate(stream grpcproto.StorageService_ReplicateS
 			}
 			return err
 		}
-		workers.Add(1)
-		go func(frame *grpcproto.ReplicationFrame) {
-			defer workers.Done()
-			var (
-				handleErr error
-				slot      = -1
-			)
-			switch payload := frame.GetPayload().(type) {
-			case *grpcproto.ReplicationFrame_ForwardWrite:
-				req := payload.ForwardWrite
-				slot = int(req.Operation.Slot)
-				if s.authorizer != nil {
-					if authErr := s.authorizer.requireStorageIdentityMatch(stream.Context(), req.FromNodeId); authErr != nil {
-						handleErr = authErr
-						break
-					}
-				}
-				handleErr = s.node.AcceptForwardWrite(stream.Context(), storage.ForwardWriteRequest{
-					Operation: storage.WriteOperation{
-						Slot:     int(req.Operation.Slot),
-						Sequence: req.Operation.Sequence,
-						Kind:     storage.OperationKind(req.Operation.Kind),
-						Key:      req.Operation.Key,
-						Value:    req.Operation.Value,
-						Metadata: derefObjectMetadata(fromProtoObjectMetadata(req.Operation.Metadata)),
-					},
-					FromNodeID:   req.FromNodeId,
-					ChainVersion: req.ChainVersion,
-				})
-			case *grpcproto.ReplicationFrame_CommitWrite:
-				req := payload.CommitWrite
-				slot = int(req.Slot)
-				if s.authorizer != nil {
-					if authErr := s.authorizer.requireStorageIdentityMatch(stream.Context(), req.FromNodeId); authErr != nil {
-						handleErr = authErr
-						break
-					}
-				}
-				handleErr = s.node.AcceptCommitWrite(stream.Context(), storage.CommitWriteRequest{
-					Slot:         int(req.Slot),
-					Sequence:     req.Sequence,
-					FromNodeID:   req.FromNodeId,
-					ChainVersion: req.ChainVersion,
-				})
-			default:
-				handleErr = status.Error(codes.InvalidArgument, "replication frame payload required")
-			}
-			if ackErr := sendAck(frame.GetRequestId(), handleErr); ackErr != nil && !errors.Is(ackErr, context.Canceled) {
-				s.logger.Debug().Err(ackErr).Msg("replication stream ack failed")
-			}
-			if creditErr := sendSlotCredit(slot); creditErr != nil && !errors.Is(creditErr, context.Canceled) {
-				s.logger.Debug().Err(creditErr).Msg("replication stream credit update failed")
-			}
-		}(frame)
+		dispatchFrame(frame)
 	}
 }
 

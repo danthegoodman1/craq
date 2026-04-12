@@ -21,6 +21,8 @@ const (
 	replicationSessionQueueDepth   = 8192
 	replicationReconnectMinBackoff = 50 * time.Millisecond
 	replicationReconnectMaxBackoff = time.Second
+	replicationBlockedSlotProbe    = 10 * time.Millisecond
+	replicationPendingAckTimeout   = 250 * time.Millisecond
 )
 
 type outboundReplicationRequest struct {
@@ -402,14 +404,17 @@ func (s *replicationPeerSession) run() {
 	defer close(s.closedCh)
 
 	var (
-		backlog []*outboundReplicationRequest
-		pending = map[uint64]*outboundReplicationRequest{}
-		credits = map[int]int{}
-		stream  grpc.BidiStreamingClient[grpcproto.ReplicationFrame, grpcproto.ReplicationFrame]
-		errCh   <-chan error
-		ackCh   <-chan *grpcproto.ReplicationFrame
-		cancel  context.CancelFunc
-		backoff = replicationReconnectMinBackoff
+		backlog       []*outboundReplicationRequest
+		pending       = map[uint64]*outboundReplicationRequest{}
+		pendingSince  = map[uint64]time.Time{}
+		pendingBySlot = map[int]int{}
+		credits       = map[int]int{}
+		probeAfter    = map[int]time.Time{}
+		stream        grpc.BidiStreamingClient[grpcproto.ReplicationFrame, grpcproto.ReplicationFrame]
+		errCh         <-chan error
+		ackCh         <-chan *grpcproto.ReplicationFrame
+		cancel        context.CancelFunc
+		backoff       = replicationReconnectMinBackoff
 	)
 
 	closeStream := func() {
@@ -431,12 +436,17 @@ func (s *replicationPeerSession) run() {
 			ids = append(ids, id)
 		}
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-		replayed := make([]*outboundReplicationRequest, 0, len(ids))
+			replayed := make([]*outboundReplicationRequest, 0, len(ids))
 		for _, id := range ids {
 			req := pending[id]
 			replayed = append(replayed, req)
 			s.recordRequeued(req)
 			delete(pending, id)
+			delete(pendingSince, id)
+			pendingBySlot[req.slot]--
+			if pendingBySlot[req.slot] <= 0 {
+				delete(pendingBySlot, req.slot)
+			}
 		}
 		backlog = append(replayed, backlog...)
 	}
@@ -456,27 +466,91 @@ func (s *replicationPeerSession) run() {
 		credits[slot] = available
 	}
 
-	var nextSendableIndex func() int
-		nextSendableIndex = func() int {
-			for i, req := range backlog {
-				if req.ctx != nil {
-					if err := req.ctx.Err(); err != nil {
-						req.complete(err)
-						s.recordCanceledBacklog(req)
-						backlog = append(backlog[:i], backlog[i+1:]...)
-						return nextSendableIndex()
-					}
-				}
-				if slotCredit(req.slot) <= 0 {
-					s.recordBlocked(req)
-					continue
-				}
-				return i
+	allowBlockedProbe := func(slot int) bool {
+		if slotCredit(slot) > 0 {
+			return true
+		}
+		if pendingBySlot[slot] > 0 {
+			return false
+		}
+		now := time.Now()
+		if until, ok := probeAfter[slot]; ok && now.Before(until) {
+			return false
+		}
+		probeAfter[slot] = now.Add(replicationBlockedSlotProbe)
+		return true
+	}
+
+	stalePending := func() (*outboundReplicationRequest, bool) {
+		if len(pendingSince) == 0 {
+			return nil, false
+		}
+		now := time.Now()
+		var (
+			oldestReq *outboundReplicationRequest
+			oldestAt  time.Time
+		)
+		for id, sentAt := range pendingSince {
+			if now.Sub(sentAt) < replicationPendingAckTimeout {
+				continue
 			}
+			req := pending[id]
+			if req == nil {
+				delete(pendingSince, id)
+				continue
+			}
+			if oldestReq == nil || sentAt.Before(oldestAt) {
+				oldestReq = req
+				oldestAt = sentAt
+			}
+		}
+		return oldestReq, oldestReq != nil
+	}
+
+	var handleInboundFrame func(frame *grpcproto.ReplicationFrame)
+
+	drainInboundFrames := func(limit int) bool {
+		for i := 0; i < limit; i++ {
+			select {
+			case frame := <-ackCh:
+				handleInboundFrame(frame)
+			case streamErr := <-errCh:
+				if streamErr == nil || errors.Is(streamErr, io.EOF) || status.Code(streamErr) == codes.Unavailable {
+					closeStream()
+					requeuePending()
+					return true
+				}
+				closeStream()
+				requeuePending()
+				return true
+			default:
+				return false
+			}
+		}
+		return true
+	}
+
+	var nextSendableIndex func() int
+	nextSendableIndex = func() int {
+		for i, req := range backlog {
+			if req.ctx != nil {
+				if err := req.ctx.Err(); err != nil {
+					req.complete(err)
+					s.recordCanceledBacklog(req)
+					backlog = append(backlog[:i], backlog[i+1:]...)
+					return nextSendableIndex()
+				}
+			}
+			if !allowBlockedProbe(req.slot) {
+				s.recordBlocked(req)
+				continue
+			}
+			return i
+		}
 		return -1
 	}
 
-	handleInboundFrame := func(frame *grpcproto.ReplicationFrame) {
+	handleInboundFrame = func(frame *grpcproto.ReplicationFrame) {
 		if frame == nil {
 			return
 		}
@@ -485,6 +559,9 @@ func (s *replicationPeerSession) run() {
 			slot := int(payload.SlotCredit.Slot)
 			available := int(payload.SlotCredit.Available)
 			setSlotCredit(slot, available)
+			if available > 0 {
+				delete(probeAfter, slot)
+			}
 			s.recordCredit(slot, available)
 		case *grpcproto.ReplicationFrame_Ack:
 			req, ok := pending[frame.GetRequestId()]
@@ -492,12 +569,25 @@ func (s *replicationPeerSession) run() {
 				return
 			}
 			delete(pending, frame.GetRequestId())
+			delete(pendingSince, frame.GetRequestId())
+			pendingBySlot[req.slot]--
+			if pendingBySlot[req.slot] <= 0 {
+				delete(pendingBySlot, req.slot)
+			}
 			s.recordAck(req)
 			if payload.Ack == nil || payload.Ack.Success {
 				req.complete(nil)
 				return
 			}
-			req.complete(unmarshalEncodedError(payload.Ack.EncodedError))
+			ackErr := unmarshalEncodedError(payload.Ack.EncodedError)
+			if errors.Is(ackErr, storage.ErrReplicaBackpressure) {
+				setSlotCredit(req.slot, 0)
+				probeAfter[req.slot] = time.Now().Add(replicationBlockedSlotProbe)
+				s.recordRequeued(req)
+				backlog = append([]*outboundReplicationRequest{req}, backlog...)
+				return
+			}
+			req.complete(ackErr)
 		}
 	}
 
@@ -588,6 +678,19 @@ func (s *replicationPeerSession) run() {
 			}
 		}
 
+		if stream != nil && drainInboundFrames(256) {
+			continue
+		}
+
+		if stream != nil {
+			if req, ok := stalePending(); ok {
+				s.recordBlocked(req)
+				closeStream()
+				requeuePending()
+				continue
+			}
+		}
+
 		if stream != nil && len(backlog) > 0 {
 			if idx := nextSendableIndex(); idx != -1 {
 				req := backlog[idx]
@@ -603,6 +706,8 @@ func (s *replicationPeerSession) run() {
 				setSlotCredit(req.slot, nextCredit)
 				s.recordSent(req, nextCredit)
 				pending[req.id] = req
+				pendingSince[req.id] = time.Now()
+				pendingBySlot[req.slot]++
 				backlog = append(backlog[:idx], backlog[idx+1:]...)
 				continue
 			}

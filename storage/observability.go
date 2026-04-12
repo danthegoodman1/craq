@@ -38,6 +38,7 @@ type nodeMetrics struct {
 	ambiguousWrites        prometheus.Counter
 	conditionFailures      prometheus.Counter
 	writeWaitDuration      prometheus.Histogram
+	headMetadataLookups    *prometheus.CounterVec
 	writeStageTransitions  *prometheus.CounterVec
 	writeStageDuration     *prometheus.HistogramVec
 	tailResolutions        *prometheus.CounterVec
@@ -164,6 +165,10 @@ func newNodeMetrics(registry *prometheus.Registry) *nodeMetrics {
 			Help:    "Client write latency observed at storage nodes.",
 			Buckets: prometheus.DefBuckets,
 		}),
+		headMetadataLookups: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "craq_storage_head_committed_metadata_lookups_total",
+			Help: "Head and single-replica committed metadata lookups by source.",
+		}, []string{"source"}),
 		writeStageTransitions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "craq_storage_write_stage_total",
 			Help: "Completed write-path stages observed at storage nodes.",
@@ -234,6 +239,7 @@ func newNodeMetrics(registry *prometheus.Registry) *nodeMetrics {
 		m.ambiguousWrites,
 		m.conditionFailures,
 		m.writeWaitDuration,
+		m.headMetadataLookups,
 		m.writeStageTransitions,
 		m.writeStageDuration,
 		m.tailResolutions,
@@ -291,14 +297,14 @@ func (n *Node) ResourceUsage() ResourceUsage {
 type writeStage string
 
 const (
-	writeStageHeadGetCommitted      writeStage = "head_get_committed"
-	writeStageHeadStageOp           writeStage = "head_stage_operation"
-	writeStageForwardAcceptRPC      writeStage = "forward_accept_rpc"
-	writeStageHeadWaitForCommit     writeStage = "head_wait_for_commit"
-	writeStageTailApplyCommit       writeStage = "tail_apply_committed"
+	writeStageHeadGetCommitted        writeStage = "head_get_committed"
+	writeStageHeadStageOp             writeStage = "head_stage_operation"
+	writeStageForwardAcceptRPC        writeStage = "forward_accept_rpc"
+	writeStageHeadWaitForCommit       writeStage = "head_wait_for_commit"
+	writeStageTailApplyCommit         writeStage = "tail_apply_committed"
 	writeStageCommitUpstreamAcceptRPC writeStage = "commit_upstream_accept_rpc"
-	writeStageCommitBatchWait       writeStage = "commit_batch_wait"
-	writeStageSingleApplyCommit     writeStage = "single_apply_committed"
+	writeStageCommitBatchWait         writeStage = "commit_batch_wait"
+	writeStageSingleApplyCommit       writeStage = "single_apply_committed"
 
 	writeStageHeadForwardRPC    writeStage = "head_forward_rpc"
 	writeStageCommitUpstreamRPC writeStage = "commit_upstream_rpc"
@@ -323,6 +329,13 @@ func (n *Node) observeWriteStage(stage writeStage, role ReplicaRole, result stri
 	}
 	n.metrics.writeStageTransitions.WithLabelValues(stageLabel, roleLabel, result).Inc()
 	n.metrics.writeStageDuration.WithLabelValues(stageLabel, roleLabel, result).Observe(dur.Seconds())
+}
+
+func (n *Node) observeHeadCommittedMetadataLookup(source string) {
+	if n.metrics == nil || source == "" {
+		return
+	}
+	n.metrics.headMetadataLookups.WithLabelValues(source).Inc()
 }
 
 func writeStageResult(err error) string {

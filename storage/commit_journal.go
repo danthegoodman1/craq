@@ -15,12 +15,14 @@ import (
 )
 
 const (
-	defaultJournalBatchDelay     = 250 * time.Microsecond
-	defaultJournalBatchMaxOps    = 128
-	defaultJournalBatchMaxBytes  = 1 << 20
-	defaultMaterializeBatchDelay = 250 * time.Microsecond
-	defaultMaterializeRetryDelay = 5 * time.Millisecond
-	defaultJournalShardCount     = 8
+	defaultJournalBatchDelayLow      = 50 * time.Microsecond
+	defaultJournalBatchDelayHigh     = 250 * time.Microsecond
+	defaultJournalBatchLowDepthLimit = 8
+	defaultJournalBatchMaxOps        = 128
+	defaultJournalBatchMaxBytes      = 1 << 20
+	defaultMaterializeBatchDelay     = 250 * time.Microsecond
+	defaultMaterializeRetryDelay     = 5 * time.Millisecond
+	defaultJournalShardCount         = 16
 )
 
 type CommitJournalStore interface {
@@ -320,9 +322,9 @@ type commitJournalShard struct {
 
 func newCommitJournalEngine(node *Node, journals []commitJournalStore, highWater map[int]uint64, backlog []DurableCommit) *commitJournalEngine {
 	engine := &commitJournalEngine{
-		node:     node,
+		node:      node,
 		highWater: make(map[int]uint64, len(highWater)),
-		shards:   make([]*commitJournalShard, 0, len(journals)),
+		shards:    make([]*commitJournalShard, 0, len(journals)),
 	}
 	for slot, sequence := range highWater {
 		engine.highWater[slot] = sequence
@@ -504,11 +506,19 @@ func (s *commitJournalShard) run() {
 		timerCh = nil
 	}
 
-	resetTimer := func() {
+	nextBatchDelay := func(queueDepth int) time.Duration {
+		if queueDepth < defaultJournalBatchLowDepthLimit {
+			return defaultJournalBatchDelayLow
+		}
+		return defaultJournalBatchDelayHigh
+	}
+
+	resetTimer := func(queueDepth int) {
+		delay := nextBatchDelay(queueDepth)
 		if timer == nil {
-			timer = time.NewTimer(defaultJournalBatchDelay)
+			timer = time.NewTimer(delay)
 		} else {
-			timer.Reset(defaultJournalBatchDelay)
+			timer.Reset(delay)
 		}
 		timerCh = timer.C
 	}
@@ -629,7 +639,11 @@ func (s *commitJournalShard) run() {
 			batch = append(batch, journalBatchItem{commit: intent})
 			batchSize += estimatedCommitBytes(intent.commit)
 			if len(batch) == 1 {
-				resetTimer()
+				resetTimer(len(s.commitCh) + len(s.confirmCh))
+			}
+			if len(batch) > 1 && len(s.commitCh)+len(s.confirmCh) == 0 {
+				flush()
+				continue
 			}
 			if len(batch) >= defaultJournalBatchMaxOps || batchSize >= defaultJournalBatchMaxBytes {
 				flush()
@@ -638,7 +652,11 @@ func (s *commitJournalShard) run() {
 			batch = append(batch, journalBatchItem{confirm: intent})
 			batchSize += 64
 			if len(batch) == 1 {
-				resetTimer()
+				resetTimer(len(s.commitCh) + len(s.confirmCh))
+			}
+			if len(batch) > 1 && len(s.commitCh)+len(s.confirmCh) == 0 {
+				flush()
+				continue
 			}
 			if len(batch) >= defaultJournalBatchMaxOps || batchSize >= defaultJournalBatchMaxBytes {
 				flush()
@@ -985,8 +1003,8 @@ func recoverJournaledReplicaState(journals []commitJournalStore, records map[int
 				if entry.Sequence > record.materializedCommittedSequence {
 					record = recordWithCommittedOverlay(record, entry.operation())
 					backlog = append(backlog, DurableCommit{
-						Operation: entry.operation(),
-						Persisted: persistedReplica(record),
+						Operation:                 entry.operation(),
+						Persisted:                 persistedReplica(record),
 						UpstreamConfirmedSequence: entry.UpstreamConfirmedSequence,
 					})
 				}

@@ -884,6 +884,9 @@ func (n *Node) beginReplicaActivation(slot int) error {
 	if record.state == ReplicaStateActive {
 		return errReplicaAlreadyActive
 	}
+	if record.state == ReplicaStatePending {
+		return errReplicaActivationInFlight
+	}
 	if record.state != ReplicaStateCatchingUp {
 		return fmt.Errorf("%w: slot %d is %q", ErrInvalidTransition, slot, record.state)
 	}
@@ -1543,9 +1546,9 @@ func peerTransportTarget(target string, fallbackNodeID string) string {
 	return fallbackNodeID
 }
 
-func (n *Node) nextObjectMetadata(found bool, current CommittedObject) ObjectMetadata {
+func (n *Node) nextObjectMetadata(found bool, current *ObjectMetadata) ObjectMetadata {
 	now := n.clock.Now().UTC()
-	if !found {
+	if !found || current == nil {
 		return ObjectMetadata{
 			Version:   1,
 			CreatedAt: now,
@@ -1553,8 +1556,8 @@ func (n *Node) nextObjectMetadata(found bool, current CommittedObject) ObjectMet
 		}
 	}
 	return ObjectMetadata{
-		Version:   current.Metadata.Version + 1,
-		CreatedAt: current.Metadata.CreatedAt,
+		Version:   current.Version + 1,
+		CreatedAt: current.CreatedAt,
 		UpdatedAt: now,
 	}
 }

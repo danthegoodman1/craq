@@ -37,6 +37,41 @@ func TestSingleReplicaWriteStageMetrics(t *testing.T) {
 	assertWriteStageCount(t, registry, string(writeStageHeadWaitForCommit), string(ReplicaRoleSingle), writeStageResultSuccess, 1)
 	assertWriteStageCount(t, registry, string(writeStageHeadForwardRPC), string(ReplicaRoleSingle), writeStageResultSuccess, 0)
 	assertWriteStageCount(t, registry, string(writeStageCommitUpstreamRPC), string(ReplicaRoleSingle), writeStageResultSuccess, 0)
+	assertCounterValue(t, registry, "craq_storage_head_committed_metadata_lookups_total", map[string]string{"source": "miss"}, 1)
+	assertCounterValue(t, registry, "craq_storage_head_committed_metadata_lookups_total", map[string]string{"source": "hit"}, 0)
+}
+
+func TestCommittedMetadataLookupMetricsRecordCacheHitAfterWarmup(t *testing.T) {
+	ctx := context.Background()
+	registry := prometheus.NewRegistry()
+	backend := NewInMemoryBackend()
+	node := mustNewNode(t, ctx, Config{
+		NodeID:          "single",
+		MetricsRegistry: registry,
+		Clock:           &fakeClock{now: time.Unix(500, 0).UTC()},
+	}, backend, NewInMemoryCoordinatorClient(), NewInMemoryReplicationTransport())
+	mustActivateReplica(t, node, 1, ReplicaAssignment{
+		Slot:         1,
+		ChainVersion: 1,
+		Role:         ReplicaRoleSingle,
+	})
+	if err := backend.Put(1, "alpha", "seed", ObjectMetadata{
+		Version:   1,
+		CreatedAt: time.Unix(100, 0).UTC(),
+		UpdatedAt: time.Unix(100, 0).UTC(),
+	}); err != nil {
+		t.Fatalf("backend.Put returned error: %v", err)
+	}
+
+	if _, err := node.SubmitPut(ctx, 1, "alpha", "one"); err != nil {
+		t.Fatalf("first SubmitPut returned error: %v", err)
+	}
+	if _, err := node.SubmitPut(ctx, 1, "alpha", "two"); err != nil {
+		t.Fatalf("second SubmitPut returned error: %v", err)
+	}
+
+	assertCounterValue(t, registry, "craq_storage_head_committed_metadata_lookups_total", map[string]string{"source": "miss"}, 1)
+	assertCounterValue(t, registry, "craq_storage_head_committed_metadata_lookups_total", map[string]string{"source": "hit"}, 1)
 }
 
 func TestThreeReplicaWriteStageMetricsRecordOncePerLogicalWrite(t *testing.T) {
@@ -85,7 +120,7 @@ func TestThreeReplicaWriteStageMetricsRecordOncePerLogicalWrite(t *testing.T) {
 	assertWriteStageCount(t, midRegistry, string(writeStageTailApplyCommit), string(ReplicaRoleMiddle), writeStageResultSuccess, 1)
 	assertWriteStageCount(t, midRegistry, string(writeStageCommitUpstreamAcceptRPC), string(ReplicaRoleMiddle), writeStageResultSuccess, 1)
 	assertWriteStageCount(t, tailRegistry, string(writeStageTailApplyCommit), string(ReplicaRoleTail), writeStageResultSuccess, 1)
-	assertWriteStageCount(t, tailRegistry, string(writeStageCommitUpstreamRPC), string(ReplicaRoleTail), writeStageResultSuccess, 1)
+	assertWriteStageCount(t, tailRegistry, string(writeStageCommitUpstreamAcceptRPC), string(ReplicaRoleTail), writeStageResultSuccess, 1)
 
 	before := histogramCountValue(t, headRegistry, "craq_storage_write_stage_seconds", map[string]string{
 		"stage":  string(writeStageTailApplyCommit),
@@ -206,6 +241,33 @@ func histogramCountValue(t *testing.T, registry *prometheus.Registry, name strin
 		for _, metric := range family.GetMetric() {
 			if metricLabelsMatch(metric, labels) && metric.Histogram != nil {
 				return metric.Histogram.GetSampleCount()
+			}
+		}
+	}
+	return 0
+}
+
+func assertCounterValue(t *testing.T, registry *prometheus.Registry, name string, labels map[string]string, want float64) {
+	t.Helper()
+	got := counterValue(t, registry, name, labels)
+	if got != want {
+		t.Fatalf("counter %s labels=%v got=%f want=%f", name, labels, got, want)
+	}
+}
+
+func counterValue(t *testing.T, registry *prometheus.Registry, name string, labels map[string]string) float64 {
+	t.Helper()
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("registry.Gather returned error: %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			if metricLabelsMatch(metric, labels) && metric.Counter != nil {
+				return metric.Counter.GetValue()
 			}
 		}
 	}

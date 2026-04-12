@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 )
 
 type stagedOperation struct {
@@ -590,6 +591,8 @@ type QueuedInMemoryReplicationTransport struct {
 	blockSequence       <-chan struct{}
 }
 
+const queuedReplicationAwaitTimeout = 250 * time.Millisecond
+
 func NewQueuedInMemoryReplicationTransport() *QueuedInMemoryReplicationTransport {
 	return &QueuedInMemoryReplicationTransport{
 		backends: map[string]Backend{},
@@ -836,20 +839,37 @@ func (t *QueuedInMemoryReplicationTransport) DeliverNext(ctx context.Context) er
 }
 
 func (t *QueuedInMemoryReplicationTransport) DeliverAt(ctx context.Context, index int) error {
-	t.mu.Lock()
-	if len(t.queue) == 0 {
+	deadline := time.Now().Add(queuedReplicationAwaitTimeout)
+	var (
+		msg  QueuedReplicationMessage
+		hook func(QueuedReplicationMessage)
+		node replicationHandler
+		ok   bool
+	)
+	for {
+		t.mu.Lock()
+		if len(t.queue) > 0 {
+			if index < 0 || index >= len(t.queue) {
+				t.mu.Unlock()
+				return fmt.Errorf("%w: queued message index %d", ErrStateMismatch, index)
+			}
+			msg = t.queue[index]
+			t.queue = append(t.queue[:index], t.queue[index+1:]...)
+			hook = t.beforeDeliver
+			node, ok = t.nodes[msg.ToNodeID]
+			t.mu.Unlock()
+			break
+		}
 		t.mu.Unlock()
-		return nil
+		if time.Now().After(deadline) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
 	}
-	if index < 0 || index >= len(t.queue) {
-		t.mu.Unlock()
-		return fmt.Errorf("%w: queued message index %d", ErrStateMismatch, index)
-	}
-	msg := t.queue[index]
-	t.queue = append(t.queue[:index], t.queue[index+1:]...)
-	hook := t.beforeDeliver
-	node, ok := t.nodes[msg.ToNodeID]
-	t.mu.Unlock()
 	if hook != nil {
 		hook(msg)
 	}

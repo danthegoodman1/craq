@@ -189,7 +189,7 @@ func TestFutureAcceptedCommitDoesNotAckBeforePriorSequenceCommits(t *testing.T) 
 	}
 }
 
-func TestCommitProgressionGapDropsReplicationCredit(t *testing.T) {
+func TestOutOfOrderAcceptedCommitDoesNotTriggerProgressionGap(t *testing.T) {
 	ctx := context.Background()
 	node := mustNewNode(t, ctx, Config{NodeID: "head"}, NewInMemoryBackend(), NewInMemoryCoordinatorClient(), NewInMemoryReplicationTransport())
 	mustActivateReplica(t, node, 13, ReplicaAssignment{
@@ -203,29 +203,67 @@ func TestCommitProgressionGapDropsReplicationCredit(t *testing.T) {
 
 	preparePendingCommitState(t, node, 13, []uint64{1, 2, 3}, "mid", 1)
 	mustWithSlotRuntime(t, node, 13, func(runtime *slotRuntime) {
-		record := ensureProtocolReplicaState(runtime.record)
-		record.highestCommittedSequence = 1
-		record.bufferedCommits[3] = CommitWriteRequest{
+		runtime.commitEffectInFlight = true
+		runtime.commitEffectSequence = 1
+		runtime.acceptedCommitEntry(1, CommitWriteRequest{
 			Slot:         13,
-			Sequence:     3,
+			Sequence:     1,
 			FromNodeID:   "mid",
 			ChainVersion: 1,
-		}
-		runtime.setRecord(record)
-		runtime.strictAcceptedCommitEntry(3, CommitWriteRequest{
+		}).stage = acceptedCommitDurableInFlight
+	})
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- node.AcceptCommitWrite(ctx, CommitWriteRequest{
 			Slot:         13,
 			Sequence:     3,
 			FromNodeID:   "mid",
 			ChainVersion: 1,
 		})
-		runtime.advanceAcceptedCommitProgress(runtime.backgroundContext())
-		if !runtime.progressionGap {
-			t.Fatal("expected progression gap to be detected")
+	}()
+
+	mustWithSlotRuntime(t, node, 13, func(runtime *slotRuntime) {
+		if runtime.progressionGap {
+			t.Fatal("unexpected progression gap before out-of-order accept")
 		}
 	})
 
-	if got := node.ReplicationSlotCredit(13); got != 0 {
-		t.Fatalf("ReplicationSlotCredit = %d, want 0 while progression gap is active", got)
+	waitForSlotCondition(t, node, 13, func(runtime *slotRuntime) bool {
+		entry := runtime.acceptedCommit(3)
+		return entry != nil && len(entry.waiters) == 1
+	})
+	mustWithSlotRuntime(t, node, 13, func(runtime *slotRuntime) {
+		if runtime.progressionGap {
+			t.Fatal("out-of-order accepted commit incorrectly triggered a progression gap")
+		}
+	})
+	if got := node.ReplicationSlotCredit(13); got == 0 {
+		t.Fatal("ReplicationSlotCredit dropped to zero for an out-of-order accepted commit")
+	}
+
+	mustJournalDurablyCommitSequence(t, node, 13, 1)
+	mustWithSlotRuntime(t, node, 13, func(runtime *slotRuntime) {
+		_ = runtime.reconcileDurableCommitProgress(runtime.backgroundContext())
+	})
+	waitForSlotCondition(t, node, 13, func(runtime *slotRuntime) bool {
+		record := ensureProtocolReplicaState(runtime.record)
+		return record.highestCommittedSequence >= 1
+	})
+	if err := node.AcceptCommitWrite(ctx, CommitWriteRequest{
+		Slot:         13,
+		Sequence:     2,
+		FromNodeID:   "mid",
+		ChainVersion: 1,
+	}); err != nil {
+		t.Fatalf("AcceptCommitWrite(seq=2) returned error: %v", err)
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("AcceptCommitWrite(seq=3) returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for out-of-order accepted commit to finish")
 	}
 }
 
