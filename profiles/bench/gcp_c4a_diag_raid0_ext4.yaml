@@ -1,4 +1,4 @@
-name: gcp-c4a-steady-pprof
+name: gcp-c4a-diag-raid0-ext4
 gcp:
   project: projectvoice-442316
   region: us-central1
@@ -8,7 +8,7 @@ gcp:
   coordinator_machine_type: c4a-standard-8
   client_machine_type: c4a-standard-16
   storage_machine_type: c4a-standard-48-lssd
-  storage_layout: single_nvme_ext4
+  storage_layout: raid0_ext4
   coordinator_boot_disk_gib: 100
 cluster:
   slot_count: 1024
@@ -33,23 +33,22 @@ workload:
     - name: get-only-c64
       kind: get
       concurrency: 64
-      warmup: 10s
-      duration: 30s
+      warmup: 5s
+      duration: 15s
     - name: put-only-c32
       kind: put
       concurrency: 32
-      warmup: 10s
-      duration: 30s
+      warmup: 5s
+      duration: 15s
     - name: mixed-80-20-c64
       kind: mixed
       concurrency: 64
-      warmup: 10s
-      duration: 30s
+      warmup: 5s
+      duration: 15s
       read_percent: 80
 telemetry:
   probe_interval: 1s
   command_interval: 1s
-  extra_run_duration: 30s
-  pprof_cpu_duration: 15s
+  extra_run_duration: 20s
 artifacts:
   root_dir: artifacts/benchmarks

@@ -18,7 +18,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: craq-bench <run|smoke-local|destroy|analyze|daemon|loadgen|probe|collect> [flags]")
+		return fmt.Errorf("usage: craq-bench <run|smoke-local|destroy|analyze|daemon|loadgen|probe|collect|durability-bench> [flags]")
 	}
 	switch args[0] {
 	case "run":
@@ -37,6 +37,8 @@ func run(args []string) error {
 		return probeCommand(args[1:])
 	case "collect":
 		return collectCommand(args[1:])
+	case "durability-bench":
+		return durabilityBenchCommand(args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -196,5 +198,24 @@ func collectCommand(args []string) error {
 	return benchmark.RunSignalContext(func(ctx context.Context) error {
 		_, err := benchmark.CollectArtifacts(ctx, cfg)
 		return err
+	})
+}
+
+func durabilityBenchCommand(args []string) error {
+	fs := flag.NewFlagSet("durability-bench", flag.ContinueOnError)
+	path := fs.String("path", "", "benchmark data path")
+	label := fs.String("label", "", "benchmark label")
+	output := fs.String("output", "", "output json path")
+	count := fs.Int("count", 1000, "operations per sub-benchmark")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	return benchmark.RunSignalContext(func(ctx context.Context) error {
+		return benchmark.RunDurabilityBench(ctx, benchmark.DurabilityBenchConfig{
+			Path:       *path,
+			Label:      *label,
+			OutputPath: *output,
+			Count:      *count,
+		})
 	})
 }

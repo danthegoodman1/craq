@@ -117,6 +117,7 @@ func (e *durableCommitEngine) run() {
 
 		commits := make([]DurableCommit, 0, len(intents))
 		filtered := make([]*commitIntent, 0, len(intents))
+		filteredBytes := 0
 		for _, intent := range intents {
 			if intent.ctx != nil {
 				if err := intent.ctx.Err(); err != nil {
@@ -127,17 +128,30 @@ func (e *durableCommitEngine) run() {
 			e.node.observeWriteStage(writeStageCommitBatchWait, intent.commit.Persisted.Assignment.Role, writeStageResultSuccess, time.Since(intent.queuedAt))
 			commits = append(commits, intent.commit)
 			filtered = append(filtered, intent)
+			filteredBytes += estimatedCommitBytes(intent.commit)
 		}
 		if len(filtered) == 0 {
 			return
 		}
+		e.node.observeCommitBatchSize(len(filtered), filteredBytes)
+		for _, intent := range filtered {
+			if stage := writeTraceFlushStartStage(intent.commit.Persisted.Assignment.Role); stage != "" {
+				e.node.traceWriteEvent(intent.commit.Persisted.Assignment, intent.commit.Operation.Sequence, stage)
+			}
+		}
+		flushStarted := time.Now()
 
 		applyBatchErr := errors.New("batch backend unavailable")
 		if backend, ok := e.node.backend.(batchCommitBackend); ok {
 			applyBatchErr = backend.ApplyCommittedBatch(context.Background(), e.node.nodeID, commits)
 		}
+		flushDuration := time.Since(flushStarted)
 		if applyBatchErr == nil {
 			for _, intent := range filtered {
+				e.node.observeCommitFlush(intent.commit.Persisted.Assignment.Role, writeStageResultSuccess, flushDuration)
+				if stage := writeTraceFlushEndStage(intent.commit.Persisted.Assignment.Role); stage != "" {
+					e.node.traceWriteEvent(intent.commit.Persisted.Assignment, intent.commit.Operation.Sequence, stage)
+				}
 				intent.resp <- durableCommitResult{committed: true}
 			}
 			return
@@ -160,6 +174,10 @@ func (e *durableCommitEngine) run() {
 				if err := upstreamBackend.SetHighestUpstreamConfirmedSequence(commit.Operation.Slot, commit.UpstreamConfirmedSequence); err != nil && result.err == nil {
 					result.err = err
 				}
+			}
+			e.node.observeCommitFlush(commit.Persisted.Assignment.Role, writeStageResult(result.err), flushDuration)
+			if stage := writeTraceFlushEndStage(commit.Persisted.Assignment.Role); stage != "" {
+				e.node.traceWriteEvent(commit.Persisted.Assignment, commit.Operation.Sequence, stage)
 			}
 			intent.resp <- result
 		}

@@ -2,6 +2,7 @@ package benchmark
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,6 +26,9 @@ func TestAnalyzeRunGeneratesSummaryAndHTML(t *testing.T) {
 		if err := os.MkdirAll(filepath.Join(artifactsDir, node), 0o755); err != nil {
 			t.Fatal(err)
 		}
+		if err := os.MkdirAll(filepath.Join(artifactsDir, node, "storage_floor"), 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	state := RunState{
 		RunID:           "run-123",
@@ -42,6 +46,8 @@ func TestAnalyzeRunGeneratesSummaryAndHTML(t *testing.T) {
 			Name:        "put-only-c32",
 			Kind:        "put",
 			Concurrency: 32,
+			StartedAt:   time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+			FinishedAt:  time.Date(2026, 1, 1, 0, 0, 1, 0, time.UTC),
 			P50Millis:   12.5,
 			P95Millis:   20.4,
 			P99Millis:   27.9,
@@ -79,6 +85,53 @@ func TestAnalyzeRunGeneratesSummaryAndHTML(t *testing.T) {
 	if err := writeMetricSnapshot(t, writeEnd, 2, 0.02, 5, 0.11, 5, 0.09); err != nil {
 		t.Fatal(err)
 	}
+	traceLine := `{"at":"2026-01-01T00:00:00.000Z","node_id":"a","slot":1,"sequence":1,"chain_version":1,"role":"head","stage":"head_accepted_write"}
+{"at":"2026-01-01T00:00:00.001Z","node_id":"a","slot":1,"sequence":1,"chain_version":1,"role":"head","stage":"head_forward_accepted"}
+{"at":"2026-01-01T00:00:00.002Z","node_id":"c","slot":1,"sequence":1,"chain_version":1,"role":"tail","stage":"tail_commit_intent_queued"}
+{"at":"2026-01-01T00:00:00.003Z","node_id":"c","slot":1,"sequence":1,"chain_version":1,"role":"tail","stage":"tail_flush_start"}
+{"at":"2026-01-01T00:00:00.004Z","node_id":"c","slot":1,"sequence":1,"chain_version":1,"role":"tail","stage":"tail_flush_end"}
+{"at":"2026-01-01T00:00:00.005Z","node_id":"b","slot":1,"sequence":1,"chain_version":1,"role":"middle","stage":"middle_commit_accept_received"}
+{"at":"2026-01-01T00:00:00.006Z","node_id":"b","slot":1,"sequence":1,"chain_version":1,"role":"middle","stage":"middle_commit_intent_queued"}
+{"at":"2026-01-01T00:00:00.007Z","node_id":"b","slot":1,"sequence":1,"chain_version":1,"role":"middle","stage":"middle_flush_start"}
+{"at":"2026-01-01T00:00:00.008Z","node_id":"b","slot":1,"sequence":1,"chain_version":1,"role":"middle","stage":"middle_flush_end"}
+{"at":"2026-01-01T00:00:00.009Z","node_id":"a","slot":1,"sequence":1,"chain_version":1,"role":"head","stage":"head_commit_accept_received"}
+{"at":"2026-01-01T00:00:00.010Z","node_id":"a","slot":1,"sequence":1,"chain_version":1,"role":"head","stage":"head_commit_intent_queued"}
+{"at":"2026-01-01T00:00:00.011Z","node_id":"a","slot":1,"sequence":1,"chain_version":1,"role":"head","stage":"head_flush_start"}
+{"at":"2026-01-01T00:00:00.012Z","node_id":"a","slot":1,"sequence":1,"chain_version":1,"role":"head","stage":"head_flush_end"}
+{"at":"2026-01-01T00:00:00.013Z","node_id":"a","slot":1,"sequence":1,"chain_version":1,"role":"head","stage":"waiter_released"}
+`
+	if err := os.WriteFile(filepath.Join(artifactsDir, "storage-a", "write-pipeline-trace.jsonl"), []byte(traceLine), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range []string{"storage-b", "storage-c"} {
+		if err := os.WriteFile(filepath.Join(artifactsDir, node, "write-pipeline-trace.jsonl"), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	floor := DurabilityBenchReport{
+		Label: "current_path",
+		Tests: []DurabilityBenchmarkStat{
+			{Name: "file_fsync_256b", Count: 10, P50Millis: 0.4},
+			{Name: "badger_sync_put_256b", Count: 10, P50Millis: 0.7},
+			{Name: "badger_batch_apply_256b", Count: 10, P50Millis: 0.8},
+		},
+	}
+	control := DurabilityBenchReport{
+		Label: "root_disk_control",
+		Tests: []DurabilityBenchmarkStat{
+			{Name: "file_fsync_256b", Count: 10, P50Millis: 0.5},
+			{Name: "badger_sync_put_256b", Count: 10, P50Millis: 0.9},
+			{Name: "badger_batch_apply_256b", Count: 10, P50Millis: 1.0},
+		},
+	}
+	for _, node := range []string{"storage-a", "storage-b", "storage-c"} {
+		if err := SaveJSON(filepath.Join(artifactsDir, node, "storage_floor", "current_path.json"), floor); err != nil {
+			t.Fatal(err)
+		}
+		if err := SaveJSON(filepath.Join(artifactsDir, node, "storage_floor", "root_disk_control.json"), control); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	summary, err := AnalyzeRun(runDir)
 	if err != nil {
@@ -113,6 +166,40 @@ func TestAnalyzeRunGeneratesSummaryAndHTML(t *testing.T) {
 	}
 	if !strings.Contains(string(budgetData), `"stage": "head_wait_for_commit"`) {
 		t.Fatalf("write latency budget missing dominant stage: %s", string(budgetData))
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "analysis", "storage_floor_summary.json")); err != nil {
+		t.Fatalf("storage_floor_summary.json stat error: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "analysis", "write_pipeline_summary.json")); err != nil {
+		t.Fatalf("write_pipeline_summary.json stat error: %v", err)
+	}
+	if summary.StorageFloor.Aggregates["badger_sync_put_256b"].CurrentPathP50Millis == 0 {
+		t.Fatalf("storage floor summary missing badger_sync_put_256b aggregate: %#v", summary.StorageFloor.Aggregates)
+	}
+	if summary.WritePipeline["put-only-c32"].EndToEndMeanMillis == 0 {
+		t.Fatalf("write pipeline summary missing end_to_end mean: %#v", summary.WritePipeline["put-only-c32"])
+	}
+}
+
+func TestRunDurabilityBenchWritesStableJSON(t *testing.T) {
+	outputPath := filepath.Join(t.TempDir(), "durability.json")
+	if err := RunDurabilityBench(context.Background(), DurabilityBenchConfig{
+		Path:       filepath.Join(t.TempDir(), "bench-data"),
+		Label:      "test-path",
+		OutputPath: outputPath,
+		Count:      5,
+	}); err != nil {
+		t.Fatalf("RunDurabilityBench returned error: %v", err)
+	}
+	var report DurabilityBenchReport
+	if err := LoadJSON(outputPath, &report); err != nil {
+		t.Fatalf("LoadJSON returned error: %v", err)
+	}
+	if got, want := report.Label, "test-path"; got != want {
+		t.Fatalf("report.Label = %q, want %q", got, want)
+	}
+	if len(report.Tests) != 3 {
+		t.Fatalf("len(report.Tests) = %d, want 3", len(report.Tests))
 	}
 }
 

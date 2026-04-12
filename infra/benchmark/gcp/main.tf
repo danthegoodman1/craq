@@ -126,8 +126,9 @@ resource "google_compute_instance" "node" {
   metadata = {
     ssh-keys = "${var.ssh_user}:${var.ssh_public_key}"
     startup-script = templatefile("${path.module}/user_data.sh.tftpl", {
-      role     = each.value.role
-      ssh_user = var.ssh_user
+      role           = each.value.role
+      ssh_user       = var.ssh_user
+      storage_layout = var.storage_layout
     })
   }
 }

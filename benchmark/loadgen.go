@@ -168,6 +168,7 @@ func runScenario(
 	scheduleSnapshot(scenario.Warmup+scenario.Duration, "end")
 
 	type opResult struct {
+		startedAt time.Time
 		at        time.Time
 		latency   time.Duration
 		success   bool
@@ -177,6 +178,7 @@ func runScenario(
 
 	opCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	var stopIssuing atomic.Bool
 	var warmup atomic.Bool
 	if scenario.Warmup > 0 {
 		warmup.Store(true)
@@ -190,6 +192,10 @@ func runScenario(
 	}
 	endTimer := time.NewTimer(scenario.Warmup + scenario.Duration)
 	defer endTimer.Stop()
+	var drainTimer *time.Timer
+	var drainTimerCh <-chan time.Time
+	measuredEnded := false
+	var measuredEndAt time.Time
 
 	results := make(chan opResult, scenario.Concurrency*2)
 	var wg sync.WaitGroup
@@ -204,6 +210,9 @@ func runScenario(
 				case <-opCtx.Done():
 					return
 				default:
+				}
+				if stopIssuing.Load() {
+					return
 				}
 				start := time.Now()
 				kind := scenario.Kind
@@ -229,6 +238,7 @@ func runScenario(
 				}
 				cancel()
 				result := opResult{
+					startedAt: start.UTC(),
 					at:        time.Now().UTC(),
 					latency:   time.Since(start),
 					success:   callErr == nil,
@@ -269,12 +279,23 @@ func runScenario(
 loop:
 	for {
 		select {
-		case <-ctx.Done():
+	case <-ctx.Done():
 			cancel()
 			<-done
 			return ScenarioReport{}, ctx.Err()
 		case <-endTimer.C:
+			stopIssuing.Store(true)
+			measuredEnded = true
+			measuredEndAt = time.Now().UTC()
+			drainTimer = time.NewTimer(workload.RequestTimeout)
+			drainTimerCh = drainTimer.C
+		case <-drainTimerCh:
 			cancel()
+			drainTimerCh = nil
+			if drainTimer != nil {
+				drainTimer.Stop()
+				drainTimer = nil
+			}
 		case result, ok := <-results:
 			if !ok {
 				break loop
@@ -290,6 +311,16 @@ loop:
 				return ScenarioReport{}, err
 			}
 			if warmup.Load() {
+				continue
+			}
+			if measuredEnded && !result.startedAt.Before(measuredEndAt) {
+				if !result.success && strings.Contains(result.err, context.Canceled.Error()) {
+					report.IgnoredErrorOps++
+				}
+				continue
+			}
+			if measuredEnded && !result.success && strings.Contains(result.err, context.Canceled.Error()) && result.at.After(measuredEndAt) {
+				report.IgnoredErrorOps++
 				continue
 			}
 			report.TotalOps++
@@ -313,6 +344,9 @@ loop:
 	}
 	flushInterval(time.Now().UTC())
 	report.FinishedAt = time.Now().UTC()
+	if drainTimer != nil {
+		drainTimer.Stop()
+	}
 	if err := profiler.wait(); err != nil {
 		return report, err
 	}
@@ -320,7 +354,10 @@ loop:
 	report.P95Millis = percentile(samples, 95)
 	report.P99Millis = percentile(samples, 99)
 	report.MaxMillis = percentile(samples, 100)
-	measuredDuration := report.FinishedAt.Sub(report.StartedAt) - scenario.Warmup
+	measuredDuration := scenario.Duration
+	if !measuredEnded {
+		measuredDuration = report.FinishedAt.Sub(report.StartedAt) - scenario.Warmup
+	}
 	if measuredDuration > 0 {
 		report.Throughput = float64(report.TotalOps) / measuredDuration.Seconds()
 	}

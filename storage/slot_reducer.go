@@ -197,6 +197,9 @@ func ensureProtocolReplicaState(record replicaRecord) replicaRecord {
 	if record.dirtyByKey == nil {
 		record.dirtyByKey = map[string][]dirtyReadEntry{}
 	}
+	if record.committedOverlay == nil {
+		record.committedOverlay = map[string]dirtyReadEntry{}
+	}
 	return record
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestOpenNodeRestoresRecoveredReplicaAndResumePreservesSequence(t *testing.T) {
@@ -98,11 +99,7 @@ func TestOpenNodeRestoresRecoveredReplicaAndResumePreservesSequence(t *testing.T
 	} else if got, want := result.Sequence, uint64(2); got != want {
 		t.Fatalf("post-resume write sequence = %d, want %d", got, want)
 	}
-	if value, found, err := backend.GetCommitted(1, "beta"); err != nil {
-		t.Fatalf("GetCommitted returned error: %v", err)
-	} else if !found || value.Value != "v2" {
-		t.Fatalf("GetCommitted = (%#v, %t), want value v2", value, found)
-	}
+	waitForBackendValue(t, backend, 1, "beta", "v2")
 }
 
 func TestReportRecoveredStateMarksMissingBackendDataAsUnavailable(t *testing.T) {
@@ -139,6 +136,27 @@ func TestReportRecoveredStateMarksMissingBackendDataAsUnavailable(t *testing.T) 
 	report := recoveredCoord.RecoveryReports[0]
 	if report.Replicas[0].HasCommittedData {
 		t.Fatal("HasCommittedData = true, want false")
+	}
+}
+
+func waitForBackendValue(t *testing.T, backend Backend, slot int, key string, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		value, found, err := backend.GetCommitted(slot, key)
+		if err == nil && found && value.Value == want {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if value, found, err := backend.GetCommitted(slot, key); err != nil {
+		t.Fatalf("GetCommitted returned error: %v", err)
+	} else if !found || value.Value != want {
+		highest, seqErr := backend.HighestCommittedSequence(slot)
+		if seqErr != nil {
+			t.Fatalf("GetCommitted = (%#v, %t), want value %s; HighestCommittedSequence error: %v", value, found, want, seqErr)
+		}
+		t.Fatalf("GetCommitted = (%#v, %t), want value %s (highest committed sequence = %d)", value, found, want, highest)
 	}
 }
 

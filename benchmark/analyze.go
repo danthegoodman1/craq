@@ -24,6 +24,8 @@ type AnalysisSummary struct {
 	GitSHA          string                        `json:"git_sha"`
 	Scenarios       []ScenarioReport              `json:"scenarios"`
 	WriteBudget     map[string]WriteBudgetSummary `json:"write_budget,omitempty"`
+	StorageFloor    StorageFloorSummary           `json:"storage_floor,omitempty"`
+	WritePipeline   map[string]WritePipelineBrief `json:"write_pipeline,omitempty"`
 	Coordinator     map[string]float64            `json:"coordinator_metrics"`
 	Storage         map[string]map[string]float64 `json:"storage_metrics"`
 	System          map[string]SystemSeries       `json:"system"`
@@ -84,6 +86,52 @@ type WriteBudgetSummary struct {
 	DominantShare      float64 `json:"dominant_share_percent"`
 }
 
+type StorageFloorSummary struct {
+	Nodes      map[string]StorageFloorNodeSummary `json:"nodes,omitempty"`
+	Aggregates map[string]StorageFloorAggregate   `json:"aggregates,omitempty"`
+}
+
+type StorageFloorNodeSummary struct {
+	CurrentPath     map[string]DurabilityBenchmarkStat `json:"current_path,omitempty"`
+	RootDiskControl map[string]DurabilityBenchmarkStat `json:"root_disk_control,omitempty"`
+}
+
+type StorageFloorAggregate struct {
+	CurrentPathP50Millis     float64 `json:"current_path_p50_ms"`
+	RootDiskControlP50Millis float64 `json:"root_disk_control_p50_ms"`
+}
+
+type WritePipelineSummary struct {
+	RunID     string                           `json:"run_id"`
+	Generated time.Time                        `json:"generated_at"`
+	Scenarios map[string]WritePipelineScenario `json:"scenarios,omitempty"`
+	Brief     map[string]WritePipelineBrief    `json:"-"`
+}
+
+type WritePipelineScenario struct {
+	Scenario                   string                   `json:"scenario"`
+	SampledWrites              int                      `json:"sampled_writes"`
+	Stages                     map[string]StageDuration `json:"stages,omitempty"`
+	MetricMeans                map[string]float64       `json:"metric_means_ms,omitempty"`
+	SessionQueueDepthHighWater map[string]float64       `json:"session_queue_depth_high_water,omitempty"`
+}
+
+type WritePipelineBrief struct {
+	SampledWrites              int     `json:"sampled_writes"`
+	EndToEndMeanMillis         float64 `json:"end_to_end_mean_ms"`
+	HeadQueueWaitMeanMillis    float64 `json:"head_queue_wait_mean_ms"`
+	MiddleQueueWaitMeanMillis  float64 `json:"middle_queue_wait_mean_ms"`
+	TailQueueWaitMeanMillis    float64 `json:"tail_queue_wait_mean_ms"`
+	CommitFlushMeanMillis      float64 `json:"commit_flush_mean_ms"`
+	OwnerCallbackMeanMillis    float64 `json:"owner_callback_mean_ms"`
+	SessionQueueWaitMeanMillis float64 `json:"session_queue_wait_mean_ms"`
+}
+
+type StageDuration struct {
+	Count      int     `json:"count"`
+	MeanMillis float64 `json:"mean_ms"`
+}
+
 type SystemSeries struct {
 	CPUUtilization []Point `json:"cpu_utilization"`
 	NetworkRXMBps  []Point `json:"network_rx_mbps"`
@@ -114,6 +162,7 @@ func AnalyzeRun(runDir string) (AnalysisSummary, error) {
 		GitSHA:          state.GitSHA,
 		Scenarios:       report.Scenarios,
 		WriteBudget:     map[string]WriteBudgetSummary{},
+		WritePipeline:   map[string]WritePipelineBrief{},
 		Coordinator:     map[string]float64{},
 		Storage:         map[string]map[string]float64{},
 		System:          map[string]SystemSeries{},
@@ -151,6 +200,20 @@ func AnalyzeRun(runDir string) (AnalysisSummary, error) {
 			}
 		}
 		if err := SaveJSON(filepath.Join(analysisDir, "write_latency_budget.json"), writeBudget); err != nil {
+			return AnalysisSummary{}, err
+		}
+	}
+	if storageFloor, err := buildStorageFloorSummary(runDir); err == nil {
+		summary.StorageFloor = storageFloor
+		if err := SaveJSON(filepath.Join(analysisDir, "storage_floor_summary.json"), storageFloor); err != nil {
+			return AnalysisSummary{}, err
+		}
+	}
+	if writePipeline, err := buildWritePipelineSummary(runDir, report); err == nil {
+		for scenario, brief := range writePipeline.Brief {
+			summary.WritePipeline[scenario] = brief
+		}
+		if err := SaveJSON(filepath.Join(analysisDir, "write_pipeline_summary.json"), writePipeline); err != nil {
 			return AnalysisSummary{}, err
 		}
 	}
@@ -217,6 +280,11 @@ type histogramCountSum struct {
 type labeledHistogram struct {
 	Labels map[string]string
 	Sample histogramCountSum
+}
+
+type labeledGauge struct {
+	Labels map[string]string
+	Value  float64
 }
 
 type writeStageMetricKey struct {
@@ -351,6 +419,68 @@ func loadStorageGRPCSnapshot(metricRoot string, snapshotName string) (map[string
 	return aggregated, nil
 }
 
+func scenarioHistogramMean(metricRoot string, startName string, endName string, family string) (float64, error) {
+	start, err := loadHistogramSnapshot(metricRoot, startName, family)
+	if err != nil {
+		return 0, err
+	}
+	end, err := loadHistogramSnapshot(metricRoot, endName, family)
+	if err != nil {
+		return 0, err
+	}
+	delta := diffHistogramCountSum(start, end)
+	if delta.Count == 0 {
+		return 0, nil
+	}
+	return (delta.Sum / float64(delta.Count)) * 1000, nil
+}
+
+func loadHistogramSnapshot(metricRoot string, snapshotName string, family string) (histogramCountSum, error) {
+	paths, err := snapshotTargetPaths(metricRoot, snapshotName, "storage-")
+	if err != nil {
+		return histogramCountSum{}, err
+	}
+	total := histogramCountSum{}
+	for _, path := range paths {
+		series, err := parseHistogramFamily(path, family)
+		if err != nil {
+			return histogramCountSum{}, err
+		}
+		for _, sample := range series {
+			total.Count += sample.Sample.Count
+			total.Sum += sample.Sample.Sum
+		}
+	}
+	return total, nil
+}
+
+func scenarioGaugeSnapshot(metricRoot string, snapshotName string, family string) (map[string]float64, error) {
+	paths, err := snapshotTargetPaths(metricRoot, snapshotName, "storage-")
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]float64{}
+	for _, path := range paths {
+		series, err := parseGaugeFamily(path, family)
+		if err != nil {
+			return nil, err
+		}
+		for _, sample := range series {
+			key := sample.Labels["kind"]
+			if target := sample.Labels["target"]; target != "" {
+				key += "@" + target
+			}
+			if key == "" {
+				key = filepath.Base(path)
+			}
+			if sample.Value > out[key] {
+				out[key] = sample.Value
+			}
+		}
+	}
+	return out, nil
+}
+
 func snapshotTargetPaths(metricRoot string, snapshotName string, prefix string) ([]string, error) {
 	dir := filepath.Join(metricRoot, snapshotName)
 	entries, err := os.ReadDir(dir)
@@ -406,6 +536,35 @@ func parseHistogramFamily(path string, familyName string) ([]labeledHistogram, e
 				Sum:   hist.GetSampleSum(),
 			},
 		})
+	}
+	return out, nil
+}
+
+func parseGaugeFamily(path string, familyName string) ([]labeledGauge, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	parser := expfmt.TextParser{}
+	families, err := parser.TextToMetricFamilies(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("parse prometheus metrics %q: %w", path, err)
+	}
+	family, ok := families[familyName]
+	if !ok {
+		return nil, nil
+	}
+	out := make([]labeledGauge, 0, len(family.GetMetric()))
+	for _, metric := range family.GetMetric() {
+		gauge := metric.GetGauge()
+		if gauge == nil {
+			continue
+		}
+		labels := map[string]string{}
+		for _, label := range metric.GetLabel() {
+			labels[label.GetName()] = label.GetValue()
+		}
+		out = append(out, labeledGauge{Labels: labels, Value: gauge.GetValue()})
 	}
 	return out, nil
 }
@@ -568,6 +727,203 @@ func diffHistogramCountSum(start histogramCountSum, end histogramCountSum) histo
 		Count: count,
 		Sum:   sum,
 	}
+}
+
+func buildStorageFloorSummary(runDir string) (StorageFloorSummary, error) {
+	summary := StorageFloorSummary{
+		Nodes:      map[string]StorageFloorNodeSummary{},
+		Aggregates: map[string]StorageFloorAggregate{},
+	}
+	currentP50 := map[string][]float64{}
+	controlP50 := map[string][]float64{}
+	for _, nodeID := range []string{"storage-a", "storage-b", "storage-c"} {
+		currentPath := filepath.Join(runDir, "artifacts", nodeID, "storage_floor", "current_path.json")
+		controlPath := filepath.Join(runDir, "artifacts", nodeID, "storage_floor", "root_disk_control.json")
+		var currentReport DurabilityBenchReport
+		var controlReport DurabilityBenchReport
+		if err := LoadJSON(currentPath, &currentReport); err != nil {
+			return StorageFloorSummary{}, err
+		}
+		if err := LoadJSON(controlPath, &controlReport); err != nil {
+			return StorageFloorSummary{}, err
+		}
+		nodeSummary := StorageFloorNodeSummary{
+			CurrentPath:     map[string]DurabilityBenchmarkStat{},
+			RootDiskControl: map[string]DurabilityBenchmarkStat{},
+		}
+		for _, stat := range currentReport.Tests {
+			nodeSummary.CurrentPath[stat.Name] = stat
+			currentP50[stat.Name] = append(currentP50[stat.Name], stat.P50Millis)
+		}
+		for _, stat := range controlReport.Tests {
+			nodeSummary.RootDiskControl[stat.Name] = stat
+			controlP50[stat.Name] = append(controlP50[stat.Name], stat.P50Millis)
+		}
+		summary.Nodes[nodeID] = nodeSummary
+	}
+	for name, samples := range currentP50 {
+		sort.Float64s(samples)
+		control := append([]float64(nil), controlP50[name]...)
+		sort.Float64s(control)
+		summary.Aggregates[name] = StorageFloorAggregate{
+			CurrentPathP50Millis:     percentileFloat(samples, 50),
+			RootDiskControlP50Millis: percentileFloat(control, 50),
+		}
+	}
+	return summary, nil
+}
+
+type writeTraceKey struct {
+	Slot         int
+	Sequence     uint64
+	ChainVersion uint64
+}
+
+type writeTraceArtifactEvent struct {
+	At           time.Time `json:"at"`
+	NodeID       string    `json:"node_id"`
+	Slot         int       `json:"slot"`
+	Sequence     uint64    `json:"sequence"`
+	ChainVersion uint64    `json:"chain_version"`
+	Role         string    `json:"role"`
+	Stage        string    `json:"stage"`
+}
+
+func buildWritePipelineSummary(runDir string, report LoadGenReport) (WritePipelineSummary, error) {
+	metricRoot := filepath.Join(runDir, "artifacts", "client", "metric-snapshots")
+	traceEvents, err := loadWriteTraceEvents(runDir)
+	if err != nil {
+		return WritePipelineSummary{}, err
+	}
+	grouped := map[writeTraceKey]map[string]time.Time{}
+	for _, event := range traceEvents {
+		key := writeTraceKey{Slot: event.Slot, Sequence: event.Sequence, ChainVersion: event.ChainVersion}
+		if grouped[key] == nil {
+			grouped[key] = map[string]time.Time{}
+		}
+		if existing, ok := grouped[key][event.Stage]; !ok || event.At.Before(existing) {
+			grouped[key][event.Stage] = event.At
+		}
+	}
+
+	out := WritePipelineSummary{
+		RunID:     report.RunID,
+		Generated: time.Now().UTC(),
+		Scenarios: map[string]WritePipelineScenario{},
+		Brief:     map[string]WritePipelineBrief{},
+	}
+	for _, scenario := range report.Scenarios {
+		putSummary, ok := scenarioOperationSummary(scenario, "put")
+		if !ok || putSummary.TotalOps == 0 {
+			continue
+		}
+		scenarioStart := scenario.StartedAt.Add(scenario.Warmup)
+		scenarioEnd := scenario.FinishedAt
+		stageSamples := map[string][]float64{}
+		sampledWrites := 0
+		for _, stages := range grouped {
+			headAccepted, ok := stages["head_accepted_write"]
+			if !ok || headAccepted.Before(scenarioStart) || headAccepted.After(scenarioEnd) {
+				continue
+			}
+			sampledWrites++
+			appendTraceDuration(stageSamples, "head_accept_to_forward_accept", stages["head_accepted_write"], stages["head_forward_accepted"])
+			appendTraceDuration(stageSamples, "tail_queue_wait", stages["tail_commit_intent_queued"], stages["tail_flush_start"])
+			appendTraceDuration(stageSamples, "tail_flush", stages["tail_flush_start"], stages["tail_flush_end"])
+			appendTraceDuration(stageSamples, "middle_accept_to_queue", stages["middle_commit_accept_received"], stages["middle_commit_intent_queued"])
+			appendTraceDuration(stageSamples, "middle_queue_wait", stages["middle_commit_intent_queued"], stages["middle_flush_start"])
+			appendTraceDuration(stageSamples, "middle_flush", stages["middle_flush_start"], stages["middle_flush_end"])
+			appendTraceDuration(stageSamples, "head_accept_to_queue", stages["head_commit_accept_received"], stages["head_commit_intent_queued"])
+			appendTraceDuration(stageSamples, "head_queue_wait", stages["head_commit_intent_queued"], stages["head_flush_start"])
+			appendTraceDuration(stageSamples, "head_flush", stages["head_flush_start"], stages["head_flush_end"])
+			appendTraceDuration(stageSamples, "flush_to_waiter_release", stages["head_flush_end"], stages["waiter_released"])
+			appendTraceDuration(stageSamples, "end_to_end", stages["head_accepted_write"], stages["waiter_released"])
+		}
+
+		stages := map[string]StageDuration{}
+		for stage, samples := range stageSamples {
+			stages[stage] = StageDuration{Count: len(samples), MeanMillis: meanFloat(samples)}
+		}
+		startName := sanitizeScenarioName(scenario.Name) + "-start"
+		endName := sanitizeScenarioName(scenario.Name) + "-end"
+		metricMeans := map[string]float64{}
+		for metricName, family := range map[string]string{
+			"commit_flush":         "craq_storage_commit_flush_seconds",
+			"owner_callback_delay": "craq_storage_commit_owner_callback_delay_seconds",
+			"session_queue_wait":   "craq_storage_replication_session_queue_wait_seconds",
+			"commit_batch_ops":     "craq_storage_commit_batch_ops",
+			"commit_batch_bytes":   "craq_storage_commit_batch_bytes",
+		} {
+			meanMillis, err := scenarioHistogramMean(metricRoot, startName, endName, family)
+			if err == nil {
+				metricMeans[metricName] = meanMillis
+			}
+		}
+		sessionDepth, err := scenarioGaugeSnapshot(metricRoot, endName, "craq_storage_replication_session_queue_depth_high_water")
+		if err != nil {
+			sessionDepth = map[string]float64{}
+		}
+		pipelineScenario := WritePipelineScenario{
+			Scenario:                   scenario.Name,
+			SampledWrites:              sampledWrites,
+			Stages:                     stages,
+			MetricMeans:                metricMeans,
+			SessionQueueDepthHighWater: sessionDepth,
+		}
+		out.Scenarios[scenario.Name] = pipelineScenario
+		out.Brief[scenario.Name] = WritePipelineBrief{
+			SampledWrites:              sampledWrites,
+			EndToEndMeanMillis:         stages["end_to_end"].MeanMillis,
+			HeadQueueWaitMeanMillis:    stages["head_queue_wait"].MeanMillis,
+			MiddleQueueWaitMeanMillis:  stages["middle_queue_wait"].MeanMillis,
+			TailQueueWaitMeanMillis:    stages["tail_queue_wait"].MeanMillis,
+			CommitFlushMeanMillis:      metricMeans["commit_flush"],
+			OwnerCallbackMeanMillis:    metricMeans["owner_callback_delay"],
+			SessionQueueWaitMeanMillis: metricMeans["session_queue_wait"],
+		}
+	}
+	return out, nil
+}
+
+func loadWriteTraceEvents(runDir string) ([]writeTraceArtifactEvent, error) {
+	var out []writeTraceArtifactEvent
+	for _, nodeID := range []string{"storage-a", "storage-b", "storage-c"} {
+		path := filepath.Join(runDir, "artifacts", nodeID, "write-pipeline-trace.jsonl")
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			var event writeTraceArtifactEvent
+			if err := json.Unmarshal([]byte(line), &event); err != nil {
+				return nil, fmt.Errorf("decode write trace %q: %w", path, err)
+			}
+			out = append(out, event)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].At.Before(out[j].At) })
+	return out, nil
+}
+
+func appendTraceDuration(samples map[string][]float64, name string, start time.Time, end time.Time) {
+	if start.IsZero() || end.IsZero() || end.Before(start) {
+		return
+	}
+	samples[name] = append(samples[name], end.Sub(start).Seconds()*1000)
+}
+
+func meanFloat(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	total := 0.0
+	for _, value := range values {
+		total += value
+	}
+	return total / float64(len(values))
 }
 
 func buildSystemSeries(path string) (SystemSeries, error) {

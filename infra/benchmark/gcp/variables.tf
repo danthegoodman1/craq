@@ -72,6 +72,15 @@ variable "storage_machine_type" {
   }
 }
 
+variable "storage_layout" {
+  type = string
+
+  validation {
+    condition     = contains(["raid0_ext4", "single_nvme_ext4", "single_nvme_xfs"], var.storage_layout)
+    error_message = "storage_layout must be raid0_ext4, single_nvme_ext4, or single_nvme_xfs."
+  }
+}
+
 variable "coordinator_boot_disk_gib" {
   type = number
 }

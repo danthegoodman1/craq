@@ -33,6 +33,7 @@ func TestRenderTerraformVarsGCP(t *testing.T) {
 				CoordinatorMachineType: "c4a-standard-8",
 				ClientMachineType:      "c4a-standard-16",
 				StorageMachineType:     "c4a-standard-48-lssd",
+				StorageLayout:          "single_nvme_ext4",
 				CoordinatorBootDiskGiB: 100,
 			},
 		},
@@ -47,6 +48,9 @@ func TestRenderTerraformVarsGCP(t *testing.T) {
 	}
 	if got, want := vars["storage_machine_type"], "c4a-standard-48-lssd"; got != want {
 		t.Fatalf("storage_machine_type = %v, want %v", got, want)
+	}
+	if got, want := vars["storage_layout"], "single_nvme_ext4"; got != want {
+		t.Fatalf("storage_layout = %v, want %v", got, want)
 	}
 	if got, want := vars["ssh_public_key"], "ssh-ed25519 AAAATEST bench"; got != want {
 		t.Fatalf("ssh_public_key = %v, want %v", got, want)

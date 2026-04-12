@@ -1,4 +1,4 @@
-name: gcp-c4a-steady-pprof
+name: gcp-c4a-diag-single-nvme-ext4
 gcp:
   project: projectvoice-442316
   region: us-central1
@@ -33,23 +33,22 @@ workload:
     - name: get-only-c64
       kind: get
       concurrency: 64
-      warmup: 10s
-      duration: 30s
+      warmup: 5s
+      duration: 15s
     - name: put-only-c32
       kind: put
       concurrency: 32
-      warmup: 10s
-      duration: 30s
+      warmup: 5s
+      duration: 15s
     - name: mixed-80-20-c64
       kind: mixed
       concurrency: 64
-      warmup: 10s
-      duration: 30s
+      warmup: 5s
+      duration: 15s
       read_percent: 80
 telemetry:
   probe_interval: 1s
   command_interval: 1s
-  extra_run_duration: 30s
-  pprof_cpu_duration: 15s
+  extra_run_duration: 20s
 artifacts:
   root_dir: artifacts/benchmarks

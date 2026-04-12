@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"sync"
 
@@ -43,6 +44,7 @@ type Store struct {
 
 type owner struct {
 	db        *badgerdb.DB
+	path      string
 	closeErr  error
 	closeOnce sync.Once
 }
@@ -80,7 +82,7 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("err in badger.Open: %w", err)
 	}
-	owner := &owner{db: db}
+	owner := &owner{db: db, path: path}
 	if err := owner.cleanupStagedOperationsOnOpen(); err != nil {
 		closeErr := owner.Close()
 		if closeErr != nil {
@@ -119,6 +121,19 @@ func (b *Backend) Close() error {
 
 func (l *LocalStore) Close() error {
 	return l.owner.Close()
+}
+
+func (l *LocalStore) CommitJournal(nodeID string) (storage.CommitJournalStore, error) {
+	return l.CommitJournalShard(nodeID, 0)
+}
+
+func (l *LocalStore) CommitJournalShard(nodeID string, shard int) (storage.CommitJournalStore, error) {
+	journalPath := filepath.Join(l.owner.path, fmt.Sprintf("commit-journal-%s-%02d.log", nodeID, shard))
+	journal, err := storage.OpenFileCommitJournalForLocalState(journalPath)
+	if err != nil {
+		return nil, err
+	}
+	return journal, nil
 }
 
 func (b *Backend) CreateReplica(slot int) error {
@@ -233,10 +248,15 @@ func (b *Backend) ApplyCommittedBatch(_ context.Context, _ string, commits []sto
 	if len(commits) == 0 {
 		return nil
 	}
+	expected := make(map[int]uint64)
 	for _, commit := range commits {
-		highestCommitted, err := b.HighestCommittedSequence(commit.Operation.Slot)
-		if err != nil {
-			return err
+		highestCommitted, ok := expected[commit.Operation.Slot]
+		if !ok {
+			current, err := b.HighestCommittedSequence(commit.Operation.Slot)
+			if err != nil {
+				return err
+			}
+			highestCommitted = current
 		}
 		if commit.Operation.Sequence != highestCommitted+1 {
 			return fmt.Errorf(
@@ -247,6 +267,7 @@ func (b *Backend) ApplyCommittedBatch(_ context.Context, _ string, commits []sto
 				commit.Operation.Sequence,
 			)
 		}
+		expected[commit.Operation.Slot] = commit.Operation.Sequence
 	}
 	if err := runBeforeDurableWrite(opApplyCommittedBatch); err != nil {
 		return err

@@ -9,6 +9,9 @@ command -v mdadm >/dev/null 2>&1 || MISSING_PKGS+=("mdadm")
 command -v nvme >/dev/null 2>&1 || MISSING_PKGS+=("nvme-cli")
 command -v iostat >/dev/null 2>&1 || MISSING_PKGS+=("sysstat")
 command -v pidstat >/dev/null 2>&1 || MISSING_PKGS+=("sysstat")
+if [ "${storage_layout}" = "single_nvme_xfs" ]; then
+  command -v mkfs.xfs >/dev/null 2>&1 || MISSING_PKGS+=("xfsprogs")
+fi
 
 if [ "$${#MISSING_PKGS[@]}" -gt 0 ]; then
   UNIQUE_PKGS=($(printf "%s\n" "$${MISSING_PKGS[@]}" | sort -u))
@@ -19,7 +22,6 @@ mkdir -p /opt/craq-bench/bin /etc/craq-bench /var/lib/craq-bench
 chown -R ${ssh_user}:${ssh_user} /opt/craq-bench /etc/craq-bench /var/lib/craq-bench
 
 if [ "${role}" = "storage" ]; then
-  command -v mdadm >/dev/null 2>&1
   command -v nvme >/dev/null 2>&1
   mkdir -p /var/lib/craq-bench/storage-data
 
@@ -34,16 +36,41 @@ if [ "${role}" = "storage" ]; then
     DEVICES+=("$(readlink -f "$${link}")")
   done
 
-  ARRAY_DEV="/dev/md/craq-bench-storage"
-  if [ ! -e "$${ARRAY_DEV}" ]; then
-    mdadm --create "$${ARRAY_DEV}" --level=0 --raid-devices="$${#DEVICES[@]}" --force --run "$${DEVICES[@]}"
-  fi
+  STORAGE_DEV=""
+  FS_TYPE="ext4"
+  case "${storage_layout}" in
+    raid0_ext4)
+      command -v mdadm >/dev/null 2>&1
+      ARRAY_DEV="/dev/md/craq-bench-storage"
+      if [ ! -e "$${ARRAY_DEV}" ]; then
+        mdadm --create "$${ARRAY_DEV}" --level=0 --raid-devices="$${#DEVICES[@]}" --force --run "$${DEVICES[@]}"
+      fi
+      STORAGE_DEV="$${ARRAY_DEV}"
+      FS_TYPE="ext4"
+      ;;
+    single_nvme_ext4)
+      STORAGE_DEV="$${DEVICES[0]}"
+      FS_TYPE="ext4"
+      ;;
+    single_nvme_xfs)
+      STORAGE_DEV="$${DEVICES[0]}"
+      FS_TYPE="xfs"
+      ;;
+    *)
+      echo "unsupported storage layout: ${storage_layout}" >&2
+      exit 1
+      ;;
+  esac
 
   udevadm settle
-  if ! blkid "$${ARRAY_DEV}" >/dev/null 2>&1; then
-    mkfs.ext4 -F "$${ARRAY_DEV}"
+  if ! blkid "$${STORAGE_DEV}" >/dev/null 2>&1; then
+    if [ "$${FS_TYPE}" = "xfs" ]; then
+      mkfs.xfs -f "$${STORAGE_DEV}"
+    else
+      mkfs.ext4 -F "$${STORAGE_DEV}"
+    fi
   fi
-  grep -q "$${ARRAY_DEV} /var/lib/craq-bench/storage-data" /etc/fstab || echo "$${ARRAY_DEV} /var/lib/craq-bench/storage-data ext4 defaults,nofail 0 2" >> /etc/fstab
+  grep -q "$${STORAGE_DEV} /var/lib/craq-bench/storage-data" /etc/fstab || echo "$${STORAGE_DEV} /var/lib/craq-bench/storage-data $${FS_TYPE} defaults,nofail 0 2" >> /etc/fstab
   mount /var/lib/craq-bench/storage-data || mount -a
   if ! mountpoint -q /var/lib/craq-bench/storage-data; then
     echo "storage-data mount is not active" >&2

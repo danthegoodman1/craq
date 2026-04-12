@@ -51,6 +51,9 @@ type Config struct {
 	Clock                             Clock
 	Logger                            *zerolog.Logger
 	MetricsRegistry                   *prometheus.Registry
+	WriteTraceOutputPath              string
+	WriteTraceSampleRate              int
+	WriteTimeoutArtifactOutputPath    string
 }
 
 type Clock interface {
@@ -169,6 +172,15 @@ type ReplicationTransport interface {
 	FetchCommittedSequence(ctx context.Context, fromNodeID string, slot int) (uint64, error)
 	ForwardWrite(ctx context.Context, toNodeID string, req ForwardWriteRequest) error
 	CommitWrite(ctx context.Context, toNodeID string, req CommitWriteRequest) error
+}
+
+type ReplicationTransportObserver interface {
+	ObserveReplicationSessionQueueWait(kind string, target string, wait time.Duration)
+	ObserveReplicationSessionQueueDepthHighWater(kind string, target string, depth int)
+}
+
+type replicationTransportObserverSetter interface {
+	SetReplicationTransportObserver(observer ReplicationTransportObserver)
 }
 
 type OperationKind string
@@ -521,6 +533,7 @@ type replicaRecord struct {
 	state                            ReplicaState
 	nextSequence                     uint64
 	highestCommittedSequence         uint64
+	materializedCommittedSequence    uint64
 	highestUpstreamConfirmedSequence uint64
 	localDataPresent                 bool
 	lastKnownState                   ReplicaState
@@ -534,6 +547,7 @@ type replicaRecord struct {
 	recentForwardOrder               []uint64
 	recentCommitOrder                []uint64
 	dirtyByKey                       map[string][]dirtyReadEntry
+	committedOverlay                 map[string]dirtyReadEntry
 	inFlightClientWrites             int
 }
 
@@ -590,9 +604,12 @@ type Node struct {
 	runtimeCancel                     context.CancelFunc
 	logger                            zerolog.Logger
 	metrics                           *nodeMetrics
+	pipelineMetrics                   *pipelineMetrics
 	events                            *eventRecorder
 	autoActivateEmptyReplicas         bool
-	commitEngine                      *durableCommitEngine
+	commitJournal                     *commitJournalEngine
+	writeTrace                        *writeTraceRecorder
+	timeoutArtifacts                  *writeTimeoutArtifactRecorder
 }
 
 const defaultWriteCommitTimeout = 5 * time.Second
@@ -658,6 +675,10 @@ func OpenNode(
 	if binder, ok := backend.(localStateBinder); ok {
 		binder.BindLocalStateStore(local)
 	}
+	metricsRegistry := cfg.MetricsRegistry
+	if metricsRegistry == nil {
+		metricsRegistry = prometheus.NewRegistry()
+	}
 
 	node := &Node{
 		nodeID:  cfg.NodeID,
@@ -683,13 +704,34 @@ func OpenNode(
 		writeCommitTimeout:                cfg.WriteCommitTimeout,
 		clock:                             cfg.Clock,
 		logger:                            loggerFromConfig(cfg.Logger),
-		metrics:                           newNodeMetrics(cfg.MetricsRegistry),
+		metrics:                           newNodeMetrics(metricsRegistry),
+		pipelineMetrics:                   newPipelineMetrics(metricsRegistry),
 		events:                            newEventRecorder("storage", cfg.NodeID),
 		autoActivateEmptyReplicas:         cfg.AutoActivateEmptyReplicas,
 		done:                              make(chan struct{}),
 	}
 	node.runtimeCtx, node.runtimeCancel = context.WithCancel(context.Background())
-	node.commitEngine = newDurableCommitEngine(node)
+	if cfg.WriteTraceOutputPath != "" {
+		traceRecorder, err := openWriteTraceRecorder(writeTraceConfig{
+			NodeID:     cfg.NodeID,
+			OutputPath: cfg.WriteTraceOutputPath,
+			SampleRate: cfg.WriteTraceSampleRate,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("open write trace recorder: %w", err)
+		}
+		node.writeTrace = traceRecorder
+	}
+	if cfg.WriteTimeoutArtifactOutputPath != "" {
+		timeoutRecorder, err := openWriteTimeoutArtifactRecorder(cfg.WriteTimeoutArtifactOutputPath)
+		if err != nil {
+			if node.writeTrace != nil {
+				_ = node.writeTrace.Close()
+			}
+			return nil, fmt.Errorf("open write timeout artifact recorder: %w", err)
+		}
+		node.timeoutArtifacts = timeoutRecorder
+	}
 	if node.maxBufferedReplicaMessagesPerSlot == 0 {
 		node.maxBufferedReplicaMessagesPerSlot = 64
 	}
@@ -699,18 +741,32 @@ func OpenNode(
 	if node.clock == nil {
 		node.clock = realClock{}
 	}
+	if setter, ok := repl.(replicationTransportObserverSetter); ok {
+		setter.SetReplicationTransportObserver(node)
+	}
 
+	journals, err := openNodeCommitJournals(local, cfg.NodeID)
+	if err != nil {
+		return nil, fmt.Errorf("open commit journal: %w", err)
+	}
 	persisted, err := node.local.LoadNode(ctx, cfg.NodeID)
 	if err != nil {
+		for _, journal := range journals {
+			if journal != nil {
+				_ = journal.Close()
+			}
+		}
 		return nil, fmt.Errorf("err in node.local.LoadNode: %w", err)
 	}
 	node.highestAcceptedCoordinatorEpoch = persisted.HighestAcceptedCoordinatorEpoch
+	records := make(map[int]replicaRecord, len(persisted.Replicas))
 	for _, replica := range persisted.Replicas {
 		record := replicaRecord{
 			assignment:                       cloneAssignment(replica.Assignment),
 			state:                            ReplicaStateRecovered,
 			nextSequence:                     replica.HighestCommittedSequence + 1,
 			highestCommittedSequence:         replica.HighestCommittedSequence,
+			materializedCommittedSequence:    0,
 			highestUpstreamConfirmedSequence: replica.HighestUpstreamConfirmedSequence,
 			localDataPresent:                 false,
 			lastKnownState:                   replica.LastKnownState,
@@ -719,8 +775,14 @@ func OpenNode(
 		if sequence, err := backend.HighestCommittedSequence(replica.Assignment.Slot); err == nil {
 			record.localDataPresent = true
 			record.highestCommittedSequence = sequence
+			record.materializedCommittedSequence = sequence
 			record.nextSequence = sequence + 1
 		} else if !errors.Is(err, ErrUnknownReplica) {
+			for _, journal := range journals {
+				if journal != nil {
+					_ = journal.Close()
+				}
+			}
 			return nil, fmt.Errorf("err in backend.HighestCommittedSequence: %w", err)
 		}
 		if upstreamBackend, ok := backend.(upstreamConfirmationBackend); ok {
@@ -728,14 +790,31 @@ func OpenNode(
 			if err == nil {
 				record.highestUpstreamConfirmedSequence = sequence
 			} else if !errors.Is(err, ErrUnknownReplica) {
+				for _, journal := range journals {
+					if journal != nil {
+						_ = journal.Close()
+					}
+				}
 				return nil, fmt.Errorf("err in backend.HighestUpstreamConfirmedSequence: %w", err)
 			}
 		}
 		record.highestUpstreamConfirmedSequence = normalizeUpstreamConfirmedSequence(record)
 		record = ensureProtocolReplicaState(record)
-
-		node.publishReplicaSnapshotLocked(replica.Assignment.Slot, publishedReplicaFromRecord(record))
-		node.slotOwners[replica.Assignment.Slot] = newSlotOwner(node, replica.Assignment.Slot, true, record)
+		records[replica.Assignment.Slot] = record
+	}
+	backlog, highWater, err := recoverJournaledReplicaState(journals, records)
+	if err != nil {
+		for _, journal := range journals {
+			if journal != nil {
+				_ = journal.Close()
+			}
+		}
+		return nil, fmt.Errorf("recover journaled replica state: %w", err)
+	}
+	node.commitJournal = newCommitJournalEngine(node, journals, highWater, backlog)
+	for slot, record := range records {
+		node.publishReplicaSnapshotLocked(slot, publishedReplicaFromRecord(record))
+		node.slotOwners[slot] = newSlotOwner(node, slot, true, record)
 	}
 
 	return node, nil
@@ -885,8 +964,14 @@ func (n *Node) Close() error {
 		if n.runtimeCancel != nil {
 			n.runtimeCancel()
 		}
-		if n.commitEngine != nil {
-			n.commitEngine.close()
+		if n.commitJournal != nil {
+			n.commitJournal.close()
+		}
+		if n.writeTrace != nil {
+			_ = n.writeTrace.Close()
+		}
+		if n.timeoutArtifacts != nil {
+			_ = n.timeoutArtifacts.Close()
 		}
 		if n.done != nil {
 			close(n.done)
@@ -952,9 +1037,9 @@ func (n *Node) HandleClientPut(ctx context.Context, req ClientPutRequest) (Commi
 				n.metrics.conditionFailures.Inc()
 			}
 			n.events.record(n.logger, zerolog.WarnLevel, "condition_failed", "storage conditional put failed", ops.IntPtr(req.Slot), ops.Uint64Ptr(req.ExpectedChainVersion), nil, "", "", err)
-			current, found, currentErr := n.backend.GetCommitted(req.Slot, req.Key)
+			current, found, currentErr := n.committedObjectOwned(ctx, req.Slot, req.Key)
 			if currentErr != nil {
-				return CommitResult{}, fmt.Errorf("err in n.backend.GetCommitted: %w", currentErr)
+				return CommitResult{}, currentErr
 			}
 			return CommitResult{}, newConditionFailedError(req.Slot, OperationKindPut, req.ExpectedChainVersion, found, current)
 		}
@@ -995,9 +1080,9 @@ func (n *Node) HandleClientDelete(ctx context.Context, req ClientDeleteRequest) 
 				n.metrics.conditionFailures.Inc()
 			}
 			n.events.record(n.logger, zerolog.WarnLevel, "condition_failed", "storage conditional delete failed", ops.IntPtr(req.Slot), ops.Uint64Ptr(req.ExpectedChainVersion), nil, "", "", err)
-			current, found, currentErr := n.backend.GetCommitted(req.Slot, req.Key)
+			current, found, currentErr := n.committedObjectOwned(ctx, req.Slot, req.Key)
 			if currentErr != nil {
-				return CommitResult{}, fmt.Errorf("err in n.backend.GetCommitted: %w", currentErr)
+				return CommitResult{}, currentErr
 			}
 			return CommitResult{}, newConditionFailedError(req.Slot, OperationKindDelete, req.ExpectedChainVersion, found, current)
 		}
@@ -1174,11 +1259,8 @@ func validateCommitSource(record replicaRecord, req CommitWriteRequest) error {
 }
 
 func (n *Node) CommittedSnapshot(slot int) (Snapshot, error) {
-	snapshot, err := n.backend.CommittedSnapshot(slot)
-	if err != nil {
-		return nil, fmt.Errorf("err in n.backend.CommittedSnapshot: %w", err)
-	}
-	return snapshot, nil
+	snapshot, _, err := n.committedSnapshotWithSequenceOwned(context.Background(), slot)
+	return snapshot, err
 }
 
 // CommittedSnapshotWithSequence returns the committed snapshot and highest
@@ -1294,13 +1376,14 @@ func normalizeReadConsistency(consistency ReadConsistency) ReadConsistency {
 func (n *Node) resolveRead(
 	ctx context.Context,
 	req ClientGetRequest,
+	record replicaRecord,
 	assignment ReplicaAssignment,
 	dirtyEntries []dirtyReadEntry,
 	consistency ReadConsistency,
 ) (CommittedObject, bool, error) {
-	object, found, err := n.backend.GetCommitted(req.Slot, req.Key)
+	object, found, err := n.committedObject(record, req.Slot, req.Key)
 	if err != nil {
-		return CommittedObject{}, false, fmt.Errorf("err in n.backend.GetCommitted: %w", err)
+		return CommittedObject{}, false, err
 	}
 	if consistency == ReadConsistencyLocalCommitted ||
 		assignment.Role == ReplicaRoleTail ||
@@ -1347,6 +1430,17 @@ func (n *Node) resolveRead(
 		default:
 			return CommittedObject{}, false, fmt.Errorf("%w: unsupported operation kind %q", ErrInvalidConfig, entry.Operation.Kind)
 		}
+	}
+	return object, found, nil
+}
+
+func (n *Node) committedObject(record replicaRecord, slot int, key string) (CommittedObject, bool, error) {
+	if overlay, overlayFound, ok := recordCommittedOverlayObject(record, key); ok {
+		return overlay, overlayFound, nil
+	}
+	object, found, err := n.backend.GetCommitted(slot, key)
+	if err != nil {
+		return CommittedObject{}, false, fmt.Errorf("err in n.backend.GetCommitted: %w", err)
 	}
 	return object, found, nil
 }

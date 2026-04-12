@@ -3,6 +3,8 @@ package storage
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -135,6 +137,48 @@ func TestWriteStageMetricsRecordCommitWaitErrors(t *testing.T) {
 	assertWriteStageCount(t, registry, string(writeStageHeadForwardRPC), string(ReplicaRoleHead), writeStageResultSuccess, 1)
 	assertWriteStageCount(t, registry, string(writeStageHeadWaitForCommit), string(ReplicaRoleHead), writeStageResultSuccess, 0)
 	assertWriteStageCount(t, registry, string(writeStageHeadWaitForCommit), string(ReplicaRoleHead), writeStageResultError, 1)
+}
+
+func TestWriteTraceRecorderWritesJSONL(t *testing.T) {
+	recorder, err := openWriteTraceRecorder(writeTraceConfig{
+		NodeID:     "node-a",
+		OutputPath: filepath.Join(t.TempDir(), "trace.jsonl"),
+		SampleRate: 1,
+	})
+	if err != nil {
+		t.Fatalf("openWriteTraceRecorder returned error: %v", err)
+	}
+	defer func() { _ = recorder.Close() }()
+	recorder.record(7, 11, 3, ReplicaRoleHead, "head_accepted_write")
+	recorder.record(7, 11, 3, ReplicaRoleHead, "waiter_released")
+	if err := recorder.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(recorder.file.Name()), filepath.Base(recorder.file.Name())))
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("trace output was empty")
+	}
+}
+
+func TestWriteTraceSamplerIsDeterministic(t *testing.T) {
+	recorder, err := openWriteTraceRecorder(writeTraceConfig{
+		NodeID:     "node-a",
+		OutputPath: filepath.Join(t.TempDir(), "trace.jsonl"),
+		SampleRate: 1024,
+	})
+	if err != nil {
+		t.Fatalf("openWriteTraceRecorder returned error: %v", err)
+	}
+	defer func() { _ = recorder.Close() }()
+	first := recorder.shouldSample(9, 12, 2)
+	for i := 0; i < 10; i++ {
+		if got := recorder.shouldSample(9, 12, 2); got != first {
+			t.Fatalf("shouldSample changed across calls: got=%v want=%v", got, first)
+		}
+	}
 }
 
 func assertWriteStageCount(t *testing.T, registry *prometheus.Registry, stage string, role string, result string, want uint64) {

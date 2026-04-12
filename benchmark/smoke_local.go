@@ -218,12 +218,13 @@ func runLocalSmoke(ctx context.Context, runDir string, state RunState, manifest 
 
 	for _, nodeID := range []string{"a", "b", "c"} {
 		cfg := StorageProcessConfig{
-			ManifestPath:       state.ManifestPath,
-			NodeID:             nodeID,
-			DataDir:            filepath.Join(runDir, "local", "storage-"+nodeID),
-			HeartbeatInterval:  state.Profile.Cluster.HeartbeatInterval,
-			ActivationInterval: state.Profile.Cluster.ActivationInterval,
-			RPCDeadline:        state.Profile.Cluster.RPCDeadline,
+			ManifestPath:         state.ManifestPath,
+			NodeID:               nodeID,
+			DataDir:              filepath.Join(runDir, "local", "storage-"+nodeID),
+			HeartbeatInterval:    state.Profile.Cluster.HeartbeatInterval,
+			ActivationInterval:   state.Profile.Cluster.ActivationInterval,
+			RPCDeadline:          state.Profile.Cluster.RPCDeadline,
+			WriteTimeoutArtifacts: filepath.Join(runDir, "local", "storage-"+nodeID, "write-timeout-artifacts.jsonl"),
 		}
 		if err := SaveJSON(filepath.Join(runDir, "rendered", "local", "storage-"+nodeID+".json"), cfg); err != nil {
 			return LocalSmokeReport{}, err

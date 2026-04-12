@@ -71,6 +71,35 @@ func CollectArtifacts(ctx context.Context, cfg CollectConfig) (ArtifactManifest,
 				return ArtifactManifest{}, err
 			}
 		}
+		for _, name := range []string{"current_path.json", "root_disk_control.json", "topology.txt"} {
+			if err := collectRemoteFile(
+				ctx,
+				cfg,
+				host,
+				"sudo cat "+shellQuote(filepath.Join(cfg.RemoteRunRoot, "storage-"+node.ID, "storage_floor", name)),
+				filepath.Join(nodeDir, "storage_floor", name),
+			); err != nil {
+				return ArtifactManifest{}, err
+			}
+		}
+		if err := collectRemoteFile(
+			ctx,
+			cfg,
+			host,
+			"sudo cat "+shellQuote(filepath.Join(cfg.RemoteRunRoot, "storage-"+node.ID, "write-pipeline-trace.jsonl")),
+			filepath.Join(nodeDir, "write-pipeline-trace.jsonl"),
+		); err != nil {
+			return ArtifactManifest{}, err
+		}
+		if err := collectOptionalRemoteFile(
+			ctx,
+			cfg,
+			host,
+			"sudo cat "+shellQuote(filepath.Join(cfg.RemoteRunRoot, "storage-"+node.ID, "write-timeout-artifacts.jsonl")),
+			filepath.Join(nodeDir, "write-timeout-artifacts.jsonl"),
+		); err != nil {
+			return ArtifactManifest{}, err
+		}
 	}
 	manifestFile, err := BuildArtifactManifest(cfg.OutputDir, cfg.RunID)
 	if err != nil {
@@ -134,6 +163,16 @@ func collectRemoteFile(ctx context.Context, cfg CollectConfig, host string, comm
 		return err
 	}
 	return os.WriteFile(outputPath, data, 0o644)
+}
+
+func collectOptionalRemoteFile(ctx context.Context, cfg CollectConfig, host string, command string, outputPath string) error {
+	if err := collectRemoteFile(ctx, cfg, host, command, outputPath); err != nil {
+		if strings.Contains(err.Error(), "No such file or directory") {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func hostPart(address string) string {

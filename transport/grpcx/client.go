@@ -530,6 +530,7 @@ type ReplicationTransport struct {
 	mu       sync.Mutex
 	sessions map[string]*replicationPeerSession
 	nextID   uint64
+	observer storage.ReplicationTransportObserver
 }
 
 func NewReplicationTransport(pool *ConnPool) *ReplicationTransport {
@@ -540,6 +541,18 @@ func NewReplicationTransport(pool *ConnPool) *ReplicationTransport {
 		pool:     pool,
 		sessions: map[string]*replicationPeerSession{},
 	}
+}
+
+func (t *ReplicationTransport) SetReplicationTransportObserver(observer storage.ReplicationTransportObserver) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.observer = observer
+}
+
+func (t *ReplicationTransport) currentObserver() storage.ReplicationTransportObserver {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.observer
 }
 
 func (t *ReplicationTransport) FetchSnapshot(ctx context.Context, fromTarget string, slot int) (storage.Snapshot, uint64, error) {

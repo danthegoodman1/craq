@@ -198,11 +198,7 @@ func TestBadgerNodeRestartRecoveryAndClose(t *testing.T) {
 	} else if result.Sequence != 2 {
 		t.Fatalf("SubmitPut after reopen sequence = %d, want 2", result.Sequence)
 	}
-	if read, found, err := reopenedBackend.GetCommitted(1, "beta"); err != nil {
-		t.Fatalf("GetCommitted returned error: %v", err)
-	} else if !found || read.Value != "v2" {
-		t.Fatalf("GetCommitted = (%#v, %t), want value v2", read, found)
-	}
+	waitForBackendValue(t, reopenedBackend, 1, "beta", "v2")
 }
 
 func TestBadgerOpenCleansStagedOperations(t *testing.T) {
@@ -258,6 +254,23 @@ func TestBadgerOpenCleansStagedOperations(t *testing.T) {
 		t.Fatalf("CommittedSnapshot(slot=2) returned error: %v", err)
 	} else if want := map[string]string{"committed": "v1"}; !reflect.DeepEqual(snapshotValues(got), want) {
 		t.Fatalf("CommittedSnapshot(slot=2) = %v, want %v", got, want)
+	}
+}
+
+func waitForBackendValue(t *testing.T, backend storage.Backend, slot int, key string, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		value, found, err := backend.GetCommitted(slot, key)
+		if err == nil && found && value.Value == want {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if value, found, err := backend.GetCommitted(slot, key); err != nil {
+		t.Fatalf("GetCommitted returned error: %v", err)
+	} else if !found || value.Value != want {
+		t.Fatalf("GetCommitted = (%#v, %t), want value %s", value, found, want)
 	}
 }
 

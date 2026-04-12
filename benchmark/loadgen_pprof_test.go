@@ -3,7 +3,9 @@ package benchmark
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,6 +63,9 @@ func TestCaptureRemoteScenarioProfilesCollectsProfiles(t *testing.T) {
 		}
 	}()
 	t.Cleanup(func() { _ = server.Close(context.Background()) })
+	if err := waitForHTTPServer(ctx, "http://"+address+"/debug/pprof/"); err != nil {
+		t.Fatalf("waitForHTTPServer returned error: %v", err)
+	}
 
 	outputDir := filepath.Join(t.TempDir(), "remote")
 	if err := captureRemoteScenarioProfiles(ctx, outputDir, address, 0, time.Second); err != nil {
@@ -79,4 +84,26 @@ func TestCaptureRemoteScenarioProfilesCollectsProfiles(t *testing.T) {
 			t.Fatalf("profile %s is empty", path)
 		}
 	}
+}
+
+func waitForHTTPServer(ctx context.Context, url string) error {
+	client := &http.Client{Timeout: 200 * time.Millisecond}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	return fmt.Errorf("http server %s did not become ready", url)
 }

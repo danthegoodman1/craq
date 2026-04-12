@@ -1,4 +1,4 @@
-name: gcp-c4a-steady-pprof
+name: gcp-c4a-steady-pprof-single-nvme-ext4
 gcp:
   project: projectvoice-442316
   region: us-central1

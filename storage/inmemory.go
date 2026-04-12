@@ -372,13 +372,15 @@ func (c *InMemoryCoordinatorClient) ReportNodeHeartbeat(_ context.Context, statu
 }
 
 type InMemoryLocalStateStore struct {
-	mu    sync.RWMutex
-	nodes map[string]PersistedNodeState
+	mu       sync.RWMutex
+	nodes    map[string]PersistedNodeState
+	journals map[string]*inMemoryCommitJournal
 }
 
 func NewInMemoryLocalStateStore() *InMemoryLocalStateStore {
 	return &InMemoryLocalStateStore{
-		nodes: map[string]PersistedNodeState{},
+		nodes:    map[string]PersistedNodeState{},
+		journals: map[string]*inMemoryCommitJournal{},
 	}
 }
 
@@ -452,6 +454,22 @@ func (s *InMemoryLocalStateStore) Close() error {
 	return nil
 }
 
+func (s *InMemoryLocalStateStore) CommitJournal(nodeID string) (CommitJournalStore, error) {
+	return s.CommitJournalShard(nodeID, 0)
+}
+
+func (s *InMemoryLocalStateStore) CommitJournalShard(nodeID string, shard int) (CommitJournalStore, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := fmt.Sprintf("%s-%02d", nodeID, shard)
+	if journal, ok := s.journals[key]; ok {
+		return journal, nil
+	}
+	journal := newInMemoryCommitJournal()
+	s.journals[key] = journal
+	return journal, nil
+}
+
 type InMemoryReplicationTransport struct {
 	backends map[string]Backend
 	nodes    map[string]replicationHandler
@@ -473,6 +491,15 @@ func (t *InMemoryReplicationTransport) RegisterNode(nodeID string, node replicat
 }
 
 func (t *InMemoryReplicationTransport) FetchSnapshot(_ context.Context, fromNodeID string, slot int) (Snapshot, uint64, error) {
+	if node, ok := t.nodes[fromNodeID]; ok {
+		if snapshotNode, ok := node.(replicationSnapshotHandler); ok {
+			snapshot, sequence, err := snapshotNode.CommittedSnapshotWithSequence(slot)
+			if err != nil {
+				return nil, 0, fmt.Errorf("err in node.CommittedSnapshotWithSequence: %w", err)
+			}
+			return snapshot, sequence, nil
+		}
+	}
 	backend, ok := t.backends[fromNodeID]
 	if !ok {
 		return nil, 0, fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, fromNodeID)
@@ -501,6 +528,15 @@ func (t *InMemoryReplicationTransport) ForwardWrite(ctx context.Context, toNodeI
 }
 
 func (t *InMemoryReplicationTransport) FetchCommittedSequence(_ context.Context, fromNodeID string, slot int) (uint64, error) {
+	if node, ok := t.nodes[fromNodeID]; ok {
+		if snapshotNode, ok := node.(replicationSnapshotHandler); ok {
+			sequence, err := snapshotNode.HighestCommittedSequence(slot)
+			if err != nil {
+				return 0, fmt.Errorf("err in node.HighestCommittedSequence: %w", err)
+			}
+			return sequence, nil
+		}
+	}
 	backend, ok := t.backends[fromNodeID]
 	if !ok {
 		return 0, fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, fromNodeID)
@@ -527,6 +563,12 @@ func (t *InMemoryReplicationTransport) CommitWrite(ctx context.Context, toNodeID
 type replicationHandler interface {
 	HandleForwardWrite(ctx context.Context, req ForwardWriteRequest) error
 	HandleCommitWrite(ctx context.Context, req CommitWriteRequest) error
+}
+
+type replicationSnapshotHandler interface {
+	replicationHandler
+	CommittedSnapshotWithSequence(slot int) (Snapshot, uint64, error)
+	HighestCommittedSequence(slot int) (uint64, error)
 }
 
 type QueuedReplicationMessage struct {
@@ -572,6 +614,7 @@ func (t *QueuedInMemoryReplicationTransport) FetchSnapshot(ctx context.Context, 
 	hook := t.beforeFetchSnapshot
 	blockSnapshot := t.blockSnapshot
 	backend, ok := t.backends[fromNodeID]
+	node := t.nodes[fromNodeID]
 	t.mu.Unlock()
 	if hook != nil {
 		hook(fromNodeID, slot)
@@ -582,6 +625,13 @@ func (t *QueuedInMemoryReplicationTransport) FetchSnapshot(ctx context.Context, 
 			return nil, 0, ctx.Err()
 		case <-blockSnapshot:
 		}
+	}
+	if snapshotNode, ok := node.(replicationSnapshotHandler); ok {
+		snapshot, sequence, err := snapshotNode.CommittedSnapshotWithSequence(slot)
+		if err != nil {
+			return nil, 0, fmt.Errorf("err in node.CommittedSnapshotWithSequence: %w", err)
+		}
+		return snapshot, sequence, nil
 	}
 	if !ok {
 		return nil, 0, fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, fromNodeID)
@@ -602,6 +652,7 @@ func (t *QueuedInMemoryReplicationTransport) FetchCommittedSequence(ctx context.
 	hook := t.beforeFetchSequence
 	blockSequence := t.blockSequence
 	backend, ok := t.backends[fromNodeID]
+	node := t.nodes[fromNodeID]
 	t.mu.Unlock()
 	if hook != nil {
 		hook(fromNodeID, slot)
@@ -612,6 +663,13 @@ func (t *QueuedInMemoryReplicationTransport) FetchCommittedSequence(ctx context.
 			return 0, ctx.Err()
 		case <-blockSequence:
 		}
+	}
+	if snapshotNode, ok := node.(replicationSnapshotHandler); ok {
+		sequence, err := snapshotNode.HighestCommittedSequence(slot)
+		if err != nil {
+			return 0, fmt.Errorf("err in node.HighestCommittedSequence: %w", err)
+		}
+		return sequence, nil
 	}
 	if !ok {
 		return 0, fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, fromNodeID)

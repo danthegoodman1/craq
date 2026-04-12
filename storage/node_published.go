@@ -37,6 +37,7 @@ func replicaRecordFromPublished(snapshot publishedReplicaSnapshot) replicaRecord
 		state:                            snapshot.state,
 		nextSequence:                     snapshot.highestCommittedSequence + 1,
 		highestCommittedSequence:         snapshot.highestCommittedSequence,
+		materializedCommittedSequence:    snapshot.highestCommittedSequence,
 		highestUpstreamConfirmedSequence: snapshot.highestUpstreamConfirmedSequence,
 		localDataPresent:                 snapshot.localDataPresent,
 		lastKnownState:                   snapshot.lastKnownState,

@@ -103,6 +103,7 @@ type ScenarioReport struct {
 	TotalOps    int64              `json:"total_ops"`
 	SuccessOps  int64              `json:"success_ops"`
 	ErrorOps    int64              `json:"error_ops"`
+	IgnoredErrorOps int64          `json:"ignored_error_ops,omitempty"`
 	ReadOps     int64              `json:"read_ops"`
 	WriteOps    int64              `json:"write_ops"`
 	P50Millis   float64            `json:"p50_ms"`
@@ -120,6 +121,7 @@ type OperationSummary struct {
 	TotalOps   int64   `json:"total_ops"`
 	SuccessOps int64   `json:"success_ops"`
 	ErrorOps   int64   `json:"error_ops"`
+	IgnoredErrorOps int64 `json:"ignored_error_ops,omitempty"`
 	P50Millis  float64 `json:"p50_ms"`
 	P95Millis  float64 `json:"p95_ms"`
 	P99Millis  float64 `json:"p99_ms"`

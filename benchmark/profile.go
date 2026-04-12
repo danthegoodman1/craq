@@ -14,6 +14,7 @@ import (
 const (
 	DefaultTopology        = "single-zone"
 	DefaultClientPlacement = "same-zone"
+	DefaultStorageLayout   = "single_nvme_ext4"
 )
 
 type Profile struct {
@@ -34,6 +35,7 @@ type GCPProfile struct {
 	ClientMachineType      string   `yaml:"client_machine_type" json:"client_machine_type"`
 	StorageMachineType     string   `yaml:"storage_machine_type" json:"storage_machine_type"`
 	CoordinatorBootDiskGiB int      `yaml:"coordinator_boot_disk_gib" json:"coordinator_boot_disk_gib"`
+	StorageLayout          string   `yaml:"storage_layout" json:"storage_layout"`
 }
 
 type ClusterProfile struct {
@@ -124,6 +126,9 @@ func (p *Profile) ApplyDefaults() {
 	}
 	if p.GCP.CoordinatorBootDiskGiB == 0 {
 		p.GCP.CoordinatorBootDiskGiB = 100
+	}
+	if p.GCP.StorageLayout == "" {
+		p.GCP.StorageLayout = DefaultStorageLayout
 	}
 
 	if p.Cluster.SlotCount == 0 {
@@ -223,6 +228,9 @@ func (p Profile) Validate() error {
 	}
 	if p.GCP.CoordinatorBootDiskGiB <= 0 {
 		return fmt.Errorf("gcp.coordinator_boot_disk_gib must be > 0")
+	}
+	if !slices.Contains([]string{"raid0_ext4", "single_nvme_ext4", "single_nvme_xfs"}, p.GCP.StorageLayout) {
+		return fmt.Errorf("gcp.storage_layout must be one of raid0_ext4, single_nvme_ext4, or single_nvme_xfs")
 	}
 	if p.Cluster.SlotCount <= 0 {
 		return fmt.Errorf("cluster.slot_count must be > 0")

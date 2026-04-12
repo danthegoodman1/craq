@@ -72,6 +72,15 @@ func cloneReplicaRecord(record replicaRecord) replicaRecord {
 			cloned.dirtyByKey[key] = clonedEntries
 		}
 	}
+	if record.committedOverlay != nil {
+		cloned.committedOverlay = make(map[string]dirtyReadEntry, len(record.committedOverlay))
+		for key, entry := range record.committedOverlay {
+			cloned.committedOverlay[key] = dirtyReadEntry{
+				Sequence:  entry.Sequence,
+				Operation: cloneWriteOperation(entry.Operation),
+			}
+		}
+	}
 	return cloned
 }
 
@@ -104,6 +113,67 @@ func persistedReplica(record replicaRecord) PersistedReplica {
 	}
 }
 
+func recordWithCommittedOverlay(record replicaRecord, operation WriteOperation) replicaRecord {
+	record = ensureProtocolReplicaState(record)
+	record.committedOverlay[operation.Key] = dirtyReadEntry{
+		Sequence:  operation.Sequence,
+		Operation: cloneWriteOperation(operation),
+	}
+	return record
+}
+
+func recordPruneMaterializedOverlay(record replicaRecord, highestMaterialized uint64) replicaRecord {
+	record = ensureProtocolReplicaState(record)
+	if highestMaterialized > record.materializedCommittedSequence {
+		record.materializedCommittedSequence = highestMaterialized
+	}
+	for key, entry := range record.committedOverlay {
+		if entry.Sequence <= highestMaterialized {
+			delete(record.committedOverlay, key)
+		}
+	}
+	if record.materializedCommittedSequence > record.highestCommittedSequence {
+		record.materializedCommittedSequence = record.highestCommittedSequence
+	}
+	return record
+}
+
+func recordCommittedOverlayObject(record replicaRecord, key string) (CommittedObject, bool, bool) {
+	record = ensureProtocolReplicaState(record)
+	entry, ok := record.committedOverlay[key]
+	if !ok {
+		return CommittedObject{}, false, false
+	}
+	switch entry.Operation.Kind {
+	case OperationKindPut:
+		return CommittedObject{
+			Value:    entry.Operation.Value,
+			Metadata: cloneObjectMetadata(entry.Operation.Metadata),
+		}, true, true
+	case OperationKindDelete:
+		return CommittedObject{}, false, true
+	default:
+		return CommittedObject{}, false, false
+	}
+}
+
+func recordMergedCommittedSnapshot(record replicaRecord, base Snapshot) Snapshot {
+	record = ensureProtocolReplicaState(record)
+	merged := cloneSnapshot(base)
+	for key, entry := range record.committedOverlay {
+		switch entry.Operation.Kind {
+		case OperationKindPut:
+			merged[key] = CommittedObject{
+				Value:    entry.Operation.Value,
+				Metadata: cloneObjectMetadata(entry.Operation.Metadata),
+			}
+		case OperationKindDelete:
+			delete(merged, key)
+		}
+	}
+	return merged
+}
+
 func normalizeUpstreamConfirmedSequence(record replicaRecord) uint64 {
 	if record.assignment.Role == ReplicaRoleHead || record.assignment.Role == ReplicaRoleSingle || record.assignment.Peers.PredecessorNodeID == "" {
 		return record.highestCommittedSequence
@@ -125,25 +195,47 @@ func upstreamConfirmedSequenceForLocalCommit(record replicaRecord, sequence uint
 	return confirmed
 }
 
-func (n *Node) applyCommittedOperation(ctx context.Context, commit DurableCommit) (bool, error) {
+func (n *Node) submitCommittedOperation(
+	ctx context.Context,
+	owner *slotOwner,
+	commit DurableCommit,
+	onComplete journalCompletionHandler,
+) error {
 	if commit.UpstreamConfirmedSequence > commit.Operation.Sequence {
 		commit.UpstreamConfirmedSequence = commit.Operation.Sequence
 	}
 	if commit.UpstreamConfirmedSequence == 0 && (commit.Persisted.Assignment.Role == ReplicaRoleHead || commit.Persisted.Assignment.Role == ReplicaRoleSingle || commit.Persisted.Assignment.Peers.PredecessorNodeID == "") {
 		commit.UpstreamConfirmedSequence = commit.Operation.Sequence
 	}
-	committed, applyErr := n.commitEngine.submit(ctx, commit)
-	if applyErr != nil {
-		highestCommitted, err := n.backend.HighestCommittedSequence(commit.Operation.Slot)
-		if err != nil || highestCommitted != commit.Operation.Sequence {
-			return committed, fmt.Errorf("err in n.commitEngine.submit: %w", applyErr)
-		}
-		return true, fmt.Errorf("err in n.commitEngine.submit: %w", applyErr)
+	if n.commitJournal == nil {
+		return fmt.Errorf("%w: commit journal unavailable", ErrInvalidConfig)
 	}
-	return committed, nil
+	if err := n.commitJournal.submitCommit(ctx, owner, commit, onComplete); err != nil {
+		return fmt.Errorf("err in n.commitJournal.submitCommit: %w", err)
+	}
+	return nil
+}
+
+func (n *Node) submitUpstreamConfirmedSequence(
+	ctx context.Context,
+	owner *slotOwner,
+	assignment ReplicaAssignment,
+	sequence uint64,
+	onComplete journalCompletionHandler,
+) error {
+	if n.commitJournal == nil {
+		return fmt.Errorf("%w: commit journal unavailable", ErrInvalidConfig)
+	}
+	if err := n.commitJournal.submitUpstreamConfirm(ctx, owner, assignment, sequence, onComplete); err != nil {
+		return fmt.Errorf("err in n.commitJournal.submitUpstreamConfirm: %w", err)
+	}
+	return nil
 }
 
 func (n *Node) writeActuallyCommitted(slot int, sequence uint64) bool {
+	if n.commitJournal != nil && n.commitJournal.committedSequence(slot) >= sequence {
+		return true
+	}
 	highestCommitted, err := n.backend.HighestCommittedSequence(slot)
 	if err != nil {
 		return false
@@ -151,15 +243,28 @@ func (n *Node) writeActuallyCommitted(slot int, sequence uint64) bool {
 	return highestCommitted >= sequence
 }
 
-func (n *Node) recordUpstreamCommitConfirmed(slot int, sequence uint64) error {
-	backend, ok := n.backend.(upstreamConfirmationBackend)
+func (n *Node) shouldMaterializeCommit(commit DurableCommit) bool {
+	record, ok := n.publishedReplicaSnapshot(commit.Operation.Slot)
 	if !ok {
-		return nil
+		return false
 	}
-	if err := backend.SetHighestUpstreamConfirmedSequence(slot, sequence); err != nil && !errors.Is(err, ErrUnknownReplica) {
-		return fmt.Errorf("err in backend.SetHighestUpstreamConfirmedSequence: %w", err)
+	return record.assignment.ChainVersion == commit.Persisted.Assignment.ChainVersion
+}
+
+func (n *Node) existingSlotOwner(slot int) *slotOwner {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.slotOwners[slot]
+}
+
+func (n *Node) notifyMaterialized(slot int, highest uint64) {
+	owner := n.existingSlotOwner(slot)
+	if owner == nil {
+		return
 	}
-	return nil
+	_ = owner.enqueue(func(runtime *slotRuntime) {
+		runtime.markMaterialized(highest)
+	})
 }
 
 func (n *Node) ensureBackendReplica(slot int) error {

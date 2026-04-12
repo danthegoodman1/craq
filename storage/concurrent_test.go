@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -61,14 +62,18 @@ func TestConcurrentForwardAndCommitOnSameSlot(t *testing.T) {
 		want[fmt.Sprintf("key-%d", seq)] = fmt.Sprintf("val-%d", seq)
 	}
 
-	// Middle and tail must agree on the committed data and have no leftovers.
+	// Middle and tail must eventually agree on the committed data and have no
+	// leftovers. The middle handler now returns after downstream acceptance,
+	// so commit propagation can still be finishing when the last forward call
+	// returns.
+	//
 	// The head is excluded: it receives CommitWrite acks that get buffered
 	// (it never staged these writes via SubmitPut).
 	replicatingNodes := map[string]*Node{
 		"middle": nodes["middle"],
 		"tail":   nodes["tail"],
 	}
-	assertCommittedStateEqual(t, replicatingNodes, slot, want, uint64(numForwards))
+	assertCommittedStateEqualEventually(t, replicatingNodes, slot, want, uint64(numForwards))
 }
 
 // TestConcurrentWriteAndMarkLeavingOnSameSlot verifies that a SubmitPut and
@@ -188,5 +193,41 @@ func TestConcurrentForwardsOnSameSlot(t *testing.T) {
 	}
 	if staged := mustNodeStagedSequences(t, nodes["tail"], slot); len(staged) != 0 {
 		t.Fatalf("tail has %d staged sequences, want 0: %v", len(staged), staged)
+	}
+}
+
+func assertCommittedStateEqualEventually(t *testing.T, nodes map[string]*Node, slot int, want map[string]string, wantSequence uint64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		matched := true
+		for _, node := range nodes {
+			snapshot, err := node.CommittedSnapshot(slot)
+			if err != nil {
+				matched = false
+				break
+			}
+			if got := snapshotValues(snapshot); !reflect.DeepEqual(got, want) {
+				matched = false
+				break
+			}
+			highest, err := node.HighestCommittedSequence(slot)
+			if err != nil || highest != wantSequence {
+				matched = false
+				break
+			}
+			staged, err := node.StagedSequences(slot)
+			if err != nil || len(staged) != 0 {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return
+		}
+		if time.Now().After(deadline) {
+			assertCommittedStateEqual(t, nodes, slot, want, wantSequence)
+		}
+		time.Sleep(250 * time.Microsecond)
 	}
 }

@@ -255,6 +255,7 @@ func renderTerraformVars(state RunState, runDir string) (map[string]any, error) 
 		"coordinator_machine_type":  state.Profile.GCP.CoordinatorMachineType,
 		"client_machine_type":       state.Profile.GCP.ClientMachineType,
 		"storage_machine_type":      state.Profile.GCP.StorageMachineType,
+		"storage_layout":            state.Profile.GCP.StorageLayout,
 		"coordinator_boot_disk_gib": state.Profile.GCP.CoordinatorBootDiskGiB,
 	}, nil
 }
@@ -395,6 +396,9 @@ func deployAndRun(ctx context.Context, state RunState, manifestPath string, binP
 	if err := installSystemdUnits(ctx, state); err != nil {
 		return err
 	}
+	if err := captureStorageDiagnostics(ctx, state); err != nil {
+		return err
+	}
 	if err := startRemoteTelemetry(ctx, state); err != nil {
 		return err
 	}
@@ -453,12 +457,15 @@ func installRemoteConfigs(ctx context.Context, state RunState, manifestPath stri
 	}
 	for _, nodeID := range []string{"a", "b", "c"} {
 		cfg := StorageProcessConfig{
-			ManifestPath:       "/etc/craq-bench/manifest.json",
-			NodeID:             nodeID,
-			DataDir:            filepath.Join("/var/lib/craq-bench/storage-data", nodeID),
-			HeartbeatInterval:  state.Profile.Cluster.HeartbeatInterval,
-			ActivationInterval: state.Profile.Cluster.ActivationInterval,
-			RPCDeadline:        state.Profile.Cluster.RPCDeadline,
+			ManifestPath:         "/etc/craq-bench/manifest.json",
+			NodeID:               nodeID,
+			DataDir:              benchmarkStorageDataDir(nodeID),
+			HeartbeatInterval:    state.Profile.Cluster.HeartbeatInterval,
+			ActivationInterval:   state.Profile.Cluster.ActivationInterval,
+			RPCDeadline:          state.Profile.Cluster.RPCDeadline,
+			WriteTraceOutput:     filepath.Join(runRoot, "storage-"+nodeID, "write-pipeline-trace.jsonl"),
+			WriteTraceSampleRate: 1024,
+			WriteTimeoutArtifacts: filepath.Join(runRoot, "storage-"+nodeID, "write-timeout-artifacts.jsonl"),
 		}
 		configs["storage-"+nodeID+".json"] = mustJSON(cfg)
 	}
@@ -497,6 +504,46 @@ func installRemoteConfigs(ctx context.Context, state RunState, manifestPath stri
 			if err := SSH(ctx, ssh, host, "sudo install -m 0644 /tmp/craq-bench/"+fileName+" /etc/craq-bench/"+targetName); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+func benchmarkStorageDataDir(nodeID string) string {
+	return filepath.Join("/var/lib/craq-bench/storage-data", nodeID)
+}
+
+func remoteStorageFloorDir(runID string, nodeID string) string {
+	return filepath.Join("/var/lib/craq-bench/runs", runID, "storage-"+nodeID, "storage_floor")
+}
+
+func captureStorageDiagnostics(ctx context.Context, state RunState) error {
+	logProgress("capturing storage layout diagnostics and durability floor on storage nodes")
+	ssh := SSHConfig{User: state.Profile.GCP.SSHUser, PrivateKey: state.SSHPrivateKey, JumpPublicIP: state.TerraformOutputs.PublicClientIP}
+	for _, nodeID := range []string{"a", "b", "c"} {
+		host := state.TerraformOutputs.PrivateIPs["storage-"+nodeID]
+		floorDir := remoteStorageFloorDir(state.RunID, nodeID)
+		currentDataDir := benchmarkStorageDataDir(nodeID)
+		rootControlDir := filepath.Join("/var/lib/craq-bench/root-disk-control", nodeID)
+		logProgress("running storage floor diagnostics on storage-%s", nodeID)
+		if err := SSH(ctx, ssh, host, "bash -lc "+shellQuote(fmt.Sprintf(
+			"mkdir -p %s %s && /opt/craq-bench/bin/craq-bench durability-bench --path %s --label current_path --output %s && /opt/craq-bench/bin/craq-bench durability-bench --path %s --label root_disk_control --output %s",
+			shellQuote(floorDir),
+			shellQuote(rootControlDir),
+			shellQuote(currentDataDir),
+			shellQuote(filepath.Join(floorDir, "current_path.json")),
+			shellQuote(rootControlDir),
+			shellQuote(filepath.Join(floorDir, "root_disk_control.json")),
+		))); err != nil {
+			return fmt.Errorf("capture storage floor diagnostics for storage-%s: %w", nodeID, err)
+		}
+		topologyPath := filepath.Join(floorDir, "topology.txt")
+		topologyCommand := strings.Join([]string{
+			fmt.Sprintf("mkdir -p %s", shellQuote(floorDir)),
+			fmt.Sprintf("{ echo '=== findmnt ==='; findmnt -T /var/lib/craq-bench/storage-data 2>&1; echo; echo '=== lsblk -f ==='; lsblk -f 2>&1; echo; echo '=== mdadm --detail ==='; sudo mdadm --detail /dev/md/craq-bench-storage 2>&1 || true; echo; echo '=== nvme list ==='; sudo nvme list 2>&1 || true; echo; echo '=== queue settings ==='; for queue in /sys/block/*/queue; do dev=\"$(basename \"$(dirname \"$queue\")\")\"; echo \"[$dev]\"; for name in scheduler nr_requests read_ahead_kb rotational write_cache; do if [ -f \"$queue/$name\" ]; then printf '  %%s=%%s\\n' \"$name\" \"$(cat \"$queue/$name\")\"; fi; done; echo; done; } > %s", shellQuote(topologyPath)),
+		}, "\n")
+		if err := SSH(ctx, ssh, host, "bash -lc "+shellQuote(topologyCommand)); err != nil {
+			return fmt.Errorf("capture storage topology for storage-%s: %w", nodeID, err)
 		}
 	}
 	return nil

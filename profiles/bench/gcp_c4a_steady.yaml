@@ -8,6 +8,7 @@ gcp:
   coordinator_machine_type: c4a-standard-8
   client_machine_type: c4a-standard-16
   storage_machine_type: c4a-standard-48-lssd
+  storage_layout: single_nvme_ext4
   coordinator_boot_disk_gib: 100
 cluster:
   slot_count: 1024

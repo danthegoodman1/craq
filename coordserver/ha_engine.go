@@ -70,65 +70,74 @@ func (s *Server) applyHAReplicaReady(
 	_ uint64,
 	commandID string,
 ) (coordruntime.State, error) {
-	if err := s.ensureLeader(ctx); err != nil {
-		return coordruntime.State{}, err
-	}
-	snapshot, err := s.readHASnapshot(ctx)
-	if err != nil {
-		return coordruntime.State{}, err
-	}
-	current := slotProgressViewFromState(snapshot.State, slot)
-	reduction, err := reduceReplicaReadyProgress(current, nodeID, commandID, 0)
-	if err != nil {
-		return coordruntime.State{}, err
-	}
-	if reduction.duplicateCompleted {
-		return snapshot.State, nil
-	}
-	readyRefreshState := reduction.peerRefreshState
-	if reduction.enqueuePeerRefresh &&
-		!readyRefreshState.useFallbackRoute &&
-		len(readyRefreshState.assignmentChain.Replicas) == 0 {
-		fallback := activeServingChain(current.Chain)
-		if len(fallback.Replicas) > 0 {
-			readyRefreshState = activePeerRefreshState{
-				fallbackServingChain: fallback,
-				useFallbackRoute:     true,
+	for attempt := 0; attempt < 8; attempt++ {
+		if err := s.ensureLeader(ctx); err != nil {
+			return coordruntime.State{}, err
+		}
+		snapshot, err := s.readHASnapshot(ctx)
+		if err != nil {
+			return coordruntime.State{}, err
+		}
+		current := slotProgressViewFromState(snapshot.State, slot)
+		reduction, err := reduceReplicaReadyProgress(current, nodeID, commandID, attempt)
+		if err != nil {
+			return coordruntime.State{}, err
+		}
+		if reduction.duplicateCompleted {
+			return snapshot.State, nil
+		}
+		readyRefreshState := reduction.peerRefreshState
+		if reduction.enqueuePeerRefresh &&
+			!readyRefreshState.useFallbackRoute &&
+			len(readyRefreshState.assignmentChain.Replicas) == 0 {
+			fallback := activeServingChain(current.Chain)
+			if len(fallback.Replicas) > 0 {
+				readyRefreshState = activePeerRefreshState{
+					fallbackServingChain: fallback,
+					useFallbackRoute:     true,
+				}
 			}
 		}
-	}
-	cmd := coordruntime.Command{
-		ID:              reduction.progressCommandID,
-		ExpectedVersion: snapshot.State.Version,
-		Kind:            coordruntime.CommandKindProgress,
-		Progress: &coordruntime.ProgressCommand{
-			Event: coordinator.Event{
-				Kind:   coordinator.EventKindReplicaBecameActive,
-				NodeID: nodeID,
-				Slot:   slot,
+		cmd := coordruntime.Command{
+			ID:              reduction.progressCommandID,
+			ExpectedVersion: snapshot.State.Version,
+			Kind:            coordruntime.CommandKindProgress,
+			Progress: &coordruntime.ProgressCommand{
+				Event: coordinator.Event{
+					Kind:   coordinator.EventKindReplicaBecameActive,
+					NodeID: nodeID,
+					Slot:   slot,
+				},
 			},
-		},
-	}
-	state, _, err := s.applyHARuntimeCommand(ctx, cmd, func(currentSnapshot HASnapshot, lease LeaderLease, evaluated coordruntime.EvaluatedCommand) (HASnapshot, error) {
-		next := cloneHASnapshot(currentSnapshot)
-		next.State = evaluated.NextState
-		next.Heartbeats = nextHAHeartbeats(currentSnapshot.Heartbeats, cmd, next.State.NodeLivenessByID)
-		next.ActivePeerRefresh = cloneHAActivePeerRefreshMap(currentSnapshot.ActivePeerRefresh)
-		if reduction.enqueuePeerRefresh {
-			next.ActivePeerRefresh[slot] = snapshotHAActivePeerRefreshState(readyRefreshState)
 		}
-		next.StartupBudgetActive = nextHAStartupBudgetActive(currentSnapshot, s.startupMaxChangedChains > 0, next.State)
-		next.Outbox = rebuildHAOutbox(next, lease.Epoch)
-		next.PendingEpochBySlot = nextHAPendingEpochs(currentSnapshot.PendingEpochBySlot, currentSnapshot.State.PendingBySlot, next.State.PendingBySlot, next.Outbox)
-		return next, nil
-	})
-	if err != nil {
+		state, _, err := s.applyHARuntimeCommand(ctx, cmd, func(currentSnapshot HASnapshot, lease LeaderLease, evaluated coordruntime.EvaluatedCommand) (HASnapshot, error) {
+			next := cloneHASnapshot(currentSnapshot)
+			next.State = evaluated.NextState
+			next.Heartbeats = nextHAHeartbeats(currentSnapshot.Heartbeats, cmd, next.State.NodeLivenessByID)
+			next.ActivePeerRefresh = cloneHAActivePeerRefreshMap(currentSnapshot.ActivePeerRefresh)
+			if reduction.enqueuePeerRefresh {
+				next.ActivePeerRefresh[slot] = snapshotHAActivePeerRefreshState(readyRefreshState)
+			}
+			next.StartupBudgetActive = nextHAStartupBudgetActive(currentSnapshot, s.startupMaxChangedChains > 0, next.State)
+			next.Outbox = rebuildHAOutbox(next, lease.Epoch)
+			next.PendingEpochBySlot = nextHAPendingEpochs(currentSnapshot.PendingEpochBySlot, currentSnapshot.State.PendingBySlot, next.State.PendingBySlot, next.Outbox)
+			return next, nil
+		})
+		if err == nil {
+			if err := s.applyHAReconcile(ctx); err != nil {
+				if errors.Is(err, coordruntime.ErrVersionMismatch) || errors.Is(err, ErrHASnapshotConflict) {
+					continue
+				}
+				return coordruntime.State{}, err
+			}
+			return s.currentState(), nil
+		}
+		if errors.Is(err, coordruntime.ErrVersionMismatch) || errors.Is(err, ErrHASnapshotConflict) {
+			continue
+		}
 		return state, err
 	}
-	if err := s.applyHAReconcile(ctx); err != nil {
-		return coordruntime.State{}, err
-	}
-	return s.currentState(), nil
+	return coordruntime.State{}, coordruntime.ErrVersionMismatch
 }
 
 func (s *Server) applyHAReplicaRemoved(
@@ -138,58 +147,67 @@ func (s *Server) applyHAReplicaRemoved(
 	_ uint64,
 	commandID string,
 ) (coordruntime.State, error) {
-	if err := s.ensureLeader(ctx); err != nil {
-		return coordruntime.State{}, err
-	}
-	snapshot, err := s.readHASnapshot(ctx)
-	if err != nil {
-		return coordruntime.State{}, err
-	}
-	current := slotProgressViewFromState(snapshot.State, slot)
-	reduction, err := reduceReplicaRemovedProgress(current, nodeID, commandID, 0)
-	if err != nil {
-		return coordruntime.State{}, err
-	}
-	if reduction.duplicateCompleted {
-		return snapshot.State, nil
-	}
-	cmd := coordruntime.Command{
-		ID:              reduction.progressCommandID,
-		ExpectedVersion: snapshot.State.Version,
-		Kind:            coordruntime.CommandKindProgress,
-		Progress: &coordruntime.ProgressCommand{
-			Event: coordinator.Event{
-				Kind:   coordinator.EventKindReplicaRemoved,
-				NodeID: nodeID,
-				Slot:   slot,
-			},
-		},
-	}
-	state, _, err := s.applyHARuntimeCommand(ctx, cmd, func(currentSnapshot HASnapshot, lease LeaderLease, evaluated coordruntime.EvaluatedCommand) (HASnapshot, error) {
-		next := cloneHASnapshot(currentSnapshot)
-		next.State = evaluated.NextState
-		next.Heartbeats = nextHAHeartbeats(currentSnapshot.Heartbeats, cmd, next.State.NodeLivenessByID)
-		next.ActivePeerRefresh = cloneHAActivePeerRefreshMap(currentSnapshot.ActivePeerRefresh)
-		next.ActivePeerRefresh[slot] = snapshotHAActivePeerRefreshState(activePeerRefreshState{})
-		next.StartupBudgetActive = nextHAStartupBudgetActive(currentSnapshot, s.startupMaxChangedChains > 0, next.State)
-		next.Outbox = rebuildHAOutbox(next, lease.Epoch)
-		next.PendingEpochBySlot = nextHAPendingEpochs(currentSnapshot.PendingEpochBySlot, currentSnapshot.State.PendingBySlot, next.State.PendingBySlot, next.Outbox)
-		return next, nil
-	})
-	if err != nil {
-		return state, err
-	}
-	if err := s.applyHAReconcile(ctx); err != nil {
-		return coordruntime.State{}, err
-	}
-	if !s.asyncHotPathDispatch {
-		if err := s.dispatchHAOutboxEntries(ctx, func(entry OutboxEntry) bool {
-			return entry.Slot == slot && entry.Kind == OutboxCommandUpdateChainPeers
-		}); err != nil {
+	for attempt := 0; attempt < 8; attempt++ {
+		if err := s.ensureLeader(ctx); err != nil {
 			return coordruntime.State{}, err
 		}
+		snapshot, err := s.readHASnapshot(ctx)
+		if err != nil {
+			return coordruntime.State{}, err
+		}
+		current := slotProgressViewFromState(snapshot.State, slot)
+		reduction, err := reduceReplicaRemovedProgress(current, nodeID, commandID, attempt)
+		if err != nil {
+			return coordruntime.State{}, err
+		}
+		if reduction.duplicateCompleted {
+			return snapshot.State, nil
+		}
+		cmd := coordruntime.Command{
+			ID:              reduction.progressCommandID,
+			ExpectedVersion: snapshot.State.Version,
+			Kind:            coordruntime.CommandKindProgress,
+			Progress: &coordruntime.ProgressCommand{
+				Event: coordinator.Event{
+					Kind:   coordinator.EventKindReplicaRemoved,
+					NodeID: nodeID,
+					Slot:   slot,
+				},
+			},
+		}
+		state, _, err := s.applyHARuntimeCommand(ctx, cmd, func(currentSnapshot HASnapshot, lease LeaderLease, evaluated coordruntime.EvaluatedCommand) (HASnapshot, error) {
+			next := cloneHASnapshot(currentSnapshot)
+			next.State = evaluated.NextState
+			next.Heartbeats = nextHAHeartbeats(currentSnapshot.Heartbeats, cmd, next.State.NodeLivenessByID)
+			next.ActivePeerRefresh = cloneHAActivePeerRefreshMap(currentSnapshot.ActivePeerRefresh)
+			next.ActivePeerRefresh[slot] = snapshotHAActivePeerRefreshState(activePeerRefreshState{})
+			next.StartupBudgetActive = nextHAStartupBudgetActive(currentSnapshot, s.startupMaxChangedChains > 0, next.State)
+			next.Outbox = rebuildHAOutbox(next, lease.Epoch)
+			next.PendingEpochBySlot = nextHAPendingEpochs(currentSnapshot.PendingEpochBySlot, currentSnapshot.State.PendingBySlot, next.State.PendingBySlot, next.Outbox)
+			return next, nil
+		})
+		if err == nil {
+			if err := s.applyHAReconcile(ctx); err != nil {
+				if errors.Is(err, coordruntime.ErrVersionMismatch) || errors.Is(err, ErrHASnapshotConflict) {
+					continue
+				}
+				return coordruntime.State{}, err
+			}
+			if !s.asyncHotPathDispatch {
+				if err := s.dispatchHAOutboxEntries(ctx, func(entry OutboxEntry) bool {
+					return entry.Slot == slot && entry.Kind == OutboxCommandUpdateChainPeers
+				}); err != nil {
+					return coordruntime.State{}, err
+				}
+			}
+			return s.currentState(), nil
+		}
+		if errors.Is(err, coordruntime.ErrVersionMismatch) || errors.Is(err, ErrHASnapshotConflict) {
+			continue
+		}
+		return state, err
 	}
-	return s.currentState(), nil
+	return coordruntime.State{}, coordruntime.ErrVersionMismatch
 }
 
 func (s *Server) applyHAHeartbeat(ctx context.Context, status storage.NodeStatus) error {
