@@ -83,7 +83,7 @@ func TestThreeReplicaWriteStageMetricsRecordOncePerLogicalWrite(t *testing.T) {
 	assertWriteStageCount(t, headRegistry, string(writeStageHeadWaitForCommit), string(ReplicaRoleHead), writeStageResultSuccess, 1)
 	assertWriteStageCount(t, midRegistry, string(writeStageHeadForwardRPC), string(ReplicaRoleMiddle), writeStageResultSuccess, 1)
 	assertWriteStageCount(t, midRegistry, string(writeStageTailApplyCommit), string(ReplicaRoleMiddle), writeStageResultSuccess, 1)
-	assertWriteStageCount(t, midRegistry, string(writeStageCommitUpstreamRPC), string(ReplicaRoleMiddle), writeStageResultSuccess, 1)
+	assertWriteStageCount(t, midRegistry, string(writeStageCommitUpstreamAcceptRPC), string(ReplicaRoleMiddle), writeStageResultSuccess, 1)
 	assertWriteStageCount(t, tailRegistry, string(writeStageTailApplyCommit), string(ReplicaRoleTail), writeStageResultSuccess, 1)
 	assertWriteStageCount(t, tailRegistry, string(writeStageCommitUpstreamRPC), string(ReplicaRoleTail), writeStageResultSuccess, 1)
 

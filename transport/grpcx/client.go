@@ -555,6 +555,21 @@ func (t *ReplicationTransport) currentObserver() storage.ReplicationTransportObs
 	return t.observer
 }
 
+func (t *ReplicationTransport) ReplicationSessionSnapshots(slot int) []storage.ReplicationSessionSlotSnapshot {
+	t.mu.Lock()
+	sessions := make([]*replicationPeerSession, 0, len(t.sessions))
+	for _, session := range t.sessions {
+		sessions = append(sessions, session)
+	}
+	t.mu.Unlock()
+
+	out := make([]storage.ReplicationSessionSlotSnapshot, 0, len(sessions)*2)
+	for _, session := range sessions {
+		out = append(out, session.slotSnapshots(slot)...)
+	}
+	return out
+}
+
 func (t *ReplicationTransport) FetchSnapshot(ctx context.Context, fromTarget string, slot int) (storage.Snapshot, uint64, error) {
 	conn, err := t.pool.DialContext(ctx, fromTarget)
 	if err != nil {

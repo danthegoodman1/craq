@@ -48,6 +48,8 @@ type nodeMetrics struct {
 	catchupOps             *prometheus.CounterVec
 	catchupDuration        prometheus.Histogram
 	backpressureRejections *prometheus.CounterVec
+	commitGapDetected      prometheus.Counter
+	commitGapRepaired      prometheus.Counter
 	inFlightWrites         prometheus.Gauge
 	bufferedReplicaMsgs    prometheus.Gauge
 	catchups               prometheus.Gauge
@@ -205,6 +207,14 @@ func newNodeMetrics(registry *prometheus.Registry) *nodeMetrics {
 			Name: "craq_storage_backpressure_rejections_total",
 			Help: "Backpressure rejections by resource.",
 		}, []string{"resource"}),
+		commitGapDetected: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "craq_storage_commit_gap_detected_total",
+			Help: "Detected per-slot commit progression gaps.",
+		}),
+		commitGapRepaired: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "craq_storage_commit_gap_repaired_total",
+			Help: "Repaired per-slot commit progression gaps.",
+		}),
 		inFlightWrites: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "craq_storage_in_flight_client_writes",
 			Help: "Current admitted in-flight client writes.",
@@ -234,6 +244,8 @@ func newNodeMetrics(registry *prometheus.Registry) *nodeMetrics {
 		m.catchupOps,
 		m.catchupDuration,
 		m.backpressureRejections,
+		m.commitGapDetected,
+		m.commitGapRepaired,
 		m.inFlightWrites,
 		m.bufferedReplicaMsgs,
 		m.catchups,
@@ -381,4 +393,18 @@ func (n *Node) observeBackpressure(err error) {
 		"",
 		err,
 	)
+}
+
+func (n *Node) observeCommitGapDetected() {
+	if n == nil || n.metrics == nil {
+		return
+	}
+	n.metrics.commitGapDetected.Inc()
+}
+
+func (n *Node) observeCommitGapRepaired() {
+	if n == nil || n.metrics == nil {
+		return
+	}
+	n.metrics.commitGapRepaired.Inc()
 }

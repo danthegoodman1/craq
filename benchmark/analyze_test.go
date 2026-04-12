@@ -108,6 +108,12 @@ func TestAnalyzeRunGeneratesSummaryAndHTML(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	timeoutArtifact := `{"at":"2026-01-01T00:00:00.100Z","node_id":"storage-b","slot":361,"sequence":203,"error":"storage write wait timed out or was canceled: context deadline exceeded","slot_state":{"next_sequence":203,"highest_committed_sequence":202,"materialized_committed_sequence":202,"journal_durable_high_water":202,"highest_upstream_confirmed_sequence":202,"commit_effect_in_flight":true,"commit_effect_sequence":203,"upstream_commit_in_flight":false,"last_accept_commit_received":{"sequence":203},"last_reconciled_from_journal":{"sequence":202},"last_applied_locally":{"sequence":202},"last_waiter_released":{"sequence":202}},"session_state":[{"kind":"commit","target":"storage-a","advertised_credit":1,"local_credit":0,"local_spool_depth":4,"last_enqueued_sequence":203,"last_transmitted_sequence":202,"last_acked_sequence":202,"blocked_since":"2026-01-01T00:00:00.090Z"}],"journal_state":{"durable_committed_high_water":202}}
+{"at":"2026-01-01T00:00:02.100Z","node_id":"storage-b","slot":361,"sequence":204,"error":"storage write wait timed out or was canceled: context canceled","slot_state":{"next_sequence":203,"highest_committed_sequence":202,"materialized_committed_sequence":202,"journal_durable_high_water":202,"highest_upstream_confirmed_sequence":202,"commit_effect_in_flight":true,"commit_effect_sequence":203,"upstream_commit_in_flight":false,"last_accept_commit_received":{"sequence":203},"last_reconciled_from_journal":{"sequence":202},"last_applied_locally":{"sequence":202},"last_waiter_released":{"sequence":202}},"session_state":[{"kind":"commit","target":"storage-a","advertised_credit":1,"local_credit":0,"local_spool_depth":5,"last_enqueued_sequence":204,"last_transmitted_sequence":202,"last_acked_sequence":202,"blocked_since":"2026-01-01T00:00:00.090Z"}],"journal_state":{"durable_committed_high_water":202}}
+`
+	if err := os.WriteFile(filepath.Join(artifactsDir, "storage-b", "write-timeout-artifacts.jsonl"), []byte(timeoutArtifact), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	floor := DurabilityBenchReport{
 		Label: "current_path",
 		Tests: []DurabilityBenchmarkStat{
@@ -178,6 +184,15 @@ func TestAnalyzeRunGeneratesSummaryAndHTML(t *testing.T) {
 	}
 	if summary.WritePipeline["put-only-c32"].EndToEndMeanMillis == 0 {
 		t.Fatalf("write pipeline summary missing end_to_end mean: %#v", summary.WritePipeline["put-only-c32"])
+	}
+	if len(summary.TimeoutRoots) != 1 {
+		t.Fatalf("len(summary.TimeoutRoots) = %d, want 1", len(summary.TimeoutRoots))
+	}
+	if summary.TimeoutRoots[0].LikelyStage != "sender_spool_or_credit" {
+		t.Fatalf("timeout root likely stage = %q, want sender_spool_or_credit", summary.TimeoutRoots[0].LikelyStage)
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "analysis", "timeout_root_causes.json")); err != nil {
+		t.Fatalf("timeout_root_causes.json stat error: %v", err)
 	}
 }
 

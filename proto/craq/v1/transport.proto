@@ -263,12 +263,18 @@ message ReplicationAck {
   bytes encoded_error = 2;
 }
 
+message ReplicationSlotCredit {
+  int32 slot = 1;
+  int32 available = 2;
+}
+
 message ReplicationFrame {
   uint64 request_id = 1;
   oneof payload {
     ForwardWriteRequest forward_write = 2;
     CommitWriteRequest commit_write = 3;
     ReplicationAck ack = 4;
+    ReplicationSlotCredit slot_credit = 5;
   }
 }
 

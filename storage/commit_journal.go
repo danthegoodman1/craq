@@ -312,6 +312,10 @@ type commitJournalShard struct {
 	confirmCh    chan *journalConfirmIntent
 	closeCh      chan struct{}
 	closedCh     chan struct{}
+
+	diagMu       sync.Mutex
+	lastFlushAt  time.Time
+	recentBySlot map[int][]journalRecord
 }
 
 func newCommitJournalEngine(node *Node, journals []commitJournalStore, highWater map[int]uint64, backlog []DurableCommit) *commitJournalEngine {
@@ -330,13 +334,14 @@ func newCommitJournalEngine(node *Node, journals []commitJournalStore, highWater
 	}
 	for i, journal := range journals {
 		shard := &commitJournalShard{
-			engine:    engine,
-			index:     i,
-			journal:   journal,
-			commitCh:  make(chan *journalCommitIntent, 4096),
-			confirmCh: make(chan *journalConfirmIntent, 4096),
-			closeCh:   make(chan struct{}),
-			closedCh:  make(chan struct{}),
+			engine:       engine,
+			index:        i,
+			journal:      journal,
+			commitCh:     make(chan *journalCommitIntent, 4096),
+			confirmCh:    make(chan *journalConfirmIntent, 4096),
+			closeCh:      make(chan struct{}),
+			closedCh:     make(chan struct{}),
+			recentBySlot: map[int][]journalRecord{},
 		}
 		shard.materializer = newCommitMaterializer(node, backlogByShard[i])
 		engine.shards = append(engine.shards, shard)
@@ -585,6 +590,7 @@ func (s *commitJournalShard) run() {
 			}
 			return
 		}
+		s.recordDurableRecords(records, completedAt)
 		committed := make([]DurableCommit, 0, len(commits))
 		for _, item := range items {
 			switch {
@@ -641,6 +647,64 @@ func (s *commitJournalShard) run() {
 			flush()
 		}
 	}
+}
+
+func (s *commitJournalShard) recordDurableRecords(records []journalRecord, flushedAt time.Time) {
+	if s == nil {
+		return
+	}
+	s.diagMu.Lock()
+	defer s.diagMu.Unlock()
+	s.lastFlushAt = flushedAt.UTC()
+	for _, record := range records {
+		cloned := cloneJournalRecord(record)
+		slotRecords := append(s.recentBySlot[record.Slot], cloned)
+		if len(slotRecords) > 32 {
+			copy(slotRecords, slotRecords[len(slotRecords)-32:])
+			slotRecords = slotRecords[:32]
+		}
+		s.recentBySlot[record.Slot] = slotRecords
+	}
+}
+
+func (s *commitJournalShard) snapshot(slot int) journalSlotSnapshot {
+	if s == nil {
+		return journalSlotSnapshot{}
+	}
+	out := journalSlotSnapshot{
+		Shard:      s.index,
+		QueueDepth: len(s.commitCh) + len(s.confirmCh),
+	}
+	s.diagMu.Lock()
+	out.LastFlushAt = s.lastFlushAt
+	if records := s.recentBySlot[slot]; len(records) > 0 {
+		out.RecentRecords = make([]journalRecordSnapshot, 0, len(records))
+		for _, record := range records {
+			out.RecentRecords = append(out.RecentRecords, journalRecordSnapshot{
+				Type:                      string(record.recordType()),
+				ChainVersion:              record.ChainVersion,
+				Sequence:                  record.Sequence,
+				Kind:                      record.Kind,
+				Key:                       record.Key,
+				UpstreamConfirmedSequence: record.UpstreamConfirmedSequence,
+			})
+		}
+	}
+	s.diagMu.Unlock()
+	out.DurableCommittedHighWater = s.engine.committedSequence(slot)
+	return out
+}
+
+func (e *commitJournalEngine) snapshot(slot int) *journalSlotSnapshot {
+	if e == nil {
+		return nil
+	}
+	shard := e.shardForSlot(slot)
+	if shard == nil {
+		return nil
+	}
+	snapshot := shard.snapshot(slot)
+	return &snapshot
 }
 
 type commitMaterializer struct {

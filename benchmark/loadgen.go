@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"math"
 	"math/rand"
 	"os"
@@ -63,9 +64,17 @@ func RunLoadGen(ctx context.Context, cfg LoadGenProcessConfig) (LoadGenReport, e
 	if err := router.Refresh(ctx); err != nil {
 		return LoadGenReport{}, fmt.Errorf("refresh benchmark client router: %w", err)
 	}
+	snapshot, ok := router.Snapshot()
+	if !ok {
+		return LoadGenReport{}, fmt.Errorf("benchmark client router snapshot not loaded")
+	}
 	metricTargets := loadgenMetricSnapshotTargets(manifest)
 	profileTargets := loadgenProfileTargets(manifest)
 	rng := rand.New(rand.NewSource(cfg.Workload.Seed))
+	fixedSlotKeys, err := buildFixedSlotKeyPools(snapshot.SlotCount, cfg.Workload)
+	if err != nil {
+		return LoadGenReport{}, err
+	}
 
 	preloadStarted := time.Now()
 	for i := 0; i < cfg.Workload.PreloadKeys; i++ {
@@ -77,6 +86,17 @@ func RunLoadGen(ctx context.Context, cfg LoadGenProcessConfig) (LoadGenReport, e
 		if err != nil {
 			report.Errors = append(report.Errors, fmt.Sprintf("preload key %q: %v", key, err))
 			return report, err
+		}
+	}
+	for _, keys := range fixedSlotKeys {
+		for _, key := range keys {
+			reqCtx, cancel := context.WithTimeout(ctx, cfg.Workload.RequestTimeout)
+			_, err := router.Put(reqCtx, key, sizedValue("preload-fixed", cfg.Workload.ValueBytes))
+			cancel()
+			if err != nil {
+				report.Errors = append(report.Errors, fmt.Sprintf("preload fixed key %q: %v", key, err))
+				return report, err
+			}
 		}
 	}
 	report.Preload = PreloadReport{
@@ -93,7 +113,7 @@ func RunLoadGen(ctx context.Context, cfg LoadGenProcessConfig) (LoadGenReport, e
 			return report, ctx.Err()
 		default:
 		}
-		result, err := runScenario(ctx, router, cfg.OutputDir, cfg.Workload, scenario, rng, cfg.Telemetry, profileTargets, metricTargets)
+		result, err := runScenario(ctx, router, cfg.OutputDir, cfg.Workload, scenario, rng, cfg.Telemetry, profileTargets, metricTargets, fixedSlotKeys)
 		if err != nil {
 			report.Errors = append(report.Errors, err.Error())
 			return report, err
@@ -127,6 +147,7 @@ func runScenario(
 	telemetry TelemetryProfile,
 	profileTargets []loadgenProfileTarget,
 	metricTargets []metricSnapshotTarget,
+	fixedSlotKeys map[int][]string,
 ) (ScenarioReport, error) {
 	report := ScenarioReport{
 		Name:        scenario.Name,
@@ -223,8 +244,7 @@ func runScenario(
 						kind = "put"
 					}
 				}
-				keyIndex := workerRand.Intn(workload.PreloadKeys)
-				key := fmt.Sprintf("preload-%06d", keyIndex)
+				key := pickScenarioKey(workerRand, workload, scenario, fixedSlotKeys)
 				requestCtx, cancel := context.WithTimeout(opCtx, workload.RequestTimeout)
 				var callErr error
 				switch kind {
@@ -511,4 +531,65 @@ func sizedValue(seed string, size int) string {
 	}
 	out := b.String()
 	return out[:size]
+}
+
+func pickScenarioKey(rng *rand.Rand, workload WorkloadProfile, scenario ScenarioProfile, fixedSlotKeys map[int][]string) string {
+	if len(scenario.FixedSlots) == 0 {
+		keyIndex := rng.Intn(workload.PreloadKeys)
+		return fmt.Sprintf("preload-%06d", keyIndex)
+	}
+	slot := scenario.FixedSlots[rng.Intn(len(scenario.FixedSlots))]
+	keys := fixedSlotKeys[slot]
+	if len(keys) == 0 {
+		return fmt.Sprintf("preload-%06d", rng.Intn(workload.PreloadKeys))
+	}
+	return keys[rng.Intn(len(keys))]
+}
+
+func buildFixedSlotKeyPools(slotCount int, workload WorkloadProfile) (map[int][]string, error) {
+	slots := map[int]struct{}{}
+	perSlot := 64
+	for _, scenario := range workload.Scenarios {
+		if scenario.Concurrency*4 > perSlot {
+			perSlot = scenario.Concurrency * 4
+		}
+		for _, slot := range scenario.FixedSlots {
+			slots[slot] = struct{}{}
+		}
+	}
+	if len(slots) == 0 {
+		return nil, nil
+	}
+	keys := make([]int, 0, len(slots))
+	for slot := range slots {
+		keys = append(keys, slot)
+	}
+	sort.Ints(keys)
+	out := make(map[int][]string, len(keys))
+	targets := make(map[int]int, len(keys))
+	for _, slot := range keys {
+		targets[slot] = perSlot
+		out[slot] = make([]string, 0, perSlot)
+	}
+	for candidate := 0; ; candidate++ {
+		done := true
+		for _, slot := range keys {
+			if len(out[slot]) < targets[slot] {
+				done = false
+				break
+			}
+		}
+		if done {
+			return out, nil
+		}
+		key := fmt.Sprintf("fixed-slot-%06d", candidate)
+		slot := int(crc32.ChecksumIEEE([]byte(key)) % uint32(slotCount))
+		if len(out[slot]) >= targets[slot] {
+			continue
+		}
+		out[slot] = append(out[slot], key)
+		if candidate > slotCount*perSlot*128 {
+			return nil, fmt.Errorf("unable to build fixed slot keys for slots %v", keys)
+		}
+	}
 }

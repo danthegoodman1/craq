@@ -464,8 +464,14 @@ func (s *StorageGRPCServer) Replicate(stream grpcproto.StorageService_ReplicateS
 	var workers sync.WaitGroup
 	defer workers.Wait()
 
+	sendFrame := func(frame *grpcproto.ReplicationFrame) error {
+		sendMu.Lock()
+		defer sendMu.Unlock()
+		return stream.Send(frame)
+	}
+
 	sendAck := func(requestID uint64, err error) error {
-		frame := &grpcproto.ReplicationFrame{
+		return sendFrame(&grpcproto.ReplicationFrame{
 			RequestId: requestID,
 			Payload: &grpcproto.ReplicationFrame_Ack{
 				Ack: &grpcproto.ReplicationAck{
@@ -473,10 +479,21 @@ func (s *StorageGRPCServer) Replicate(stream grpcproto.StorageService_ReplicateS
 					EncodedError: marshalEncodedError(err),
 				},
 			},
+		})
+	}
+
+	sendSlotCredit := func(slot int) error {
+		if slot < 0 {
+			return nil
 		}
-		sendMu.Lock()
-		defer sendMu.Unlock()
-		return stream.Send(frame)
+		return sendFrame(&grpcproto.ReplicationFrame{
+			Payload: &grpcproto.ReplicationFrame_SlotCredit{
+				SlotCredit: &grpcproto.ReplicationSlotCredit{
+					Slot:      int32(slot),
+					Available: int32(s.node.ReplicationSlotCredit(slot)),
+				},
+			},
+		})
 	}
 
 	for {
@@ -493,10 +510,14 @@ func (s *StorageGRPCServer) Replicate(stream grpcproto.StorageService_ReplicateS
 		workers.Add(1)
 		go func(frame *grpcproto.ReplicationFrame) {
 			defer workers.Done()
-			var handleErr error
+			var (
+				handleErr error
+				slot      = -1
+			)
 			switch payload := frame.GetPayload().(type) {
 			case *grpcproto.ReplicationFrame_ForwardWrite:
 				req := payload.ForwardWrite
+				slot = int(req.Operation.Slot)
 				if s.authorizer != nil {
 					if authErr := s.authorizer.requireStorageIdentityMatch(stream.Context(), req.FromNodeId); authErr != nil {
 						handleErr = authErr
@@ -517,6 +538,7 @@ func (s *StorageGRPCServer) Replicate(stream grpcproto.StorageService_ReplicateS
 				})
 			case *grpcproto.ReplicationFrame_CommitWrite:
 				req := payload.CommitWrite
+				slot = int(req.Slot)
 				if s.authorizer != nil {
 					if authErr := s.authorizer.requireStorageIdentityMatch(stream.Context(), req.FromNodeId); authErr != nil {
 						handleErr = authErr
@@ -534,6 +556,9 @@ func (s *StorageGRPCServer) Replicate(stream grpcproto.StorageService_ReplicateS
 			}
 			if ackErr := sendAck(frame.GetRequestId(), handleErr); ackErr != nil && !errors.Is(ackErr, context.Canceled) {
 				s.logger.Debug().Err(ackErr).Msg("replication stream ack failed")
+			}
+			if creditErr := sendSlotCredit(slot); creditErr != nil && !errors.Is(creditErr, context.Canceled) {
+				s.logger.Debug().Err(creditErr).Msg("replication stream credit update failed")
 			}
 		}(frame)
 	}

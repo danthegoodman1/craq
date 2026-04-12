@@ -179,6 +179,30 @@ type ReplicationTransportObserver interface {
 	ObserveReplicationSessionQueueDepthHighWater(kind string, target string, depth int)
 }
 
+type ReplicationSessionRequestSnapshot struct {
+	RequestID uint64 `json:"request_id"`
+	Sequence  uint64 `json:"sequence"`
+}
+
+type ReplicationSessionSlotSnapshot struct {
+	Target             string                              `json:"target"`
+	Kind               string                              `json:"kind"`
+	Slot               int                                 `json:"slot"`
+	AdvertisedCredit   int                                 `json:"advertised_credit"`
+	LocalCredit        int                                 `json:"local_credit"`
+	LocalSpoolDepth    int                                 `json:"local_spool_depth"`
+	PendingRequests    []ReplicationSessionRequestSnapshot `json:"pending_requests,omitempty"`
+	LastEnqueuedSeq    uint64                              `json:"last_enqueued_sequence"`
+	LastTransmittedSeq uint64                              `json:"last_transmitted_sequence"`
+	LastAckedSeq       uint64                              `json:"last_acked_sequence"`
+	LastCreditUpdateAt *time.Time                          `json:"last_credit_update_at,omitempty"`
+	BlockedSince       *time.Time                          `json:"blocked_since,omitempty"`
+}
+
+type replicationTransportSessionSnapshotter interface {
+	ReplicationSessionSnapshots(slot int) []ReplicationSessionSlotSnapshot
+}
+
 type replicationTransportObserverSetter interface {
 	SetReplicationTransportObserver(observer ReplicationTransportObserver)
 }
@@ -811,11 +835,11 @@ func OpenNode(
 		}
 		return nil, fmt.Errorf("recover journaled replica state: %w", err)
 	}
-	node.commitJournal = newCommitJournalEngine(node, journals, highWater, backlog)
 	for slot, record := range records {
-		node.publishReplicaSnapshotLocked(slot, publishedReplicaFromRecord(record))
 		node.slotOwners[slot] = newSlotOwner(node, slot, true, record)
+		node.publishReplicaRecord(slot, record)
 	}
+	node.commitJournal = newCommitJournalEngine(node, journals, highWater, backlog)
 
 	return node, nil
 }

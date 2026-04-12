@@ -2,6 +2,7 @@ package benchmark
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -26,9 +27,43 @@ type AnalysisSummary struct {
 	WriteBudget     map[string]WriteBudgetSummary `json:"write_budget,omitempty"`
 	StorageFloor    StorageFloorSummary           `json:"storage_floor,omitempty"`
 	WritePipeline   map[string]WritePipelineBrief `json:"write_pipeline,omitempty"`
+	TimeoutRoots    []TimeoutRootCauseBrief       `json:"timeout_roots,omitempty"`
 	Coordinator     map[string]float64            `json:"coordinator_metrics"`
 	Storage         map[string]map[string]float64 `json:"storage_metrics"`
 	System          map[string]SystemSeries       `json:"system"`
+}
+
+type TimeoutRootCauseReport struct {
+	RunID       string              `json:"run_id"`
+	GeneratedAt time.Time           `json:"generated_at"`
+	Roots       []TimeoutRootCause  `json:"roots"`
+}
+
+type TimeoutRootCause struct {
+	NodeID                string    `json:"node_id"`
+	Slot                  int       `json:"slot"`
+	FirstStuckSequence    uint64    `json:"first_stuck_sequence"`
+	PrimaryDeadlineErrors int       `json:"primary_deadline_errors"`
+	FollowOnCanceled      int       `json:"follow_on_canceled"`
+	FirstSeen             time.Time `json:"first_seen"`
+	LastSeen              time.Time `json:"last_seen"`
+	HighestCommitted      uint64    `json:"highest_committed_sequence"`
+	MaterializedCommitted uint64    `json:"materialized_committed_sequence"`
+	JournalHighWater      uint64    `json:"journal_durable_high_water"`
+	SessionCreditChanged  bool      `json:"session_credit_changed"`
+	LocalSpoolChanged     bool      `json:"local_spool_changed"`
+	JournalHighWaterMoved bool      `json:"journal_high_water_changed"`
+	ApplyStateChanged     bool      `json:"apply_state_changed"`
+	LikelyStage           string    `json:"likely_stage"`
+}
+
+type TimeoutRootCauseBrief struct {
+	NodeID                string `json:"node_id"`
+	Slot                  int    `json:"slot"`
+	FirstStuckSequence    uint64 `json:"first_stuck_sequence"`
+	PrimaryDeadlineErrors int    `json:"primary_deadline_errors"`
+	FollowOnCanceled      int    `json:"follow_on_canceled"`
+	LikelyStage           string `json:"likely_stage"`
 }
 
 type WriteLatencyBudgetReport struct {
@@ -214,6 +249,21 @@ func AnalyzeRun(runDir string) (AnalysisSummary, error) {
 			summary.WritePipeline[scenario] = brief
 		}
 		if err := SaveJSON(filepath.Join(analysisDir, "write_pipeline_summary.json"), writePipeline); err != nil {
+			return AnalysisSummary{}, err
+		}
+	}
+	if timeoutRoots, err := buildTimeoutRootCauseSummary(runDir, report); err == nil {
+		for _, root := range timeoutRoots.Roots {
+			summary.TimeoutRoots = append(summary.TimeoutRoots, TimeoutRootCauseBrief{
+				NodeID:                root.NodeID,
+				Slot:                  root.Slot,
+				FirstStuckSequence:    root.FirstStuckSequence,
+				PrimaryDeadlineErrors: root.PrimaryDeadlineErrors,
+				FollowOnCanceled:      root.FollowOnCanceled,
+				LikelyStage:           root.LikelyStage,
+			})
+		}
+		if err := SaveJSON(filepath.Join(analysisDir, "timeout_root_causes.json"), timeoutRoots); err != nil {
 			return AnalysisSummary{}, err
 		}
 	}
@@ -789,6 +839,57 @@ type writeTraceArtifactEvent struct {
 	Stage        string    `json:"stage"`
 }
 
+type timeoutArtifactSlotState struct {
+	NextSequence                  uint64 `json:"next_sequence"`
+	HighestCommittedSequence      uint64 `json:"highest_committed_sequence"`
+	MaterializedCommittedSequence uint64 `json:"materialized_committed_sequence"`
+	JournalDurableHighWater       uint64 `json:"journal_durable_high_water"`
+	HighestUpstreamConfirmed      uint64 `json:"highest_upstream_confirmed_sequence"`
+	CommitEffectInFlight          bool   `json:"commit_effect_in_flight"`
+	CommitEffectSequence          uint64 `json:"commit_effect_sequence"`
+	UpstreamCommitInFlight        bool   `json:"upstream_commit_in_flight"`
+	LastAcceptCommitReceived      struct {
+		Sequence uint64 `json:"sequence"`
+	} `json:"last_accept_commit_received"`
+	LastReconciledFromJournal struct {
+		Sequence uint64 `json:"sequence"`
+	} `json:"last_reconciled_from_journal"`
+	LastAppliedLocally struct {
+		Sequence uint64 `json:"sequence"`
+	} `json:"last_applied_locally"`
+	LastWaiterReleased struct {
+		Sequence uint64 `json:"sequence"`
+	} `json:"last_waiter_released"`
+}
+
+type timeoutArtifactSessionState struct {
+	Kind               string    `json:"kind"`
+	Target             string    `json:"target"`
+	AdvertisedCredit   int       `json:"advertised_credit"`
+	LocalCredit        int       `json:"local_credit"`
+	LocalSpoolDepth    int       `json:"local_spool_depth"`
+	LastEnqueuedSeq    uint64    `json:"last_enqueued_sequence"`
+	LastTransmittedSeq uint64    `json:"last_transmitted_sequence"`
+	LastAckedSeq       uint64    `json:"last_acked_sequence"`
+	LastCreditUpdateAt time.Time `json:"last_credit_update_at"`
+	BlockedSince       time.Time `json:"blocked_since"`
+}
+
+type timeoutArtifactJournalState struct {
+	DurableCommittedHighWater uint64 `json:"durable_committed_high_water"`
+}
+
+type timeoutArtifact struct {
+	At           time.Time                    `json:"at"`
+	NodeID       string                       `json:"node_id"`
+	Slot         int                          `json:"slot"`
+	Sequence     uint64                       `json:"sequence"`
+	Error        string                       `json:"error"`
+	SlotState    timeoutArtifactSlotState     `json:"slot_state"`
+	SessionState []timeoutArtifactSessionState `json:"session_state"`
+	JournalState *timeoutArtifactJournalState `json:"journal_state"`
+}
+
 func buildWritePipelineSummary(runDir string, report LoadGenReport) (WritePipelineSummary, error) {
 	metricRoot := filepath.Join(runDir, "artifacts", "client", "metric-snapshots")
 	traceEvents, err := loadWriteTraceEvents(runDir)
@@ -883,6 +984,161 @@ func buildWritePipelineSummary(runDir string, report LoadGenReport) (WritePipeli
 		}
 	}
 	return out, nil
+}
+
+func buildTimeoutRootCauseSummary(runDir string, report LoadGenReport) (TimeoutRootCauseReport, error) {
+	artifacts, err := loadTimeoutArtifacts(runDir)
+	if err != nil {
+		return TimeoutRootCauseReport{}, err
+	}
+	grouped := map[string][]timeoutArtifact{}
+	for _, artifact := range artifacts {
+		stuckSequence := timeoutArtifactStuckSequence(artifact)
+		key := fmt.Sprintf("%s/%d/%d", artifact.NodeID, artifact.Slot, stuckSequence)
+		grouped[key] = append(grouped[key], artifact)
+	}
+	reportOut := TimeoutRootCauseReport{
+		RunID:       report.RunID,
+		GeneratedAt: time.Now().UTC(),
+	}
+	keys := make([]string, 0, len(grouped))
+	for key := range grouped {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		group := grouped[key]
+		sort.Slice(group, func(i, j int) bool { return group[i].At.Before(group[j].At) })
+		first := group[0]
+		last := group[len(group)-1]
+		root := TimeoutRootCause{
+			NodeID:                first.NodeID,
+			Slot:                  first.Slot,
+			FirstStuckSequence:    timeoutArtifactStuckSequence(first),
+			FirstSeen:             first.At,
+			LastSeen:              last.At,
+			HighestCommitted:      last.SlotState.HighestCommittedSequence,
+			MaterializedCommitted: last.SlotState.MaterializedCommittedSequence,
+			JournalHighWater:      timeoutArtifactJournalHighWater(last),
+			SessionCreditChanged:  timeoutSessionCreditChanged(first, last),
+			LocalSpoolChanged:     timeoutLocalSpoolChanged(first, last),
+			JournalHighWaterMoved: timeoutArtifactJournalHighWater(first) != timeoutArtifactJournalHighWater(last),
+			ApplyStateChanged:     timeoutApplyStateChanged(first, last),
+			LikelyStage:           classifyTimeoutRoot(first, last),
+		}
+		for _, artifact := range group {
+			switch {
+			case strings.Contains(artifact.Error, context.DeadlineExceeded.Error()):
+				root.PrimaryDeadlineErrors++
+			case strings.Contains(artifact.Error, context.Canceled.Error()):
+				root.FollowOnCanceled++
+			}
+		}
+		reportOut.Roots = append(reportOut.Roots, root)
+	}
+	return reportOut, nil
+}
+
+func loadTimeoutArtifacts(runDir string) ([]timeoutArtifact, error) {
+	var out []timeoutArtifact
+	for _, nodeID := range []string{"storage-a", "storage-b", "storage-c"} {
+		path := filepath.Join(runDir, "artifacts", nodeID, "write-timeout-artifacts.jsonl")
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			var artifact timeoutArtifact
+			if err := json.Unmarshal([]byte(line), &artifact); err != nil {
+				return nil, fmt.Errorf("decode timeout artifact %q: %w", path, err)
+			}
+			out = append(out, artifact)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].At.Before(out[j].At) })
+	return out, nil
+}
+
+func timeoutArtifactStuckSequence(artifact timeoutArtifact) uint64 {
+	if artifact.SlotState.NextSequence > 0 {
+		return artifact.SlotState.NextSequence
+	}
+	if artifact.SlotState.HighestCommittedSequence > 0 {
+		return artifact.SlotState.HighestCommittedSequence + 1
+	}
+	return artifact.Sequence
+}
+
+func timeoutArtifactJournalHighWater(artifact timeoutArtifact) uint64 {
+	if artifact.JournalState != nil && artifact.JournalState.DurableCommittedHighWater > artifact.SlotState.JournalDurableHighWater {
+		return artifact.JournalState.DurableCommittedHighWater
+	}
+	return artifact.SlotState.JournalDurableHighWater
+}
+
+func timeoutSessionCreditChanged(first timeoutArtifact, last timeoutArtifact) bool {
+	return timeoutSessionFingerprint(first, func(state timeoutArtifactSessionState) string {
+		return fmt.Sprintf("%s/%s/%d/%d/%s", state.Kind, state.Target, state.AdvertisedCredit, state.LocalCredit, state.LastCreditUpdateAt.UTC().Format(time.RFC3339Nano))
+	}) != timeoutSessionFingerprint(last, func(state timeoutArtifactSessionState) string {
+		return fmt.Sprintf("%s/%s/%d/%d/%s", state.Kind, state.Target, state.AdvertisedCredit, state.LocalCredit, state.LastCreditUpdateAt.UTC().Format(time.RFC3339Nano))
+	})
+}
+
+func timeoutLocalSpoolChanged(first timeoutArtifact, last timeoutArtifact) bool {
+	return timeoutSessionFingerprint(first, func(state timeoutArtifactSessionState) string {
+		return fmt.Sprintf("%s/%s/%d/%d/%d/%d", state.Kind, state.Target, state.LocalSpoolDepth, state.LastEnqueuedSeq, state.LastTransmittedSeq, state.LastAckedSeq)
+	}) != timeoutSessionFingerprint(last, func(state timeoutArtifactSessionState) string {
+		return fmt.Sprintf("%s/%s/%d/%d/%d/%d", state.Kind, state.Target, state.LocalSpoolDepth, state.LastEnqueuedSeq, state.LastTransmittedSeq, state.LastAckedSeq)
+	})
+}
+
+func timeoutSessionFingerprint(artifact timeoutArtifact, format func(timeoutArtifactSessionState) string) string {
+	if len(artifact.SessionState) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(artifact.SessionState))
+	for _, state := range artifact.SessionState {
+		parts = append(parts, format(state))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "|")
+}
+
+func timeoutApplyStateChanged(first timeoutArtifact, last timeoutArtifact) bool {
+	return first.SlotState.HighestCommittedSequence != last.SlotState.HighestCommittedSequence ||
+		first.SlotState.MaterializedCommittedSequence != last.SlotState.MaterializedCommittedSequence ||
+		first.SlotState.CommitEffectSequence != last.SlotState.CommitEffectSequence ||
+		first.SlotState.LastReconciledFromJournal.Sequence != last.SlotState.LastReconciledFromJournal.Sequence ||
+		first.SlotState.LastAppliedLocally.Sequence != last.SlotState.LastAppliedLocally.Sequence ||
+		first.SlotState.LastWaiterReleased.Sequence != last.SlotState.LastWaiterReleased.Sequence
+}
+
+func classifyTimeoutRoot(first timeoutArtifact, last timeoutArtifact) string {
+	stuck := timeoutArtifactStuckSequence(first)
+	durable := timeoutArtifactJournalHighWater(last)
+	if durable >= stuck && last.SlotState.HighestCommittedSequence < stuck {
+		return "slot_owner_apply_or_reconcile"
+	}
+	for _, state := range last.SessionState {
+		if state.LocalSpoolDepth > 0 && (state.LocalCredit == 0 || !state.BlockedSince.IsZero()) {
+			return "sender_spool_or_credit"
+		}
+	}
+	if last.SlotState.UpstreamCommitInFlight && last.SlotState.HighestUpstreamConfirmed < last.SlotState.HighestCommittedSequence {
+		return "upstream_replay_or_confirm_debt"
+	}
+	for _, state := range last.SessionState {
+		if state.LastTransmittedSeq >= stuck && state.LastAckedSeq < stuck && durable < stuck {
+			return "receiver_delivery_or_journal"
+		}
+	}
+	return "unknown"
 }
 
 func loadWriteTraceEvents(runDir string) ([]writeTraceArtifactEvent, error) {

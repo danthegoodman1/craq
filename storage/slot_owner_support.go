@@ -233,14 +233,21 @@ func (n *Node) submitUpstreamConfirmedSequence(
 }
 
 func (n *Node) writeActuallyCommitted(slot int, sequence uint64) bool {
-	if n.commitJournal != nil && n.commitJournal.committedSequence(slot) >= sequence {
+	if n.durableCommittedSequence(slot) >= sequence {
 		return true
+	}
+	return false
+}
+
+func (n *Node) durableCommittedSequence(slot int) uint64 {
+	if n.commitJournal != nil {
+		return n.commitJournal.committedSequence(slot)
 	}
 	highestCommitted, err := n.backend.HighestCommittedSequence(slot)
 	if err != nil {
-		return false
+		return 0
 	}
-	return highestCommitted >= sequence
+	return highestCommitted
 }
 
 func (n *Node) shouldMaterializeCommit(commit DurableCommit) bool {

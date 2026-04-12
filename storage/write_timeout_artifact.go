@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	runtimemetrics "runtime/metrics"
+	"sort"
 	"sync"
 	"time"
 )
@@ -35,18 +36,87 @@ type runtimePauseSnapshot struct {
 	GCPauseLatencyP99Secs    float64 `json:"gc_pause_latency_p99_seconds,omitempty"`
 }
 
+type slotSequenceBreadcrumb struct {
+	Sequence uint64    `json:"sequence"`
+	At       time.Time `json:"at,omitempty"`
+}
+
+type sequenceWindowSnapshot struct {
+	Count     int      `json:"count"`
+	Lowest    uint64   `json:"lowest_sequence,omitempty"`
+	Highest   uint64   `json:"highest_sequence,omitempty"`
+	Sequences []uint64 `json:"sequences,omitempty"`
+}
+
+type sequenceCountSnapshot struct {
+	Sequence uint64 `json:"sequence"`
+	Count    int    `json:"count"`
+}
+
+type acceptedCommitSnapshot struct {
+	Sequence    uint64              `json:"sequence"`
+	Stage       acceptedCommitStage `json:"stage"`
+	WaiterCount int                 `json:"waiter_count"`
+}
+
+type slotOwnerTimeoutSnapshot struct {
+	Exists                           bool                     `json:"exists"`
+	Assignment                       ReplicaAssignment        `json:"assignment"`
+	State                            ReplicaState             `json:"state"`
+	NextSequence                     uint64                   `json:"next_sequence"`
+	HighestCommittedSequence         uint64                   `json:"highest_committed_sequence"`
+	MaterializedCommittedSequence    uint64                   `json:"materialized_committed_sequence"`
+	JournalDurableHighWater          uint64                   `json:"journal_durable_high_water"`
+	HighestUpstreamConfirmedSequence uint64                   `json:"highest_upstream_confirmed_sequence"`
+	CommitEffectInFlight             bool                     `json:"commit_effect_in_flight"`
+	CommitEffectSequence             uint64                   `json:"commit_effect_sequence"`
+	UpstreamCommitInFlight           bool                     `json:"upstream_commit_in_flight"`
+	ProgressionGap                   bool                     `json:"progression_gap"`
+	ProgressionGapSequence           uint64                   `json:"progression_gap_sequence"`
+	BufferedForwards                 sequenceWindowSnapshot   `json:"buffered_forwards"`
+	BufferedCommits                  sequenceWindowSnapshot   `json:"buffered_commits"`
+	ParkedCommitAcceptWaiters        []sequenceCountSnapshot  `json:"parked_commit_accept_waiters,omitempty"`
+	AcceptedCommitLedger             []acceptedCommitSnapshot `json:"accepted_commit_ledger,omitempty"`
+	LastAcceptCommitReceived         slotSequenceBreadcrumb   `json:"last_accept_commit_received,omitempty"`
+	LastDuplicateCommitParked        slotSequenceBreadcrumb   `json:"last_duplicate_commit_parked,omitempty"`
+	LastReconciledFromJournal        slotSequenceBreadcrumb   `json:"last_reconciled_from_journal,omitempty"`
+	LastAppliedLocally               slotSequenceBreadcrumb   `json:"last_applied_locally,omitempty"`
+	LastWaiterReleased               slotSequenceBreadcrumb   `json:"last_waiter_released,omitempty"`
+}
+
+type journalRecordSnapshot struct {
+	Type                      string        `json:"type"`
+	ChainVersion              uint64        `json:"chain_version"`
+	Sequence                  uint64        `json:"sequence"`
+	Kind                      OperationKind `json:"kind,omitempty"`
+	Key                       string        `json:"key,omitempty"`
+	UpstreamConfirmedSequence uint64        `json:"upstream_confirmed_sequence,omitempty"`
+}
+
+type journalSlotSnapshot struct {
+	Shard                     int                    `json:"shard"`
+	QueueDepth                int                    `json:"queue_depth"`
+	LastFlushAt               time.Time              `json:"last_flush_at,omitempty"`
+	DurableCommittedHighWater uint64                 `json:"durable_committed_high_water"`
+	RecentRecords             []journalRecordSnapshot `json:"recent_records,omitempty"`
+}
+
 type writeTimeoutArtifact struct {
-	At                    time.Time              `json:"at"`
-	NodeID                string                 `json:"node_id"`
-	Slot                  int                    `json:"slot"`
-	Sequence              uint64                 `json:"sequence"`
-	Role                  ReplicaRole            `json:"role"`
-	Error                 string                 `json:"error"`
-	JournalQueueDepths    []queueDepthSample     `json:"journal_queue_depths"`
-	MaterializerQueues    []queueDepthSample     `json:"materializer_queue_depths"`
-	MaterializerLags      []materializerLagSample `json:"materializer_lags"`
-	RecentWriteTrace      []writeTraceEvent      `json:"recent_write_trace_events"`
-	Runtime               runtimePauseSnapshot   `json:"runtime"`
+	At                 time.Time                         `json:"at"`
+	NodeID             string                            `json:"node_id"`
+	Slot               int                               `json:"slot"`
+	Sequence           uint64                            `json:"sequence"`
+	Role               ReplicaRole                       `json:"role"`
+	Error              string                            `json:"error"`
+	JournalQueueDepths []queueDepthSample                `json:"journal_queue_depths"`
+	MaterializerQueues []queueDepthSample                `json:"materializer_queue_depths"`
+	MaterializerLags   []materializerLagSample           `json:"materializer_lags"`
+	RecentWriteTrace   []writeTraceEvent                 `json:"recent_write_trace_events,omitempty"`
+	RecentSlotTrace    []writeTraceEvent                 `json:"recent_slot_trace_events,omitempty"`
+	SlotState          slotOwnerTimeoutSnapshot          `json:"slot_state"`
+	SessionState       []ReplicationSessionSlotSnapshot  `json:"session_state,omitempty"`
+	JournalState       *journalSlotSnapshot              `json:"journal_state,omitempty"`
+	Runtime            runtimePauseSnapshot              `json:"runtime"`
 }
 
 type writeTimeoutArtifactRecorder struct {
@@ -124,20 +194,12 @@ func (r *writeTimeoutArtifactRecorder) recordMaterializerLag(slot int, highestCo
 	}, defaultTimeoutArtifactSampleLimit)
 }
 
-func (r *writeTimeoutArtifactRecorder) capture(nodeID string, slot int, sequence uint64, role ReplicaRole, err error, recent []writeTraceEvent) {
+func (r *writeTimeoutArtifactRecorder) capture(artifact writeTimeoutArtifact) {
 	if r == nil || r.file == nil {
 		return
 	}
-	artifact := writeTimeoutArtifact{
-		At:                 time.Now().UTC(),
-		NodeID:             nodeID,
-		Slot:               slot,
-		Sequence:           sequence,
-		Role:               role,
-		Error:              errString(err),
-		RecentWriteTrace:   append([]writeTraceEvent(nil), recent...),
-		Runtime:            captureRuntimePauseSnapshot(),
-	}
+	artifact.At = time.Now().UTC()
+	artifact.Runtime = captureRuntimePauseSnapshot()
 	r.mu.Lock()
 	artifact.JournalQueueDepths = append([]queueDepthSample(nil), r.journalQueue...)
 	artifact.MaterializerQueues = append([]queueDepthSample(nil), r.materializer...)
@@ -248,8 +310,171 @@ func (n *Node) captureWriteTimeout(slot int, sequence uint64, role ReplicaRole, 
 		return
 	}
 	var recent []writeTraceEvent
+	var slotTrace []writeTraceEvent
 	if n.writeTrace != nil {
 		recent = n.writeTrace.recentForSlot(slot, sequence, 32)
+		slotTrace = n.writeTrace.failureRecentForSlot(slot, sequence, defaultFailureWriteTraceEvents)
 	}
-	n.timeoutArtifacts.capture(n.nodeID, slot, sequence, role, err, recent)
+	n.timeoutArtifacts.capture(writeTimeoutArtifact{
+		NodeID:           n.nodeID,
+		Slot:             slot,
+		Sequence:         sequence,
+		Role:             role,
+		Error:            errString(err),
+		RecentWriteTrace: recent,
+		RecentSlotTrace:  slotTrace,
+		SlotState:        n.timeoutSlotSnapshot(slot),
+		SessionState:     n.timeoutSessionSnapshots(slot),
+		JournalState:     n.timeoutJournalSnapshot(slot),
+	})
+}
+
+func (n *Node) timeoutSlotSnapshot(slot int) slotOwnerTimeoutSnapshot {
+	owner := n.existingSlotOwner(slot)
+	if owner == nil {
+		return slotOwnerTimeoutSnapshot{JournalDurableHighWater: n.durableCommittedSequence(slot)}
+	}
+	respCh := make(chan slotOwnerTimeoutSnapshot, 1)
+	if err := owner.dispatch(n.runtimeCtx, func(runtime *slotRuntime) {
+		respCh <- runtime.timeoutSnapshot()
+	}); err != nil {
+		return slotOwnerTimeoutSnapshot{JournalDurableHighWater: n.durableCommittedSequence(slot)}
+	}
+	select {
+	case <-n.done:
+		return slotOwnerTimeoutSnapshot{JournalDurableHighWater: n.durableCommittedSequence(slot)}
+	case snapshot := <-respCh:
+		if snapshot.JournalDurableHighWater == 0 {
+			snapshot.JournalDurableHighWater = n.durableCommittedSequence(slot)
+		}
+		return snapshot
+	}
+}
+
+func (n *Node) timeoutSessionSnapshots(slot int) []ReplicationSessionSlotSnapshot {
+	snapshotter, ok := n.repl.(replicationTransportSessionSnapshotter)
+	if !ok {
+		return nil
+	}
+	return snapshotter.ReplicationSessionSnapshots(slot)
+}
+
+func (n *Node) timeoutJournalSnapshot(slot int) *journalSlotSnapshot {
+	if n == nil || n.commitJournal == nil {
+		return nil
+	}
+	return n.commitJournal.snapshot(slot)
+}
+
+func (rt *slotRuntime) timeoutSnapshot() slotOwnerTimeoutSnapshot {
+	snapshot := slotOwnerTimeoutSnapshot{
+		Exists:                  rt.exists,
+		CommitEffectInFlight:    rt.commitEffectInFlight,
+		CommitEffectSequence:    rt.commitEffectSequence,
+		UpstreamCommitInFlight:  rt.upstreamCommitInFlight,
+		ProgressionGap:          rt.progressionGap,
+		ProgressionGapSequence:  rt.progressionGapSequence,
+		JournalDurableHighWater: rt.node.durableCommittedSequence(rt.slot),
+	}
+	if !rt.exists {
+		return snapshot
+	}
+	record := ensureProtocolReplicaState(rt.record)
+	snapshot.Assignment = cloneAssignment(record.assignment)
+	snapshot.State = record.state
+	snapshot.NextSequence = record.nextSequence
+	snapshot.HighestCommittedSequence = record.highestCommittedSequence
+	snapshot.MaterializedCommittedSequence = record.materializedCommittedSequence
+	snapshot.HighestUpstreamConfirmedSequence = record.highestUpstreamConfirmedSequence
+	snapshot.BufferedForwards = snapshotSequenceWindow(record.bufferedForwards)
+	snapshot.BufferedCommits = snapshotCommitSequenceWindow(record.bufferedCommits)
+	snapshot.ParkedCommitAcceptWaiters = snapshotAcceptedWaiterCounts(rt.acceptedCommits)
+	snapshot.AcceptedCommitLedger = snapshotAcceptedCommitLedger(rt.acceptedCommits)
+	snapshot.LastAcceptCommitReceived = rt.lastAcceptCommitReceived
+	snapshot.LastDuplicateCommitParked = rt.lastDuplicateCommitParked
+	snapshot.LastReconciledFromJournal = rt.lastReconciledFromJournal
+	snapshot.LastAppliedLocally = rt.lastAppliedLocally
+	snapshot.LastWaiterReleased = rt.lastWaiterReleased
+	return snapshot
+}
+
+func snapshotSequenceWindow(requests map[uint64]ForwardWriteRequest) sequenceWindowSnapshot {
+	if len(requests) == 0 {
+		return sequenceWindowSnapshot{}
+	}
+	sequences := make([]uint64, 0, len(requests))
+	for sequence := range requests {
+		sequences = append(sequences, sequence)
+	}
+	sort.Slice(sequences, func(i, j int) bool { return sequences[i] < sequences[j] })
+	return sequenceWindowSnapshot{
+		Count:     len(sequences),
+		Lowest:    sequences[0],
+		Highest:   sequences[len(sequences)-1],
+		Sequences: sequences,
+	}
+}
+
+func snapshotCommitSequenceWindow(requests map[uint64]CommitWriteRequest) sequenceWindowSnapshot {
+	if len(requests) == 0 {
+		return sequenceWindowSnapshot{}
+	}
+	sequences := make([]uint64, 0, len(requests))
+	for sequence := range requests {
+		sequences = append(sequences, sequence)
+	}
+	sort.Slice(sequences, func(i, j int) bool { return sequences[i] < sequences[j] })
+	return sequenceWindowSnapshot{
+		Count:     len(sequences),
+		Lowest:    sequences[0],
+		Highest:   sequences[len(sequences)-1],
+		Sequences: sequences,
+	}
+}
+
+func snapshotAcceptedWaiterCounts(entries map[uint64]*acceptedCommitEntry) []sequenceCountSnapshot {
+	if len(entries) == 0 {
+		return nil
+	}
+	sequences := make([]uint64, 0, len(entries))
+	for sequence := range entries {
+		sequences = append(sequences, sequence)
+	}
+	sort.Slice(sequences, func(i, j int) bool { return sequences[i] < sequences[j] })
+	out := make([]sequenceCountSnapshot, 0, len(sequences))
+	for _, sequence := range sequences {
+		entry := entries[sequence]
+		if entry == nil || len(entry.waiters) == 0 {
+			continue
+		}
+		out = append(out, sequenceCountSnapshot{
+			Sequence: sequence,
+			Count:    len(entry.waiters),
+		})
+	}
+	return out
+}
+
+func snapshotAcceptedCommitLedger(entries map[uint64]*acceptedCommitEntry) []acceptedCommitSnapshot {
+	if len(entries) == 0 {
+		return nil
+	}
+	sequences := make([]uint64, 0, len(entries))
+	for sequence := range entries {
+		sequences = append(sequences, sequence)
+	}
+	sort.Slice(sequences, func(i, j int) bool { return sequences[i] < sequences[j] })
+	out := make([]acceptedCommitSnapshot, 0, len(sequences))
+	for _, sequence := range sequences {
+		entry := entries[sequence]
+		if entry == nil {
+			continue
+		}
+		out = append(out, acceptedCommitSnapshot{
+			Sequence:    sequence,
+			Stage:       entry.stage,
+			WaiterCount: len(entry.waiters),
+		})
+	}
+	return out
 }

@@ -73,6 +73,7 @@ type ScenarioProfile struct {
 	Duration    time.Duration `yaml:"duration" json:"duration"`
 	ReadPercent int           `yaml:"read_percent,omitempty" json:"read_percent,omitempty"`
 	ValueBytes  int           `yaml:"value_bytes,omitempty" json:"value_bytes,omitempty"`
+	FixedSlots  []int         `yaml:"fixed_slots,omitempty" json:"fixed_slots,omitempty"`
 }
 
 type TelemetryProfile struct {
@@ -280,10 +281,15 @@ func (p Profile) Validate() error {
 		if scenario.Kind == "mixed" && (scenario.ReadPercent < 0 || scenario.ReadPercent > 100) {
 			return fmt.Errorf("scenario %q read_percent must be between 0 and 100", scenario.Name)
 		}
-		if scenario.ValueBytes <= 0 {
-			return fmt.Errorf("scenario %q value_bytes must be > 0", scenario.Name)
+			if scenario.ValueBytes <= 0 {
+				return fmt.Errorf("scenario %q value_bytes must be > 0", scenario.Name)
+			}
+			for _, slot := range scenario.FixedSlots {
+				if slot < 0 || slot >= p.Cluster.SlotCount {
+					return fmt.Errorf("scenario %q fixed slot %d is outside [0,%d)", scenario.Name, slot, p.Cluster.SlotCount)
+				}
+			}
 		}
-	}
 	return nil
 }
 

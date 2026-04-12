@@ -15,6 +15,8 @@ import (
 
 const defaultWriteTraceSampleRate = 1024
 const defaultRecentWriteTraceEvents = 512
+const defaultFailureWriteTraceEvents = 256
+const defaultFailureWriteTraceIdle = 60 * time.Second
 
 type writeTraceConfig struct {
 	NodeID     string
@@ -28,6 +30,12 @@ type writeTraceRecorder struct {
 	file       *os.File
 	mu         sync.Mutex
 	recent     []writeTraceEvent
+	failure    map[int]slotWriteTraceRing
+}
+
+type slotWriteTraceRing struct {
+	updatedAt time.Time
+	events    []writeTraceEvent
 }
 
 type writeTraceEvent struct {
@@ -58,6 +66,7 @@ func openWriteTraceRecorder(cfg writeTraceConfig) (*writeTraceRecorder, error) {
 		nodeID:     cfg.NodeID,
 		sampleRate: uint64(cfg.SampleRate),
 		file:       file,
+		failure:    map[int]slotWriteTraceRing{},
 	}, nil
 }
 
@@ -85,9 +94,6 @@ func (r *writeTraceRecorder) record(slot int, sequence uint64, chainVersion uint
 	if r == nil || r.file == nil {
 		return
 	}
-	if !r.shouldSample(slot, sequence, chainVersion) {
-		return
-	}
 	event := writeTraceEvent{
 		At:           time.Now().UTC(),
 		NodeID:       r.nodeID,
@@ -97,12 +103,21 @@ func (r *writeTraceRecorder) record(slot int, sequence uint64, chainVersion uint
 		Role:         role,
 		Stage:        stage,
 	}
-	data, err := json.Marshal(event)
-	if err != nil {
-		return
+	shouldSample := r.shouldSample(slot, sequence, chainVersion)
+	var data []byte
+	if shouldSample {
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			return
+		}
+		data = encoded
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.recordFailureEventLocked(event)
+	if !shouldSample {
+		return
+	}
 	r.recent = appendBoundedWriteTraceEvent(r.recent, event, defaultRecentWriteTraceEvents)
 	_, _ = r.file.Write(append(data, '\n'))
 }
@@ -135,6 +150,35 @@ func (r *writeTraceRecorder) recentForSlot(slot int, sequence uint64, limit int)
 	return result
 }
 
+func (r *writeTraceRecorder) failureRecentForSlot(slot int, sequence uint64, limit int) []writeTraceEvent {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if limit <= 0 {
+		limit = defaultFailureWriteTraceEvents
+	}
+	trace, ok := r.failure[slot]
+	if !ok {
+		return nil
+	}
+	result := make([]writeTraceEvent, 0, limit)
+	for i := len(trace.events) - 1; i >= 0 && len(result) < limit; i-- {
+		event := trace.events[i]
+		if sequence > 0 {
+			if event.Sequence+128 < sequence || event.Sequence > sequence+128 {
+				continue
+			}
+		}
+		result = append(result, event)
+	}
+	for i, j := 0, len(result)-1; i < j; i, j = i+1, j-1 {
+		result[i], result[j] = result[j], result[i]
+	}
+	return result
+}
+
 func (n *Node) traceWriteEvent(assignment ReplicaAssignment, sequence uint64, stage string) {
 	if n == nil || n.writeTrace == nil {
 		return
@@ -149,6 +193,25 @@ func appendBoundedWriteTraceEvent(events []writeTraceEvent, event writeTraceEven
 	}
 	copy(events, events[len(events)-limit:])
 	return events[:limit]
+}
+
+func (r *writeTraceRecorder) recordFailureEventLocked(event writeTraceEvent) {
+	if r.failure == nil {
+		r.failure = map[int]slotWriteTraceRing{}
+	}
+	now := event.At
+	for slot, trace := range r.failure {
+		if slot == event.Slot {
+			continue
+		}
+		if now.Sub(trace.updatedAt) > defaultFailureWriteTraceIdle {
+			delete(r.failure, slot)
+		}
+	}
+	trace := r.failure[event.Slot]
+	trace.updatedAt = now
+	trace.events = appendBoundedWriteTraceEvent(trace.events, event, defaultFailureWriteTraceEvents)
+	r.failure[event.Slot] = trace
 }
 
 func writeTraceCommitIntentStage(role ReplicaRole) string {
