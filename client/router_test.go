@@ -905,7 +905,7 @@ func TestEndToEndRouterPutGetDeleteWithQueuedReplicationTransport(t *testing.T) 
 			t.Fatalf("head staged before first queued delivery = %v, want %v", got, want)
 		}
 	})
-	if _, err := router.Put(ctx, key, "v1"); err != nil {
+	if _, err := routerPutWithDelivery(t, ctx, router, h.repl, key, "v1"); err != nil {
 		t.Fatalf("Put returned error: %v", err)
 	}
 	if !observedHeadStaged {
@@ -918,7 +918,7 @@ func TestEndToEndRouterPutGetDeleteWithQueuedReplicationTransport(t *testing.T) 
 	if got, want := readResult.Value, "v1"; got != want {
 		t.Fatalf("read value = %q, want %q", got, want)
 	}
-	if _, err := router.Delete(ctx, key); err != nil {
+	if _, err := routerDeleteWithDelivery(t, ctx, router, h.repl, key); err != nil {
 		t.Fatalf("Delete returned error: %v", err)
 	}
 	readResult, err = router.Get(ctx, key)
@@ -974,7 +974,7 @@ func TestRouterCRAQLocalCommittedAndLinearizableReadsUseRealHarness(t *testing.T
 	}
 
 	key := keyForSlot(t, 0, 1, "craq-local-real")
-	if _, err := router.Put(ctx, key, "v1"); err != nil {
+	if _, err := routerPutWithDelivery(t, ctx, router, h.repl, key, "v1"); err != nil {
 		t.Fatalf("Put returned error: %v", err)
 	}
 	enqueueDirtyCommittedMiddleWrite(t, ctx, h, 0, key, "v2", 2)
@@ -1023,7 +1023,7 @@ func TestRouterCRAQFallsBackDirectlyToTailWithRealHarness(t *testing.T) {
 	}
 
 	key := keyForSlot(t, 0, 1, "craq-tail-fallback-real")
-	if _, err := router.Put(ctx, key, "v1"); err != nil {
+	if _, err := routerPutWithDelivery(t, ctx, router, h.repl, key, "v1"); err != nil {
 		t.Fatalf("Put returned error: %v", err)
 	}
 	enqueueDirtyCommittedMiddleWrite(t, ctx, h, 0, key, "v2", 2)
@@ -1612,7 +1612,7 @@ func misconfigureReadDependency(t *testing.T, node *storage.Node, slot int, tail
 }
 
 func setNextReadReplicaForSlot(router *Router, slot int, next int) {
-	router.mu.Lock()
-	defer router.mu.Unlock()
+	router.roundRobinMu.Lock()
+	defer router.roundRobinMu.Unlock()
 	router.nextReadReplica[slot] = next
 }

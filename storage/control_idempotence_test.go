@@ -44,7 +44,7 @@ func TestAddReplicaAsTailReplayIsIdempotent(t *testing.T) {
 	}
 }
 
-// Per-slot locking serializes concurrent AddReplicaAsTail calls for the same
+// The slot owner serializes concurrent AddReplicaAsTail calls for the same
 // slot. The second call observes the record created by the first and returns
 // nil (idempotent).
 func TestAddReplicaAsTailConcurrentReplayIsIdempotent(t *testing.T) {
@@ -93,8 +93,10 @@ func TestAddReplicaAsTailReplaySucceedsFromPersistedReplica(t *testing.T) {
 	if err := node.AddReplicaAsTail(ctx, cmd); err != nil {
 		t.Fatalf("first AddReplicaAsTail returned error: %v", err)
 	}
-
-	node.deleteReplicaRecord(cmd.Assignment.Slot)
+	if err := node.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	node = mustOpenNode(t, ctx, Config{NodeID: "node-a"}, backend, local, NewInMemoryCoordinatorClient(), NewInMemoryReplicationTransport())
 
 	replay := cmd
 	replay.Epoch = 6
@@ -121,8 +123,10 @@ func TestAddReplicaAsTailReplayRejectsConflictingPersistedAssignment(t *testing.
 	if err := node.AddReplicaAsTail(ctx, cmd); err != nil {
 		t.Fatalf("first AddReplicaAsTail returned error: %v", err)
 	}
-
-	node.deleteReplicaRecord(cmd.Assignment.Slot)
+	if err := node.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	node = mustOpenNode(t, ctx, Config{NodeID: "node-a"}, backend, local, NewInMemoryCoordinatorClient(), NewInMemoryReplicationTransport())
 
 	conflict := AddReplicaAsTailCommand{
 		Assignment: ReplicaAssignment{Slot: 1, ChainVersion: 4, Role: ReplicaRoleTail},

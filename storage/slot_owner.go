@@ -18,6 +18,8 @@ type slotOwner struct {
 	node *Node
 	slot int
 	ch   chan func(*slotRuntime)
+	done chan struct{}
+	once sync.Once
 }
 
 type slotRuntime struct {
@@ -130,6 +132,7 @@ func newSlotOwner(node *Node, slot int, exists bool, record replicaRecord) *slot
 		node: node,
 		slot: slot,
 		ch:   make(chan func(*slotRuntime), slotOwnerMailboxSize),
+		done: make(chan struct{}),
 	}
 	go owner.loop(exists, record)
 	return owner
@@ -147,8 +150,9 @@ func (o *slotOwner) loop(exists bool, record replicaRecord) {
 		select {
 		case <-o.node.done:
 			return
+		case <-o.done:
+			return
 		case fn := <-o.ch:
-			runtime.syncFromPublished()
 			fn(runtime)
 		}
 	}
@@ -157,6 +161,8 @@ func (o *slotOwner) loop(exists bool, record replicaRecord) {
 func (o *slotOwner) dispatch(ctx context.Context, fn func(*slotRuntime)) error {
 	select {
 	case <-o.node.done:
+		return context.Canceled
+	case <-o.done:
 		return context.Canceled
 	case <-ctx.Done():
 		return ctx.Err()
@@ -169,9 +175,17 @@ func (o *slotOwner) enqueue(fn func(*slotRuntime)) bool {
 	select {
 	case <-o.node.done:
 		return false
+	case <-o.done:
+		return false
 	case o.ch <- fn:
 		return true
 	}
+}
+
+func (o *slotOwner) close() {
+	o.once.Do(func() {
+		close(o.done)
+	})
 }
 
 func (rt *slotRuntime) bufferedCount() int {
@@ -182,35 +196,11 @@ func (rt *slotRuntime) bufferedCount() int {
 	return len(record.bufferedForwards) + len(record.bufferedCommits)
 }
 
-func (rt *slotRuntime) syncFromPublished() {
-	record, ok := rt.node.replicaRecordSnapshot(rt.slot)
-	if !ok {
-		if !rt.exists {
-			return
-		}
-		rt.exists = false
-		rt.record = replicaRecord{}
-		return
-	}
-	record = ensureProtocolReplicaState(record)
-	if rt.exists {
-		current := ensureProtocolReplicaState(rt.record)
-		for sequence, pending := range record.pendingWrites {
-			if existing, ok := current.pendingWrites[sequence]; ok {
-				pending.waiter = existing.waiter
-				record.pendingWrites[sequence] = pending
-			}
-		}
-	}
-	rt.exists = true
-	rt.record = record
-}
-
 func (rt *slotRuntime) publish(prevBuffered int) {
 	if rt.exists {
-		rt.node.setReplicaRecord(rt.slot, rt.record)
+		rt.node.publishReplicaRecord(rt.slot, rt.record)
 	} else {
-		rt.node.deleteReplicaRecord(rt.slot)
+		rt.node.deletePublishedReplica(rt.slot)
 	}
 	if prevBuffered != rt.bufferedCount() {
 		rt.node.refreshMetricGauges()
@@ -733,14 +723,14 @@ func (rt *slotRuntime) releaseClientWrite() {
 
 func (rt *slotRuntime) handleClientGet(ctx context.Context, req ClientGetRequest) (ReadResult, error) {
 	if !rt.exists {
-		return ReadResult{}, newRoutingMismatch(req.Slot, req.ExpectedChainVersion, replicaRecord{}, RoutingMismatchReasonUnknownSlot)
+		return ReadResult{}, newRoutingMismatch(req.Slot, req.ExpectedChainVersion, ReplicaAssignment{}, ReplicaState(""), RoutingMismatchReasonUnknownSlot)
 	}
 	record := rt.record
 	if record.state != ReplicaStateActive {
-		return ReadResult{}, newRoutingMismatch(req.Slot, req.ExpectedChainVersion, record, RoutingMismatchReasonInactiveReplica)
+		return ReadResult{}, newRoutingMismatch(req.Slot, req.ExpectedChainVersion, record.assignment, record.state, RoutingMismatchReasonInactiveReplica)
 	}
 	if record.assignment.ChainVersion != req.ExpectedChainVersion {
-		return ReadResult{}, newRoutingMismatch(req.Slot, req.ExpectedChainVersion, record, RoutingMismatchReasonWrongVersion)
+		return ReadResult{}, newRoutingMismatch(req.Slot, req.ExpectedChainVersion, record.assignment, record.state, RoutingMismatchReasonWrongVersion)
 	}
 	assignment := cloneAssignment(record.assignment)
 	dirtyEntries := rt.node.dirtyEntriesForKey(record, req.Key)
@@ -973,6 +963,7 @@ func (rt *slotRuntime) removeReplica(ctx context.Context) error {
 		}
 	}
 	rt.removeRecord()
+	rt.node.evictSlotOwner(rt.slot, rt.owner)
 	rt.node.refreshMetricGauges()
 	rt.node.events.record(rt.node.logger, zerolog.InfoLevel, "remove_replica", "storage replica removed", &rt.slot, nil, nil, "", "", nil)
 	return nil
@@ -1091,6 +1082,7 @@ func (rt *slotRuntime) dropRecoveredReplica(ctx context.Context, slot int) error
 		return fmt.Errorf("err in n.local.DeleteReplica: %w", err)
 	}
 	rt.removeRecord()
+	rt.node.evictSlotOwner(rt.slot, rt.owner)
 	rt.node.events.record(rt.node.logger, zerolog.InfoLevel, "drop_recovered_replica", "storage recovered replica dropped", &slot, nil, nil, "", "", nil)
 	return nil
 }
@@ -1101,10 +1093,24 @@ func (n *Node) ensureSlotOwner(slot int) *slotOwner {
 	if owner, ok := n.slotOwners[slot]; ok {
 		return owner
 	}
-	record, ok := n.replicas[slot]
+	record := replicaRecord{}
+	ok := false
+	if published, exists := n.publishedReplicas[slot]; exists {
+		record = replicaRecordFromPublished(published)
+		ok = true
+	}
 	owner := newSlotOwner(n, slot, ok, record)
 	n.slotOwners[slot] = owner
 	return owner
+}
+
+func (n *Node) evictSlotOwner(slot int, owner *slotOwner) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if existing, ok := n.slotOwners[slot]; ok && existing == owner {
+		delete(n.slotOwners, slot)
+		owner.close()
+	}
 }
 
 func (n *Node) tryAdmitNodeClientWrite(slot int, slotCurrent int) error {
@@ -1130,30 +1136,6 @@ func (n *Node) releaseNodeClientWrite() {
 	n.refreshMetricGaugesLocked()
 }
 
-func (n *Node) applyCommittedOperation(
-	ctx context.Context,
-	operation WriteOperation,
-	persisted PersistedReplica,
-) (bool, error) {
-	applyErr := n.backend.ApplyCommitted(ctx, n.nodeID, operation, &persisted)
-	if applyErr != nil {
-		highestCommitted, err := n.backend.HighestCommittedSequence(operation.Slot)
-		if err != nil || highestCommitted != operation.Sequence {
-			return false, fmt.Errorf("err in n.backend.ApplyCommitted: %w", applyErr)
-		}
-		return true, fmt.Errorf("err in n.backend.ApplyCommitted: %w", applyErr)
-	}
-	return true, nil
-}
-
-func (n *Node) writeActuallyCommitted(slot int, sequence uint64) bool {
-	highestCommitted, err := n.backend.HighestCommittedSequence(slot)
-	if err != nil {
-		return false
-	}
-	return highestCommitted >= sequence
-}
-
 func (n *Node) releaseClientWriteOwned(owner *slotOwner) {
 	if owner == nil {
 		return
@@ -1161,22 +1143,6 @@ func (n *Node) releaseClientWriteOwned(owner *slotOwner) {
 	done := make(chan struct{}, 1)
 	if err := owner.dispatch(n.runtimeCtx, func(runtime *slotRuntime) {
 		runtime.releaseClientWrite()
-		done <- struct{}{}
-	}); err != nil {
-		return
-	}
-	select {
-	case <-n.done:
-	case <-done:
-	}
-}
-
-func (n *Node) syncSlotOwner(owner *slotOwner) {
-	if owner == nil {
-		return
-	}
-	done := make(chan struct{}, 1)
-	if err := owner.dispatch(n.runtimeCtx, func(*slotRuntime) {
 		done <- struct{}{}
 	}); err != nil {
 		return
@@ -1216,30 +1182,6 @@ func (n *Node) submitWriteOwned(
 	}
 	waitCtx, cancel := withDefaultTimeout(ctx, n.writeCommitTimeout)
 	defer cancel()
-	if waiter, ok := n.repl.(interface {
-		AwaitWriteCommit(ctx context.Context, check func() bool) error
-	}); ok && !response.waiter.ready() {
-		if err := waiter.AwaitWriteCommit(waitCtx, response.waiter.ready); err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				err = fmt.Errorf("%w: err in repl.AwaitWriteCommit: %w", ErrWriteTimeout, err)
-				n.releaseClientWriteOwned(owner)
-				return CommitResult{}, err
-			}
-			if !errors.Is(err, ErrStateMismatch) {
-				err = fmt.Errorf("err in repl.AwaitWriteCommit: %w", err)
-				n.releaseClientWriteOwned(owner)
-				return CommitResult{}, err
-			}
-			if !response.waiter.ready() {
-				n.syncSlotOwner(owner)
-			}
-			if !response.waiter.ready() {
-				err = fmt.Errorf("err in repl.AwaitWriteCommit: %w", err)
-				n.releaseClientWriteOwned(owner)
-				return CommitResult{}, err
-			}
-		}
-	}
 	err := response.waiter.wait(waitCtx, n.done)
 	n.releaseClientWriteOwned(owner)
 	if err != nil {

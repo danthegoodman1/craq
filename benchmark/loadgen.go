@@ -21,10 +21,11 @@ import (
 )
 
 type LoadGenProcessConfig struct {
-	RunID        string          `json:"run_id"`
-	ManifestPath string          `json:"manifest_path"`
-	OutputDir    string          `json:"output_dir"`
-	Workload     WorkloadProfile `json:"workload"`
+	RunID        string           `json:"run_id"`
+	ManifestPath string           `json:"manifest_path"`
+	OutputDir    string           `json:"output_dir"`
+	Workload     WorkloadProfile  `json:"workload"`
+	Telemetry    TelemetryProfile `json:"telemetry"`
 }
 
 type latencySample struct {
@@ -62,6 +63,7 @@ func RunLoadGen(ctx context.Context, cfg LoadGenProcessConfig) (LoadGenReport, e
 	if err := router.Refresh(ctx); err != nil {
 		return LoadGenReport{}, fmt.Errorf("refresh benchmark client router: %w", err)
 	}
+	profileTargets := loadgenProfileTargets(manifest)
 	rng := rand.New(rand.NewSource(cfg.Workload.Seed))
 
 	preloadStarted := time.Now()
@@ -87,7 +89,7 @@ func RunLoadGen(ctx context.Context, cfg LoadGenProcessConfig) (LoadGenReport, e
 			return report, ctx.Err()
 		default:
 		}
-		result, err := runScenario(ctx, router, cfg.OutputDir, cfg.Workload, scenario, rng)
+		result, err := runScenario(ctx, router, cfg.OutputDir, cfg.Workload, scenario, rng, cfg.Telemetry, profileTargets)
 		if err != nil {
 			report.Errors = append(report.Errors, err.Error())
 			return report, err
@@ -118,6 +120,8 @@ func runScenario(
 	workload WorkloadProfile,
 	scenario ScenarioProfile,
 	rng *rand.Rand,
+	telemetry TelemetryProfile,
+	profileTargets []loadgenProfileTarget,
 ) (ScenarioReport, error) {
 	report := ScenarioReport{
 		Name:        scenario.Name,
@@ -133,6 +137,8 @@ func runScenario(
 		return ScenarioReport{}, fmt.Errorf("create sample file: %w", err)
 	}
 	defer file.Close()
+
+	profiler := startScenarioProfiler(ctx, outputDir, scenario, telemetry, profileTargets)
 
 	type opResult struct {
 		at        time.Time
@@ -278,6 +284,9 @@ loop:
 	}
 	flushInterval(time.Now().UTC())
 	report.FinishedAt = time.Now().UTC()
+	if err := profiler.wait(); err != nil {
+		return report, err
+	}
 	report.P50Millis = percentile(samples, 50)
 	report.P95Millis = percentile(samples, 95)
 	report.P99Millis = percentile(samples, 99)

@@ -503,6 +503,7 @@ type QueuedReplicationMessage struct {
 }
 
 type QueuedInMemoryReplicationTransport struct {
+	mu                  sync.Mutex
 	backends            map[string]Backend
 	nodes               map[string]replicationHandler
 	queue               []QueuedReplicationMessage
@@ -522,44 +523,72 @@ func NewQueuedInMemoryReplicationTransport() *QueuedInMemoryReplicationTransport
 }
 
 func (t *QueuedInMemoryReplicationTransport) Register(nodeID string, backend Backend) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.backends[nodeID] = backend
 }
 
 func (t *QueuedInMemoryReplicationTransport) RegisterNode(nodeID string, node replicationHandler) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.nodes[nodeID] = node
 }
 
 func (t *QueuedInMemoryReplicationTransport) FetchSnapshot(ctx context.Context, fromNodeID string, slot int) (Snapshot, uint64, error) {
-	if t.beforeFetchSnapshot != nil {
-		t.beforeFetchSnapshot(fromNodeID, slot)
+	t.mu.Lock()
+	hook := t.beforeFetchSnapshot
+	blockSnapshot := t.blockSnapshot
+	backend, ok := t.backends[fromNodeID]
+	t.mu.Unlock()
+	if hook != nil {
+		hook(fromNodeID, slot)
 	}
-	if t.blockSnapshot != nil {
+	if blockSnapshot != nil {
 		select {
 		case <-ctx.Done():
 			return nil, 0, ctx.Err()
-		case <-t.blockSnapshot:
+		case <-blockSnapshot:
 		}
 	}
-	inline := InMemoryReplicationTransport{backends: t.backends}
-	return inline.FetchSnapshot(ctx, fromNodeID, slot)
+	if !ok {
+		return nil, 0, fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, fromNodeID)
+	}
+	snap, err := backend.Snapshot(slot)
+	if err != nil {
+		return nil, 0, fmt.Errorf("err in backend.Snapshot: %w", err)
+	}
+	sequence, err := backend.HighestCommittedSequence(slot)
+	if err != nil {
+		return nil, 0, fmt.Errorf("err in backend.HighestCommittedSequence: %w", err)
+	}
+	return cloneSnapshot(snap), sequence, nil
 }
 
 func (t *QueuedInMemoryReplicationTransport) FetchCommittedSequence(ctx context.Context, fromNodeID string, slot int) (uint64, error) {
-	if t.beforeFetchSequence != nil {
-		t.beforeFetchSequence(fromNodeID, slot)
+	t.mu.Lock()
+	hook := t.beforeFetchSequence
+	blockSequence := t.blockSequence
+	backend, ok := t.backends[fromNodeID]
+	t.mu.Unlock()
+	if hook != nil {
+		hook(fromNodeID, slot)
 	}
-	if t.blockSequence != nil {
+	if blockSequence != nil {
 		select {
 		case <-ctx.Done():
 			return 0, ctx.Err()
-		case <-t.blockSequence:
+		case <-blockSequence:
 		}
 	}
-	inline := InMemoryReplicationTransport{backends: t.backends}
-	return inline.FetchCommittedSequence(ctx, fromNodeID, slot)
+	if !ok {
+		return 0, fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, fromNodeID)
+	}
+	return backend.HighestCommittedSequence(slot)
 }
 
 func (t *QueuedInMemoryReplicationTransport) ForwardWrite(_ context.Context, toNodeID string, req ForwardWriteRequest) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if _, ok := t.nodes[toNodeID]; !ok {
 		return fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, toNodeID)
 	}
@@ -577,6 +606,8 @@ func (t *QueuedInMemoryReplicationTransport) ForwardWrite(_ context.Context, toN
 }
 
 func (t *QueuedInMemoryReplicationTransport) CommitWrite(_ context.Context, toNodeID string, req CommitWriteRequest) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if _, ok := t.nodes[toNodeID]; !ok {
 		return fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, toNodeID)
 	}
@@ -610,10 +641,14 @@ func (t *QueuedInMemoryReplicationTransport) AwaitWriteCommit(ctx context.Contex
 }
 
 func (t *QueuedInMemoryReplicationTransport) Pending() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	return len(t.queue)
 }
 
 func (t *QueuedInMemoryReplicationTransport) PendingMessages() []QueuedReplicationMessage {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	cloned := make([]QueuedReplicationMessage, 0, len(t.queue))
 	for _, msg := range t.queue {
 		cloned = append(cloned, cloneQueuedReplicationMessage(msg))
@@ -622,10 +657,14 @@ func (t *QueuedInMemoryReplicationTransport) PendingMessages() []QueuedReplicati
 }
 
 func (t *QueuedInMemoryReplicationTransport) DropNext() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.dropNextWrite = true
 }
 
 func (t *QueuedInMemoryReplicationTransport) DropAt(index int) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if index < 0 || index >= len(t.queue) {
 		return fmt.Errorf("%w: queued message index %d", ErrStateMismatch, index)
 	}
@@ -634,6 +673,8 @@ func (t *QueuedInMemoryReplicationTransport) DropAt(index int) error {
 }
 
 func (t *QueuedInMemoryReplicationTransport) DuplicateAt(index int) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if index < 0 || index >= len(t.queue) {
 		return fmt.Errorf("%w: queued message index %d", ErrStateMismatch, index)
 	}
@@ -646,6 +687,8 @@ func (t *QueuedInMemoryReplicationTransport) MoveToFront(index int) error {
 }
 
 func (t *QueuedInMemoryReplicationTransport) MoveTo(index int, destination int) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if index < 0 || index >= len(t.queue) {
 		return fmt.Errorf("%w: queued message index %d", ErrStateMismatch, index)
 	}
@@ -668,22 +711,32 @@ func (t *QueuedInMemoryReplicationTransport) MoveTo(index int, destination int) 
 }
 
 func (t *QueuedInMemoryReplicationTransport) SetBeforeDeliver(hook func(QueuedReplicationMessage)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.beforeDeliver = hook
 }
 
 func (t *QueuedInMemoryReplicationTransport) SetBeforeFetchSnapshot(hook func(fromNodeID string, slot int)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.beforeFetchSnapshot = hook
 }
 
 func (t *QueuedInMemoryReplicationTransport) SetBeforeFetchCommittedSequence(hook func(fromNodeID string, slot int)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.beforeFetchSequence = hook
 }
 
 func (t *QueuedInMemoryReplicationTransport) BlockFetchSnapshot(ch <-chan struct{}) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.blockSnapshot = ch
 }
 
 func (t *QueuedInMemoryReplicationTransport) BlockFetchCommittedSequence(ch <-chan struct{}) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.blockSequence = ch
 }
 
@@ -692,18 +745,23 @@ func (t *QueuedInMemoryReplicationTransport) DeliverNext(ctx context.Context) er
 }
 
 func (t *QueuedInMemoryReplicationTransport) DeliverAt(ctx context.Context, index int) error {
+	t.mu.Lock()
 	if len(t.queue) == 0 {
+		t.mu.Unlock()
 		return nil
 	}
 	if index < 0 || index >= len(t.queue) {
+		t.mu.Unlock()
 		return fmt.Errorf("%w: queued message index %d", ErrStateMismatch, index)
 	}
 	msg := t.queue[index]
 	t.queue = append(t.queue[:index], t.queue[index+1:]...)
-	if t.beforeDeliver != nil {
-		t.beforeDeliver(msg)
-	}
+	hook := t.beforeDeliver
 	node, ok := t.nodes[msg.ToNodeID]
+	t.mu.Unlock()
+	if hook != nil {
+		hook(msg)
+	}
 	if !ok {
 		return fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, msg.ToNodeID)
 	}

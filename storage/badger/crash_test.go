@@ -183,7 +183,7 @@ func TestBadgerNodeReopenAfterDirtyCRAQStateRecoversFromServingPeer(t *testing.T
 		}
 	}
 
-	if _, err := head.SubmitPut(ctx, 3, "alpha", "v1"); err != nil {
+	if _, err := submitPutWithQueuedDelivery(t, ctx, head, repl, 3, "alpha", "v1"); err != nil {
 		t.Fatalf("head SubmitPut(v1) returned error: %v", err)
 	}
 
@@ -195,10 +195,10 @@ func TestBadgerNodeReopenAfterDirtyCRAQStateRecoversFromServingPeer(t *testing.T
 		dropped = true
 		repl.DropNext()
 	})
-	if _, err := head.SubmitPut(ctx, 3, "alpha", "v2"); err == nil {
+	if _, err := submitPutWithQueuedDelivery(t, ctx, head, repl, 3, "alpha", "v2"); err == nil {
 		t.Fatal("head SubmitPut(v2) unexpectedly succeeded")
-	} else if !errors.Is(err, storage.ErrStateMismatch) {
-		t.Fatalf("head SubmitPut(v2) error = %v, want ErrStateMismatch", err)
+	} else if !errors.Is(err, storage.ErrWriteTimeout) {
+		t.Fatalf("head SubmitPut(v2) error = %v, want ErrWriteTimeout", err)
 	}
 
 	if read, err := tail.HandleClientGet(ctx, storage.ClientGetRequest{

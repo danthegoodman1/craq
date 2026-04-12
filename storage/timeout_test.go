@@ -42,7 +42,7 @@ func TestSubmitPutTimesOutAndPreservesInFlightState(t *testing.T) {
 	if got, want := mustHighestCommitted(t, node, 7), uint64(0); got != want {
 		t.Fatalf("highest committed = %d, want %d", got, want)
 	}
-	record := node.replicas[7]
+	record := mustSlotRecord(t, node, 7)
 	if _, ok := record.pendingWrites[1]; !ok {
 		t.Fatal("pending write missing after timeout")
 	}
@@ -140,8 +140,7 @@ func TestSubmitPutTimesOutWithoutAwaitWriteCommitTransport(t *testing.T) {
 	})
 
 	// This transport returns from ForwardWrite before the tail processes the
-	// write and does not implement AwaitWriteCommit, matching the transport
-	// shape that previously fell through to ErrStateMismatch.
+	// write, so the slot-owned waiter has to enforce the timeout on its own.
 	if _, err := head.SubmitPut(ctx, 7, "k", "v"); err == nil {
 		t.Fatal("SubmitPut unexpectedly succeeded")
 	} else {
@@ -195,8 +194,8 @@ func TestSubmitPutWaitsForDelayedCommitWithoutAwaitWriteCommitTransport(t *testi
 		deliverErrCh <- transport.DeliverNextForward(ctx)
 	}()
 
-	// The fallback poll should observe the delayed local commit and return a
-	// normal success once the tail forwards the commit back to the head.
+	// The slot-owned waiter should observe the delayed local commit and return
+	// a normal success once the tail forwards the commit back to the head.
 	result, err := head.SubmitPut(ctx, 7, "k", "v")
 	if err != nil {
 		t.Fatalf("SubmitPut returned error: %v", err)
@@ -209,6 +208,46 @@ func TestSubmitPutWaitsForDelayedCommitWithoutAwaitWriteCommitTransport(t *testi
 		"head": head,
 		"tail": tail,
 	}, 7, map[string]string{"k": "v"}, 1)
+}
+
+func TestSubmitPutDoesNotUseAwaitWriteCommitTransport(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	transport := &trackingAwaitWriteTransport{asyncWriteTransport: *newAsyncWriteTransport()}
+	head := mustNewNode(t, ctx, Config{
+		NodeID:             "head",
+		WriteCommitTimeout: 50 * time.Millisecond,
+	}, NewInMemoryBackend(), NewInMemoryCoordinatorClient(), transport)
+	tail := mustNewNode(t, ctx, Config{NodeID: "tail"}, NewInMemoryBackend(), NewInMemoryCoordinatorClient(), transport)
+	transport.RegisterNode("head", head)
+	transport.RegisterNode("tail", tail)
+	mustActivateReplica(t, head, 8, ReplicaAssignment{
+		Slot:         8,
+		ChainVersion: 1,
+		Role:         ReplicaRoleHead,
+		Peers:        ChainPeers{SuccessorNodeID: "tail"},
+	})
+	mustActivateReplica(t, tail, 8, ReplicaAssignment{
+		Slot:         8,
+		ChainVersion: 1,
+		Role:         ReplicaRoleTail,
+		Peers:        ChainPeers{PredecessorNodeID: "head"},
+	})
+
+	deliverErrCh := make(chan error, 1)
+	go func() {
+		deliverErrCh <- transport.DeliverNextForward(ctx)
+	}()
+
+	if _, err := head.SubmitPut(ctx, 8, "k", "v"); err != nil {
+		t.Fatalf("SubmitPut returned error: %v", err)
+	}
+	if err := <-deliverErrCh; err != nil {
+		t.Fatalf("DeliverNextForward returned error: %v", err)
+	}
+	if got := transport.awaitCalls; got != 0 {
+		t.Fatalf("AwaitWriteCommit call count = %d, want 0", got)
+	}
 }
 
 type blockingWriteTransport struct{}
@@ -247,11 +286,21 @@ type asyncForward struct {
 	req      ForwardWriteRequest
 }
 
+type trackingAwaitWriteTransport struct {
+	asyncWriteTransport
+	awaitCalls int
+}
+
 func newAsyncWriteTransport() *asyncWriteTransport {
 	return &asyncWriteTransport{
 		nodes:    map[string]replicationHandler{},
 		forwards: make(chan asyncForward, 16),
 	}
+}
+
+func (t *trackingAwaitWriteTransport) AwaitWriteCommit(context.Context, func() bool) error {
+	t.awaitCalls++
+	return nil
 }
 
 func (t *asyncWriteTransport) RegisterNode(nodeID string, node replicationHandler) {

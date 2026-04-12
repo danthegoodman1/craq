@@ -14,8 +14,8 @@ import (
 //
 // Concurrent goroutines call HandleForwardWrite directly on the middle node.
 // Each forward is staged and synchronously forwarded to the tail, which
-// commits it and sends a CommitWrite back to the middle. The per-slot lock
-// on the middle serializes these mixed forward/commit operations. Out-of-order
+// commits it and sends a CommitWrite back to the middle. The slot owner on the
+// middle serializes these mixed forward/commit operations. Out-of-order
 // forwards are buffered and drained once the in-order sequence arrives.
 func TestConcurrentForwardAndCommitOnSameSlot(t *testing.T) {
 	const (

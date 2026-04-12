@@ -435,6 +435,7 @@ func installRemoteConfigs(ctx context.Context, state RunState, manifestPath stri
 		ManifestPath: "/etc/craq-bench/manifest.json",
 		OutputDir:    filepath.Join(runRoot, "client"),
 		Workload:     state.Profile.Workload,
+		Telemetry:    state.Profile.Telemetry,
 	}
 	collectCfg := CollectConfig{
 		RunID:         state.RunID,

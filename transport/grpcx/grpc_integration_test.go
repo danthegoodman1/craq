@@ -741,7 +741,7 @@ func TestClientTransportCRAQReadsOverGRPCFromNonTailReplica(t *testing.T) {
 	chain := mustStartQueuedCRAQGRPCChain(t, ctx, 18)
 	transport := grpcx.NewClientTransport(pool)
 
-	if _, err := chain.nodes["head"].SubmitPut(ctx, 18, "alpha", "v1"); err != nil {
+	if _, err := submitPutWithQueuedDelivery(t, ctx, chain.nodes["head"], chain.repl, 18, "alpha", "v1"); err != nil {
 		t.Fatalf("SubmitPut returned error: %v", err)
 	}
 	queueDirtyCommittedMiddleWrite(t, ctx, chain, 18, "alpha", "v2", 2)
@@ -780,7 +780,7 @@ func TestClientTransportReturnsReadDependencyErrorOverGRPCForDirtyNonTailRead(t 
 	chain := mustStartQueuedCRAQGRPCChain(t, ctx, 19)
 	transport := grpcx.NewClientTransport(pool)
 
-	if _, err := chain.nodes["head"].SubmitPut(ctx, 19, "alpha", "v1"); err != nil {
+	if _, err := submitPutWithQueuedDelivery(t, ctx, chain.nodes["head"], chain.repl, 19, "alpha", "v1"); err != nil {
 		t.Fatalf("SubmitPut returned error: %v", err)
 	}
 	queueDirtyCommittedMiddleWrite(t, ctx, chain, 19, "alpha", "v2", 2)

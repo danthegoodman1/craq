@@ -137,10 +137,11 @@ func TestTailHandleForwardWriteHonorsContextDuringCommitPersist(t *testing.T) {
 		ChainVersion: 1,
 		Role:         ReplicaRoleSingle,
 	})
-	record := node.replicas[6]
-	record.assignment.Role = ReplicaRoleTail
-	record.assignment.Peers.PredecessorNodeID = "head"
-	node.replicas[6] = record
+	mustMutateSlotRecord(t, node, 6, func(record replicaRecord) replicaRecord {
+		record.assignment.Role = ReplicaRoleTail
+		record.assignment.Peers.PredecessorNodeID = "head"
+		return record
+	})
 	local.blockUpsert = true
 	cancelCtx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -178,8 +179,7 @@ func TestHandleCommitWriteHonorsContextDuringCommitPersist(t *testing.T) {
 		Role:         ReplicaRoleHead,
 		Peers:        ChainPeers{SuccessorNodeID: "tail"},
 	})
-	record := node.replicas[7]
-	record = node.ensureProtocolState(record)
+	record := mustSlotRecord(t, node, 7)
 	op := WriteOperation{Slot: 7, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v", Metadata: testObjectMetadata(1)}
 	if err := node.stageOperation(op); err != nil {
 		t.Fatalf("stageOperation returned error: %v", err)
@@ -187,7 +187,9 @@ func TestHandleCommitWriteHonorsContextDuringCommitPersist(t *testing.T) {
 	record.stagedForwards[1] = ForwardWriteRequest{Operation: op, FromNodeID: "client", ChainVersion: 1}
 	record.pendingWrites[1] = pendingWrite{}
 	record.nextSequence = 2
-	node.replicas[7] = record
+	mustMutateSlotRecord(t, node, 7, func(replicaRecord) replicaRecord {
+		return record
+	})
 
 	local.blockUpsert = true
 	cancelCtx, cancel := context.WithCancel(context.Background())

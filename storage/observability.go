@@ -244,20 +244,21 @@ func (n *Node) RecentEvents() []ops.Event {
 }
 
 func (n *Node) ResourceUsage() ResourceUsage {
+	replicas := n.publishedReplicaMapSnapshot()
 	n.mu.RLock()
-	defer n.mu.RUnlock()
 	usage := ResourceUsage{
 		InFlightClientWritesPerNode:    n.inFlightClientWrites,
-		InFlightClientWritesPerSlot:    make(map[int]int, len(n.replicas)),
-		BufferedReplicaMessagesPerNode: n.bufferedReplicaMessagesForNodeLocked(),
-		BufferedReplicaMessagesPerSlot: make(map[int]int, len(n.replicas)),
-		DirtyKeysPerSlot:               make(map[int]int, len(n.replicas)),
+		InFlightClientWritesPerSlot:    make(map[int]int, len(replicas)),
+		BufferedReplicaMessagesPerNode: n.publishedBufferedReplicaMessages,
+		BufferedReplicaMessagesPerSlot: make(map[int]int, len(replicas)),
+		DirtyKeysPerSlot:               make(map[int]int, len(replicas)),
 		ActiveCatchups:                 n.inFlightCatchups,
 	}
-	for slot, record := range n.replicas {
+	n.mu.RUnlock()
+	for slot, record := range replicas {
 		usage.InFlightClientWritesPerSlot[slot] = record.inFlightClientWrites
-		usage.BufferedReplicaMessagesPerSlot[slot] = len(record.bufferedForwards) + len(record.bufferedCommits)
-		usage.DirtyKeysPerSlot[slot] = dirtyKeyCount(record)
+		usage.BufferedReplicaMessagesPerSlot[slot] = record.bufferedReplicaMessages()
+		usage.DirtyKeysPerSlot[slot] = record.dirtyKeyCount
 	}
 	return usage
 }
@@ -285,7 +286,7 @@ func (n *Node) refreshMetricGaugesLocked() {
 		return
 	}
 	inFlightWrites := n.inFlightClientWrites
-	bufferedReplicaMessages := n.bufferedReplicaMessagesForNodeLocked()
+	bufferedReplicaMessages := n.publishedBufferedReplicaMessages
 	catchups := n.inFlightCatchups
 	n.metrics.inFlightWrites.Set(float64(inFlightWrites))
 	n.metrics.bufferedReplicaMsgs.Set(float64(bufferedReplicaMessages))

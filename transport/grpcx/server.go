@@ -236,7 +236,7 @@ func (s *CoordinatorGRPCServer) EvaluateLiveness(ctx context.Context, _ *grpcpro
 	if err := s.server.EvaluateLiveness(ctx); err != nil {
 		return nil, encodeError(err)
 	}
-	return protoServerState(s.server.Current()), nil
+	return &grpcproto.ServerState{Version: s.server.CurrentVersion()}, nil
 }
 
 type StorageGRPCServer struct {

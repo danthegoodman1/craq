@@ -45,6 +45,15 @@ type View struct {
 	LastPolicy              coordinator.ReconfigurationPolicy
 }
 
+type LivenessView struct {
+	Version              uint64
+	Initialized          bool
+	NeedsPeriodicAdvance bool
+	NodeHealthByID       map[string]coordinator.NodeHealth
+	PendingBySlotCount   int
+	OutboxCount          int
+}
+
 // SlotProgressView keeps the replica progress hot path slot-scoped so the
 // coordinator can validate ready/removed reports without cloning the whole
 // runtime view at startup scale.
@@ -299,10 +308,22 @@ func (r *Runtime) Current() State {
 	return cloneState(r.state)
 }
 
+func (r *Runtime) CurrentVersion() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.state.Version
+}
+
 func (r *Runtime) CurrentView() View {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return cloneView(viewFromState(r.state))
+}
+
+func (r *Runtime) CurrentLivenessView() LivenessView {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return cloneLivenessView(livenessViewFromState(r.state))
 }
 
 func (r *Runtime) CurrentSlotProgressView(slot int) SlotProgressView {
@@ -871,8 +892,47 @@ func cloneView(view View) View {
 	}
 }
 
+func livenessViewFromState(state State) LivenessView {
+	return LivenessView{
+		Version:              state.Version,
+		Initialized:          isInitialized(state),
+		NeedsPeriodicAdvance: clusterNeedsPeriodicAdvanceForView(state.Cluster),
+		NodeHealthByID:       cloneNodeHealthMap(state.Cluster.NodeHealthByID),
+		PendingBySlotCount:   len(state.PendingBySlot),
+		OutboxCount:          len(state.Outbox),
+	}
+}
+
+func cloneLivenessView(view LivenessView) LivenessView {
+	return LivenessView{
+		Version:              view.Version,
+		Initialized:          view.Initialized,
+		NeedsPeriodicAdvance: view.NeedsPeriodicAdvance,
+		NodeHealthByID:       cloneNodeHealthMap(view.NodeHealthByID),
+		PendingBySlotCount:   view.PendingBySlotCount,
+		OutboxCount:          view.OutboxCount,
+	}
+}
+
 func isInitialized(state State) bool {
 	return state.Cluster.SlotCount > 0
+}
+
+func clusterNeedsPeriodicAdvanceForView(cluster coordinator.ClusterState) bool {
+	if cluster.SlotCount == 0 || cluster.ReplicationFactor <= 0 || len(cluster.Chains) != cluster.SlotCount {
+		return true
+	}
+	for _, chain := range cluster.Chains {
+		if len(chain.Replicas) != cluster.ReplicationFactor {
+			return true
+		}
+		for _, replica := range chain.Replicas {
+			if replica.State != coordinator.ReplicaStateActive {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func cloneState(state State) State {
@@ -1481,6 +1541,14 @@ func cloneClusterState(state coordinator.ClusterState) coordinator.ClusterState 
 	}
 	for id, draining := range state.DrainingNodeIDs {
 		cloned.DrainingNodeIDs[id] = draining
+	}
+	return cloned
+}
+
+func cloneNodeHealthMap(healthByID map[string]coordinator.NodeHealth) map[string]coordinator.NodeHealth {
+	cloned := make(map[string]coordinator.NodeHealth, len(healthByID))
+	for nodeID, health := range healthByID {
+		cloned[nodeID] = health
 	}
 	return cloned
 }

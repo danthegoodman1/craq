@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	stdpprof "net/http/pprof"
 	"sync/atomic"
 	"time"
 
@@ -84,12 +85,17 @@ func newServer(component string, cfg Config, registerState func(*http.ServeMux))
 		}
 		writeJSON(w, http.StatusOK, healthResponse{Component: component, Ready: true})
 	})
+	mux.HandleFunc("/debug/pprof/", stdpprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", stdpprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", stdpprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", stdpprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", stdpprof.Trace)
 	mux.Handle("/metrics", promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{}))
 	registerState(mux)
 	s.http = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      2 * time.Minute,
 		IdleTimeout:       60 * time.Second,
 	}
 	return s

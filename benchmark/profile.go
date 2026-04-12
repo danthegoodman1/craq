@@ -77,6 +77,7 @@ type TelemetryProfile struct {
 	ProbeInterval    time.Duration `yaml:"probe_interval" json:"probe_interval"`
 	CommandInterval  time.Duration `yaml:"command_interval" json:"command_interval"`
 	ExtraRunDuration time.Duration `yaml:"extra_run_duration" json:"extra_run_duration"`
+	PPROFCPUDuration time.Duration `yaml:"pprof_cpu_duration" json:"pprof_cpu_duration"`
 }
 
 type ArtifactProfile struct {
@@ -237,6 +238,12 @@ func (p Profile) Validate() error {
 	}
 	if p.Workload.PreloadKeys <= 0 {
 		return fmt.Errorf("workload.preload_keys must be > 0")
+	}
+	if p.Telemetry.ProbeInterval <= 0 || p.Telemetry.CommandInterval <= 0 || p.Telemetry.ExtraRunDuration <= 0 {
+		return fmt.Errorf("telemetry timing values must be > 0")
+	}
+	if p.Telemetry.PPROFCPUDuration < 0 {
+		return fmt.Errorf("telemetry.pprof_cpu_duration must be >= 0")
 	}
 	if p.Workload.ValueBytes <= 0 {
 		return fmt.Errorf("workload.value_bytes must be > 0")

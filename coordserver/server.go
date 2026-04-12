@@ -287,6 +287,12 @@ func (s *Server) Current() coordruntime.State {
 	return s.currentState()
 }
 
+func (s *Server) CurrentVersion() uint64 {
+	s.runtimeMu.RLock()
+	defer s.runtimeMu.RUnlock()
+	return s.rt.CurrentVersion()
+}
+
 func (s *Server) setNodeClient(nodeID string, client StorageNodeClient) {
 	s.nodesMu.Lock()
 	s.nodes[nodeID] = client
@@ -785,11 +791,11 @@ func (s *Server) EvaluateLiveness(ctx context.Context) error {
 			}
 
 			if record.State == coordruntime.NodeLivenessStateDead && !record.DeadActionFired {
-				if len(s.Pending()) > 0 {
+				if s.currentLivenessView().PendingBySlotCount > 0 {
 					continue
 				}
-				currentState := s.currentState()
-				if nodeMarkedDead(currentState.Cluster, nodeID) || !isRuntimeInitialized(currentState) {
+				current := s.currentLivenessView()
+				if current.NodeHealthByID[nodeID] == coordinator.NodeHealthDead || !current.Initialized {
 					updated, err := s.applyLivenessTransition(ctx, nodeID, coordruntime.NodeLivenessStateDead, nowUnix, true)
 					if err != nil {
 						return err
@@ -799,10 +805,10 @@ func (s *Server) EvaluateLiveness(ctx context.Context) error {
 					continue
 				}
 
-				currentState = s.currentState()
+				current = s.currentLivenessView()
 				if _, err := s.applyMembershipMutation(ctx, coordruntime.Command{
-					ID:              fmt.Sprintf("server-auto-dead-%s-v%d", nodeID, currentState.Version),
-					ExpectedVersion: currentState.Version,
+					ID:              fmt.Sprintf("server-auto-dead-%s-v%d", nodeID, current.Version),
+					ExpectedVersion: current.Version,
 					Kind:            coordruntime.CommandKindReconfigure,
 					Reconfigure: &coordruntime.ReconfigureCommand{
 						Events: []coordinator.Event{{
@@ -821,10 +827,10 @@ func (s *Server) EvaluateLiveness(ctx context.Context) error {
 			}
 		}
 	}
-	current := s.currentStateView()
-	if clusterNeedsPeriodicAdvance(current.Cluster) &&
-		len(current.PendingBySlot) == 0 &&
-		len(current.Outbox) == 0 &&
+	current := s.currentLivenessView()
+	if current.NeedsPeriodicAdvance &&
+		current.PendingBySlotCount == 0 &&
+		current.OutboxCount == 0 &&
 		len(s.snapshotActivePeerRefreshSlots()) == 0 {
 		if err := s.reconcileState(ctx); err != nil {
 			return err
@@ -1316,8 +1322,8 @@ func (s *Server) dispatchRuntimeOutboxBatchOwned(ctx context.Context, maxEntries
 			if err != nil {
 				return coordruntime.State{}, err
 			}
-				return coordruntime.State{Version: version}, nil
-			}); err != nil {
+			return coordruntime.State{Version: version}, nil
+		}); err != nil {
 			return more, fmt.Errorf("err in rt.AcknowledgeOutbox: %w", err)
 		}
 		s.syncViewsFromRuntime()
@@ -2310,6 +2316,12 @@ func (s *Server) currentStateView() coordruntime.View {
 	s.runtimeMu.RLock()
 	defer s.runtimeMu.RUnlock()
 	return s.rt.CurrentView()
+}
+
+func (s *Server) currentLivenessView() coordruntime.LivenessView {
+	s.runtimeMu.RLock()
+	defer s.runtimeMu.RUnlock()
+	return s.rt.CurrentLivenessView()
 }
 
 func (s *Server) replaceRuntime(rt *coordruntime.Runtime) {

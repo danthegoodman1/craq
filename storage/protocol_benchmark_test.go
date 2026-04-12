@@ -8,12 +8,14 @@ import (
 
 func BenchmarkQueuedTransportSubmitPut(b *testing.B) {
 	ctx := context.Background()
-	nodes, _, _ := setupActiveChainWithQueuedTransportForBenchmark(b, 21, []string{"head", "mid", "tail"})
+	nodes, _, repl := setupActiveChainWithQueuedTransportForBenchmark(b, 21, []string{"head", "mid", "tail"})
 
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("k-%d", i)
-		if _, err := nodes["head"].SubmitPut(ctx, 21, key, "value"); err != nil {
+		if _, err := runQueuedCommitResultWithDelivery(ctx, repl, func() (CommitResult, error) {
+			return nodes["head"].SubmitPut(ctx, 21, key, "value")
+		}); err != nil {
 			b.Fatalf("SubmitPut returned error: %v", err)
 		}
 	}

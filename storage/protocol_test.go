@@ -128,7 +128,7 @@ func TestQueuedTransportWaitsForExplicitCommitAndPreservesStaging(t *testing.T) 
 		}
 	})
 
-	result, err := nodes["head"].SubmitPut(ctx, 7, "k", "v")
+	result, err := submitPutWithQueuedDelivery(t, ctx, nodes["head"], transport, 7, "k", "v")
 	if err != nil {
 		t.Fatalf("SubmitPut returned error: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestQueuedTransportDuplicateMessagesStillConverge(t *testing.T) {
 		}
 	})
 
-	result, err := nodes["head"].SubmitPut(ctx, 9, "k", "v")
+	result, err := submitPutWithQueuedDelivery(t, ctx, nodes["head"], transport, 9, "k", "v")
 	if err != nil {
 		t.Fatalf("SubmitPut returned error: %v", err)
 	}
@@ -190,10 +190,10 @@ func TestQueuedTransportDropLeavesWriteStagedAndUncommitted(t *testing.T) {
 	nodes, _, transport := setupActiveChainWithQueuedTransport(t, 6, []string{"head", "tail"})
 	transport.DropNext()
 
-	if _, err := nodes["head"].SubmitPut(ctx, 6, "k", "v"); err == nil {
+	if _, err := submitPutWithQueuedDelivery(t, ctx, nodes["head"], transport, 6, "k", "v"); err == nil {
 		t.Fatal("SubmitPut unexpectedly succeeded")
-	} else if !errors.Is(err, ErrStateMismatch) {
-		t.Fatalf("error = %v, want state mismatch", err)
+	} else if !errors.Is(err, ErrWriteTimeout) {
+		t.Fatalf("error = %v, want write timeout", err)
 	}
 	if got, want := mustNodeCommittedSnapshot(t, nodes["head"], 6), map[string]string{}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("committed snapshot = %v, want empty", got)
@@ -589,8 +589,7 @@ func TestWriteValidationAndDownstreamFailure(t *testing.T) {
 			Role:         ReplicaRoleHead,
 			Peers:        ChainPeers{SuccessorNodeID: "mid"},
 		})
-		record := node.replicas[6]
-		record = node.ensureProtocolState(record)
+		record := mustSlotRecord(t, node, 6)
 		op := WriteOperation{Slot: 6, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v", Metadata: testObjectMetadata(1)}
 		if err := node.stageOperation(op); err != nil {
 			t.Fatalf("stageOperation returned error: %v", err)
@@ -602,7 +601,9 @@ func TestWriteValidationAndDownstreamFailure(t *testing.T) {
 		}
 		record.pendingWrites[1] = pendingWrite{}
 		record.nextSequence = 2
-		node.replicas[6] = record
+		mustMutateSlotRecord(t, node, 6, func(replicaRecord) replicaRecord {
+			return record
+		})
 		if err := node.UpdateChainPeers(ctx, UpdateChainPeersCommand{
 			Assignment: ReplicaAssignment{
 				Slot:         6,

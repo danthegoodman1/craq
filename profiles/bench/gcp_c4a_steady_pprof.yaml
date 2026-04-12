@@ -1,0 +1,54 @@
+name: gcp-c4a-steady-pprof
+gcp:
+  project: projectvoice-442316
+  region: us-central1
+  operator_cidrs:
+    - 0.0.0.0/0
+  ssh_user: ubuntu
+  coordinator_machine_type: c4a-standard-8
+  client_machine_type: c4a-standard-16
+  storage_machine_type: c4a-standard-48-lssd
+  coordinator_boot_disk_gib: 100
+cluster:
+  slot_count: 1024
+  replication_factor: 3
+  storage_node_count: 3
+  heartbeat_interval: 1s
+  liveness_interval: 1s
+  suspect_after: 3s
+  dead_after: 6s
+  activation_interval: 250ms
+  rpc_deadline: 5s
+  reconfiguration:
+    max_changed_chains: 32
+workload:
+  seed: 42
+  preload_keys: 10000
+  value_bytes: 256
+  request_timeout: 3s
+  per_scenario_pause: 2s
+  interval: 1s
+  scenarios:
+    - name: get-only-c64
+      kind: get
+      concurrency: 64
+      warmup: 10s
+      duration: 30s
+    - name: put-only-c32
+      kind: put
+      concurrency: 32
+      warmup: 10s
+      duration: 30s
+    - name: mixed-80-20-c64
+      kind: mixed
+      concurrency: 64
+      warmup: 10s
+      duration: 30s
+      read_percent: 80
+telemetry:
+  probe_interval: 1s
+  command_interval: 1s
+  extra_run_duration: 30s
+  pprof_cpu_duration: 15s
+artifacts:
+  root_dir: artifacts/benchmarks
