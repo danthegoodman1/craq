@@ -137,17 +137,19 @@ func TestTailHandleForwardWriteHonorsContextDuringCommitPersist(t *testing.T) {
 		ChainVersion: 1,
 		Role:         ReplicaRoleSingle,
 	})
-	record := node.replicas[6]
-	record.assignment.Role = ReplicaRoleTail
-	record.assignment.Peers.PredecessorNodeID = "head"
-	node.replicas[6] = record
+	mustMutateSlotRecord(t, node, 6, func(record replicaRecord) replicaRecord {
+		record.assignment.Role = ReplicaRoleTail
+		record.assignment.Peers.PredecessorNodeID = "head"
+		return record
+	})
 	local.blockUpsert = true
 	cancelCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	err = node.HandleForwardWrite(cancelCtx, ForwardWriteRequest{
-		Operation:  WriteOperation{Slot: 6, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v", Metadata: testObjectMetadata(1)},
-		FromNodeID: "head",
+		Operation:    WriteOperation{Slot: 6, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v", Metadata: testObjectMetadata(1)},
+		FromNodeID:   "head",
+		ChainVersion: 1,
 	})
 	if err == nil {
 		t.Fatal("HandleForwardWrite unexpectedly succeeded")
@@ -177,25 +179,27 @@ func TestHandleCommitWriteHonorsContextDuringCommitPersist(t *testing.T) {
 		Role:         ReplicaRoleHead,
 		Peers:        ChainPeers{SuccessorNodeID: "tail"},
 	})
-	record := node.replicas[7]
-	record = node.ensureProtocolState(record)
+	record := mustSlotRecord(t, node, 7)
 	op := WriteOperation{Slot: 7, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v", Metadata: testObjectMetadata(1)}
 	if err := node.stageOperation(op); err != nil {
 		t.Fatalf("stageOperation returned error: %v", err)
 	}
-	record.stagedForwards[1] = ForwardWriteRequest{Operation: op, FromNodeID: "client"}
+	record.stagedForwards[1] = ForwardWriteRequest{Operation: op, FromNodeID: "client", ChainVersion: 1}
 	record.pendingWrites[1] = pendingWrite{}
 	record.nextSequence = 2
-	node.replicas[7] = record
+	mustMutateSlotRecord(t, node, 7, func(replicaRecord) replicaRecord {
+		return record
+	})
 
 	local.blockUpsert = true
 	cancelCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	err = node.HandleCommitWrite(cancelCtx, CommitWriteRequest{
-		Slot:       7,
-		Sequence:   1,
-		FromNodeID: "tail",
+		Slot:         7,
+		Sequence:     1,
+		FromNodeID:   "tail",
+		ChainVersion: 1,
 	})
 	if err == nil {
 		t.Fatal("HandleCommitWrite unexpectedly succeeded")

@@ -10,8 +10,10 @@ import (
 	"github.com/danthegoodman1/craq/storage"
 )
 
-func BenchmarkRouterGet_PreloadedSnapshot(b *testing.B) {
-	router, key := benchmarkRouter(b, 128)
+const benchmarkRouterSlotCount = 1024
+
+func BenchmarkRouterGet_1024Slots(b *testing.B) {
+	router, key := benchmarkRouterWithSingleReplica(b)
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -23,8 +25,8 @@ func BenchmarkRouterGet_PreloadedSnapshot(b *testing.B) {
 	}
 }
 
-func BenchmarkRouterPut_PreloadedSnapshot(b *testing.B) {
-	router, key := benchmarkRouter(b, 128)
+func BenchmarkRouterPut_1024Slots(b *testing.B) {
+	router, key := benchmarkRouterWithSingleReplica(b)
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -36,46 +38,69 @@ func BenchmarkRouterPut_PreloadedSnapshot(b *testing.B) {
 	}
 }
 
-func BenchmarkRouterDelete_PreloadedSnapshot(b *testing.B) {
-	router, key := benchmarkRouter(b, 128)
-
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		if _, err := router.Delete(context.Background(), key); err != nil {
-			b.Fatalf("Delete returned error: %v", err)
-		}
-	}
-}
-
-func benchmarkRouter(b *testing.B, slotCount int) (*Router, string) {
+func benchmarkRouterWithSingleReplica(b *testing.B) (*Router, string) {
 	b.Helper()
 
-	snapshot := coordserver.RoutingSnapshot{
-		Version:   1,
-		SlotCount: slotCount,
-		Slots:     make([]coordserver.SlotRoute, slotCount),
+	ctx := context.Background()
+	repl := storage.NewInMemoryReplicationTransport()
+	backend := storage.NewInMemoryBackend()
+	node := mustNewStorageNodeForRouterBenchmark(b, ctx, "node-a", backend, repl)
+	b.Cleanup(func() { _ = node.Close() })
+
+	slot := 17
+	key := benchmarkKeyForSlot(b, slot, benchmarkRouterSlotCount, "bench")
+	assignment := storage.ReplicaAssignment{
+		Slot:         slot,
+		ChainVersion: 1,
+		Role:         storage.ReplicaRoleSingle,
+		Peers: storage.ChainPeers{
+			TailNodeID: "node-a",
+			TailTarget: "node-a",
+		},
 	}
-	for slot := 0; slot < slotCount; slot++ {
-		snapshot.Slots[slot] = coordserver.SlotRoute{
-			Slot:         slot,
-			ChainVersion: 1,
-			HeadNodeID:   "head",
-			TailNodeID:   "tail",
-			Writable:     true,
-			Readable:     true,
-		}
+	mustActivateStorageAssignmentBenchmark(b, node, assignment)
+	if _, err := node.HandleClientPut(ctx, storage.ClientPutRequest{
+		Slot:                 slot,
+		Key:                  key,
+		Value:                "seed",
+		ExpectedChainVersion: assignment.ChainVersion,
+	}); err != nil {
+		b.Fatalf("HandleClientPut seed returned error: %v", err)
 	}
 
+	transport := NewInMemoryTransport()
+	transport.RegisterNode("node-a", node)
 	router := mustNewRouterForBenchmark(b, &scriptedSnapshotSource{
-		snapshots: []coordserver.RoutingSnapshot{snapshot},
-	}, &benchmarkTransport{})
-	if err := router.Refresh(context.Background()); err != nil {
+		snapshots: []coordserver.RoutingSnapshot{benchmarkRoutingSnapshot()},
+	}, transport)
+	if err := router.Refresh(ctx); err != nil {
 		b.Fatalf("Refresh returned error: %v", err)
 	}
 
-	return router, benchmarkKeyForSlot(b, 17, slotCount, "bench")
+	return router, key
+}
+
+func benchmarkRoutingSnapshot() coordserver.RoutingSnapshot {
+	snapshot := coordserver.RoutingSnapshot{
+		Version:   1,
+		SlotCount: benchmarkRouterSlotCount,
+		Slots:     make([]coordserver.SlotRoute, benchmarkRouterSlotCount),
+	}
+	for slot := 0; slot < benchmarkRouterSlotCount; slot++ {
+		snapshot.Slots[slot] = coordserver.SlotRoute{
+			Slot:         slot,
+			ChainVersion: 1,
+			HeadNodeID:   "node-a",
+			TailNodeID:   "node-a",
+			Writable:     true,
+			Readable:     true,
+			ReadReplicas: []coordserver.ReadReplicaRoute{{
+				NodeID: "node-a",
+				Role:   storage.ReplicaRoleSingle,
+			}},
+		}
+	}
+	return snapshot
 }
 
 func mustNewRouterForBenchmark(b *testing.B, source SnapshotSource, transport Transport) *Router {
@@ -85,6 +110,35 @@ func mustNewRouterForBenchmark(b *testing.B, source SnapshotSource, transport Tr
 		b.Fatalf("NewRouter returned error: %v", err)
 	}
 	return router
+}
+
+func mustNewStorageNodeForRouterBenchmark(b *testing.B, ctx context.Context, nodeID string, backend storage.Backend, repl *storage.InMemoryReplicationTransport) *storage.Node {
+	b.Helper()
+	node, err := storage.OpenNode(
+		ctx,
+		storage.Config{NodeID: nodeID},
+		backend,
+		storage.NewInMemoryLocalStateStore(),
+		storage.NewInMemoryCoordinatorClient(),
+		repl,
+	)
+	if err != nil {
+		b.Fatalf("OpenNode(%q) returned error: %v", nodeID, err)
+	}
+	repl.Register(nodeID, backend)
+	repl.RegisterNode(nodeID, node)
+	return node
+}
+
+func mustActivateStorageAssignmentBenchmark(b *testing.B, node *storage.Node, assignment storage.ReplicaAssignment) {
+	b.Helper()
+	ctx := context.Background()
+	if err := node.AddReplicaAsTail(ctx, storage.AddReplicaAsTailCommand{Assignment: assignment}); err != nil {
+		b.Fatalf("AddReplicaAsTail returned error: %v", err)
+	}
+	if err := node.ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: assignment.Slot}); err != nil {
+		b.Fatalf("ActivateReplica returned error: %v", err)
+	}
 }
 
 func benchmarkKeyForSlot(b *testing.B, slot int, slotCount int, prefix string) string {
@@ -97,29 +151,4 @@ func benchmarkKeyForSlot(b *testing.B, slot int, slotCount int, prefix string) s
 	}
 	b.Fatalf("unable to find key for slot %d", slot)
 	return ""
-}
-
-type benchmarkTransport struct{}
-
-func (t *benchmarkTransport) Get(_ context.Context, _ string, req storage.ClientGetRequest) (storage.ReadResult, error) {
-	return storage.ReadResult{
-		Slot:         req.Slot,
-		ChainVersion: req.ExpectedChainVersion,
-		Found:        true,
-		Value:        "value",
-	}, nil
-}
-
-func (t *benchmarkTransport) Put(_ context.Context, _ string, req storage.ClientPutRequest) (storage.CommitResult, error) {
-	return storage.CommitResult{
-		Slot:     req.Slot,
-		Sequence: 1,
-	}, nil
-}
-
-func (t *benchmarkTransport) Delete(_ context.Context, _ string, req storage.ClientDeleteRequest) (storage.CommitResult, error) {
-	return storage.CommitResult{
-		Slot:     req.Slot,
-		Sequence: 1,
-	}, nil
 }

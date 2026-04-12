@@ -33,6 +33,39 @@ type State struct {
 	AppliedCommands         map[string]AppliedCommand
 }
 
+type View struct {
+	Version                 uint64
+	LastLogIndex            uint64
+	Cluster                 coordinator.ClusterState
+	SlotVersions            map[int]uint64
+	CompletedProgressBySlot map[int][]CompletedProgressRecord
+	NodeLivenessByID        map[string]NodeLivenessRecord
+	PendingBySlot           map[int]PendingWork
+	Outbox                  []OutboxEntry
+	LastPolicy              coordinator.ReconfigurationPolicy
+}
+
+type LivenessView struct {
+	Version              uint64
+	Initialized          bool
+	NeedsPeriodicAdvance bool
+	NodeHealthByID       map[string]coordinator.NodeHealth
+	PendingBySlotCount   int
+	OutboxCount          int
+}
+
+// SlotProgressView keeps the replica progress hot path slot-scoped so the
+// coordinator can validate ready/removed reports without cloning the whole
+// runtime view at startup scale.
+type SlotProgressView struct {
+	Version           uint64
+	ReplicationFactor int
+	Chain             coordinator.Chain
+	SlotVersion       uint64
+	Pending           *PendingWork
+	Completed         []CompletedProgressRecord
+}
+
 type PendingKind string
 
 const (
@@ -88,6 +121,7 @@ const (
 
 type NodeLivenessRecord struct {
 	LastHeartbeatUnixNano      int64
+	UpdatedAtUnixNano          int64
 	State                      NodeLivenessState
 	LastStatus                 storage.NodeStatus
 	DeadActionFired            bool
@@ -114,6 +148,7 @@ const (
 	CommandKindBootstrap         CommandKind = "bootstrap"
 	CommandKindReconfigure       CommandKind = "reconfigure"
 	CommandKindProgress          CommandKind = "progress"
+	CommandKindNodeReady         CommandKind = "node_ready"
 	CommandKindHeartbeat         CommandKind = "heartbeat"
 	CommandKindLiveness          CommandKind = "liveness"
 	CommandKindAcknowledgeOutbox CommandKind = "acknowledge_outbox"
@@ -126,6 +161,7 @@ type Command struct {
 	Bootstrap         *BootstrapCommand
 	Reconfigure       *ReconfigureCommand
 	Progress          *ProgressCommand
+	NodeReady         *NodeReadyCommand
 	Heartbeat         *HeartbeatCommand
 	Liveness          *LivenessCommand
 	AcknowledgeOutbox *AcknowledgeOutboxCommand
@@ -134,6 +170,7 @@ type Command struct {
 type BootstrapCommand struct {
 	Config coordinator.Config
 	Nodes  []coordinator.Node
+	Policy coordinator.ReconfigurationPolicy
 }
 
 type ReconfigureCommand struct {
@@ -143,6 +180,12 @@ type ReconfigureCommand struct {
 
 type ProgressCommand struct {
 	Event coordinator.Event
+}
+
+type NodeReadyCommand struct {
+	Status             storage.NodeStatus
+	ObservedAtUnixNano int64
+	FlapWindowNanos    int64
 }
 
 type HeartbeatCommand struct {
@@ -160,7 +203,8 @@ type LivenessCommand struct {
 }
 
 type AcknowledgeOutboxCommand struct {
-	EntryID string
+	EntryID  string
+	EntryIDs []string
 }
 
 type LogRecord struct {
@@ -264,6 +308,43 @@ func (r *Runtime) Current() State {
 	return cloneState(r.state)
 }
 
+func (r *Runtime) CurrentVersion() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.state.Version
+}
+
+func (r *Runtime) CurrentView() View {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return cloneView(viewFromState(r.state))
+}
+
+func (r *Runtime) CurrentLivenessView() LivenessView {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return cloneLivenessView(livenessViewFromState(r.state))
+}
+
+func (r *Runtime) CurrentSlotProgressView(slot int) SlotProgressView {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	view := SlotProgressView{
+		Version:           r.state.Version,
+		ReplicationFactor: r.state.Cluster.ReplicationFactor,
+		SlotVersion:       r.state.SlotVersions[slot],
+		Completed:         append([]CompletedProgressRecord(nil), r.state.CompletedProgressBySlot[slot]...),
+	}
+	if pending, ok := r.state.PendingBySlot[slot]; ok {
+		cloned := pending
+		view.Pending = &cloned
+	}
+	if slot >= 0 && slot < len(r.state.Cluster.Chains) {
+		view.Chain = cloneChain(r.state.Cluster.Chains[slot])
+	}
+	return view
+}
+
 func (r *Runtime) Bootstrap(ctx context.Context, cmd Command) (State, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -331,6 +412,44 @@ func (r *Runtime) ApplyProgress(ctx context.Context, cmd Command) (State, error)
 	return cloneState(r.state), nil
 }
 
+func (r *Runtime) ApplyProgressVersion(ctx context.Context, cmd Command) (uint64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cluster, _, duplicate, err := r.executeProgress(cmd)
+	if err != nil {
+		return 0, fmt.Errorf("err in r.executeProgress: %w", err)
+	}
+	if duplicate != nil {
+		return duplicate.Version, nil
+	}
+
+	record, nextState := r.commitCandidate(cmd, cluster, nil)
+	if err := r.store.AppendWAL(ctx, record); err != nil {
+		return 0, fmt.Errorf("err in r.store.AppendWAL: %w", err)
+	}
+	r.state = nextState
+	return r.state.Version, nil
+}
+
+func (r *Runtime) MarkNodeReady(ctx context.Context, cmd Command) (State, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, _, duplicate, err := r.executeNodeReady(cmd)
+	if err != nil {
+		return State{}, fmt.Errorf("err in r.executeNodeReady: %w", err)
+	}
+	if duplicate != nil {
+		return r.snapshotForApplied(*duplicate), nil
+	}
+
+	record, nextState := r.commitCandidate(cmd, r.state.Cluster, nil)
+	if err := r.store.AppendWAL(ctx, record); err != nil {
+		return State{}, fmt.Errorf("err in r.store.AppendWAL: %w", err)
+	}
+	r.state = nextState
+	return cloneState(r.state), nil
+}
+
 func (r *Runtime) Heartbeat(ctx context.Context, cmd Command) (State, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -372,7 +491,17 @@ func (r *Runtime) ApplyLiveness(ctx context.Context, cmd Command) (State, error)
 func (r *Runtime) AcknowledgeOutbox(ctx context.Context, cmd Command) (State, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	_, _, duplicate, err := r.executeAcknowledgeOutbox(cmd)
+	duplicate, err := r.validateCommand(cmd)
+	if err != nil {
+		return State{}, fmt.Errorf("err in r.validateCommand: %w", err)
+	}
+	if duplicate != nil {
+		return r.snapshotForApplied(*duplicate), nil
+	}
+	if cmd.AcknowledgeOutbox != nil && !outboxEntriesExist(r.state.Outbox, outboxAckEntryIDs(*cmd.AcknowledgeOutbox)) {
+		return cloneState(r.state), nil
+	}
+	_, _, duplicate, err = r.executeAcknowledgeOutbox(cmd)
 	if err != nil {
 		return State{}, fmt.Errorf("err in r.executeAcknowledgeOutbox: %w", err)
 	}
@@ -386,6 +515,35 @@ func (r *Runtime) AcknowledgeOutbox(ctx context.Context, cmd Command) (State, er
 	}
 	r.state = nextState
 	return cloneState(r.state), nil
+}
+
+func (r *Runtime) AcknowledgeOutboxVersion(ctx context.Context, cmd Command) (uint64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	duplicate, err := r.validateCommand(cmd)
+	if err != nil {
+		return 0, fmt.Errorf("err in r.validateCommand: %w", err)
+	}
+	if duplicate != nil {
+		return duplicate.Version, nil
+	}
+	if cmd.AcknowledgeOutbox != nil && !outboxEntriesExist(r.state.Outbox, outboxAckEntryIDs(*cmd.AcknowledgeOutbox)) {
+		return r.state.Version, nil
+	}
+	_, _, duplicate, err = r.executeAcknowledgeOutbox(cmd)
+	if err != nil {
+		return 0, fmt.Errorf("err in r.executeAcknowledgeOutbox: %w", err)
+	}
+	if duplicate != nil {
+		return duplicate.Version, nil
+	}
+
+	record, nextState := r.commitCandidate(cmd, r.state.Cluster, nil)
+	if err := r.store.AppendWAL(ctx, record); err != nil {
+		return 0, fmt.Errorf("err in r.store.AppendWAL: %w", err)
+	}
+	r.state = nextState
+	return r.state.Version, nil
 }
 
 func (r *Runtime) Checkpoint(ctx context.Context) error {
@@ -428,6 +586,10 @@ func (r *Runtime) executeReconfigure(cmd Command) (coordinator.ClusterState, *co
 }
 
 func (r *Runtime) executeProgress(cmd Command) (coordinator.ClusterState, *coordinator.ReconfigurationPlan, *AppliedCommand, error) {
+	return r.executeCommand(cmd)
+}
+
+func (r *Runtime) executeNodeReady(cmd Command) (coordinator.ClusterState, *coordinator.ReconfigurationPlan, *AppliedCommand, error) {
 	return r.executeCommand(cmd)
 }
 
@@ -490,6 +652,14 @@ func (r *Runtime) executeCommand(cmd Command) (coordinator.ClusterState, *coordi
 			return coordinator.ClusterState{}, nil, nil, fmt.Errorf("err in coordinator.ApplyProgress: %w", err)
 		}
 		return cloneClusterState(*cluster), nil, nil, nil
+	case CommandKindNodeReady:
+		if !isInitialized(r.state) {
+			return coordinator.ClusterState{}, nil, nil, ErrNotInitialized
+		}
+		if cmd.NodeReady.Status.NodeID == "" {
+			return coordinator.ClusterState{}, nil, nil, fmt.Errorf("%w: ready node ID must not be empty", ErrInvalidCommand)
+		}
+		return cloneClusterState(r.state.Cluster), nil, nil, nil
 	case CommandKindHeartbeat:
 		return cloneClusterState(r.state.Cluster), nil, nil, nil
 	case CommandKindLiveness:
@@ -501,7 +671,7 @@ func (r *Runtime) executeCommand(cmd Command) (coordinator.ClusterState, *coordi
 		if !isInitialized(r.state) {
 			return coordinator.ClusterState{}, nil, nil, ErrNotInitialized
 		}
-		if !outboxEntryExists(r.state.Outbox, cmd.AcknowledgeOutbox.EntryID) {
+		if !outboxEntriesExist(r.state.Outbox, outboxAckEntryIDs(*cmd.AcknowledgeOutbox)) {
 			return cloneClusterState(r.state.Cluster), nil, nil, nil
 		}
 		return cloneClusterState(r.state.Cluster), nil, nil, nil
@@ -553,11 +723,18 @@ func validateCommandPayload(cmd Command) error {
 			return fmt.Errorf("%w: reconfigure command must set only reconfigure payload", ErrInvalidCommand)
 		}
 	case CommandKindProgress:
-		if cmd.Progress == nil || cmd.Bootstrap != nil || cmd.Reconfigure != nil || cmd.Heartbeat != nil || cmd.Liveness != nil || cmd.AcknowledgeOutbox != nil {
+		if cmd.Progress == nil || cmd.Bootstrap != nil || cmd.Reconfigure != nil || cmd.NodeReady != nil || cmd.Heartbeat != nil || cmd.Liveness != nil || cmd.AcknowledgeOutbox != nil {
 			return fmt.Errorf("%w: progress command must set only progress payload", ErrInvalidCommand)
 		}
+	case CommandKindNodeReady:
+		if cmd.NodeReady == nil || cmd.Bootstrap != nil || cmd.Reconfigure != nil || cmd.Progress != nil || cmd.Heartbeat != nil || cmd.Liveness != nil || cmd.AcknowledgeOutbox != nil {
+			return fmt.Errorf("%w: node ready command must set only ready payload", ErrInvalidCommand)
+		}
+		if cmd.NodeReady.Status.NodeID == "" {
+			return fmt.Errorf("%w: ready node ID must not be empty", ErrInvalidCommand)
+		}
 	case CommandKindHeartbeat:
-		if cmd.Heartbeat == nil || cmd.Bootstrap != nil || cmd.Reconfigure != nil || cmd.Progress != nil || cmd.Liveness != nil || cmd.AcknowledgeOutbox != nil {
+		if cmd.Heartbeat == nil || cmd.Bootstrap != nil || cmd.Reconfigure != nil || cmd.Progress != nil || cmd.NodeReady != nil || cmd.Liveness != nil || cmd.AcknowledgeOutbox != nil {
 			return fmt.Errorf("%w: heartbeat command must set only heartbeat payload", ErrInvalidCommand)
 		}
 		if cmd.Heartbeat.Status.NodeID == "" {
@@ -574,8 +751,8 @@ func validateCommandPayload(cmd Command) error {
 		if cmd.AcknowledgeOutbox == nil || cmd.Bootstrap != nil || cmd.Reconfigure != nil || cmd.Progress != nil || cmd.Heartbeat != nil || cmd.Liveness != nil {
 			return fmt.Errorf("%w: acknowledge outbox command must set only outbox payload", ErrInvalidCommand)
 		}
-		if cmd.AcknowledgeOutbox.EntryID == "" {
-			return fmt.Errorf("%w: outbox entry id must not be empty", ErrInvalidCommand)
+		if len(outboxAckEntryIDs(*cmd.AcknowledgeOutbox)) == 0 {
+			return fmt.Errorf("%w: outbox entry ids must not be empty", ErrInvalidCommand)
 		}
 	default:
 		return fmt.Errorf("%w: unsupported command kind %q", ErrInvalidCommand, cmd.Kind)
@@ -602,7 +779,7 @@ func (r *Runtime) nextStateForApplied(
 	cluster coordinator.ClusterState,
 	plan *coordinator.ReconfigurationPlan,
 ) State {
-	next := cloneState(r.state)
+	next := cloneStateForNextApplied(r.state)
 	next.Version++
 	next.LastLogIndex = logIndex
 	next.Cluster = cloneClusterState(cluster)
@@ -634,6 +811,15 @@ func (r *Runtime) nextStateForApplied(
 
 func nextClusterState(current coordinator.ClusterState, cmd Command) coordinator.ClusterState {
 	next := cloneClusterState(current)
+	if cmd.Kind == CommandKindNodeReady && cmd.NodeReady != nil {
+		nodeID := cmd.NodeReady.Status.NodeID
+		if next.NodeHealthByID[nodeID] != coordinator.NodeHealthDead {
+			if next.ReadyNodeIDs == nil {
+				next.ReadyNodeIDs = map[string]bool{}
+			}
+			next.ReadyNodeIDs[nodeID] = true
+		}
+	}
 	if cmd.Kind == CommandKindHeartbeat && cmd.Heartbeat != nil {
 		nodeID := cmd.Heartbeat.Status.NodeID
 		if next.NodeHealthByID[nodeID] != coordinator.NodeHealthDead {
@@ -678,8 +864,75 @@ func zeroState() State {
 	}
 }
 
+func viewFromState(state State) View {
+	return View{
+		Version:                 state.Version,
+		LastLogIndex:            state.LastLogIndex,
+		Cluster:                 cloneClusterState(state.Cluster),
+		SlotVersions:            cloneSlotVersions(state.SlotVersions),
+		CompletedProgressBySlot: cloneCompletedProgressMap(state.CompletedProgressBySlot),
+		NodeLivenessByID:        cloneNodeLivenessMap(state.NodeLivenessByID),
+		PendingBySlot:           clonePendingMap(state.PendingBySlot),
+		Outbox:                  cloneOutbox(state.Outbox),
+		LastPolicy:              state.LastPolicy,
+	}
+}
+
+func cloneView(view View) View {
+	return View{
+		Version:                 view.Version,
+		LastLogIndex:            view.LastLogIndex,
+		Cluster:                 cloneClusterState(view.Cluster),
+		SlotVersions:            cloneSlotVersions(view.SlotVersions),
+		CompletedProgressBySlot: cloneCompletedProgressMap(view.CompletedProgressBySlot),
+		NodeLivenessByID:        cloneNodeLivenessMap(view.NodeLivenessByID),
+		PendingBySlot:           clonePendingMap(view.PendingBySlot),
+		Outbox:                  cloneOutbox(view.Outbox),
+		LastPolicy:              view.LastPolicy,
+	}
+}
+
+func livenessViewFromState(state State) LivenessView {
+	return LivenessView{
+		Version:              state.Version,
+		Initialized:          isInitialized(state),
+		NeedsPeriodicAdvance: clusterNeedsPeriodicAdvanceForView(state.Cluster),
+		NodeHealthByID:       cloneNodeHealthMap(state.Cluster.NodeHealthByID),
+		PendingBySlotCount:   len(state.PendingBySlot),
+		OutboxCount:          len(state.Outbox),
+	}
+}
+
+func cloneLivenessView(view LivenessView) LivenessView {
+	return LivenessView{
+		Version:              view.Version,
+		Initialized:          view.Initialized,
+		NeedsPeriodicAdvance: view.NeedsPeriodicAdvance,
+		NodeHealthByID:       cloneNodeHealthMap(view.NodeHealthByID),
+		PendingBySlotCount:   view.PendingBySlotCount,
+		OutboxCount:          view.OutboxCount,
+	}
+}
+
 func isInitialized(state State) bool {
 	return state.Cluster.SlotCount > 0
+}
+
+func clusterNeedsPeriodicAdvanceForView(cluster coordinator.ClusterState) bool {
+	if cluster.SlotCount == 0 || cluster.ReplicationFactor <= 0 || len(cluster.Chains) != cluster.SlotCount {
+		return true
+	}
+	for _, chain := range cluster.Chains {
+		if len(chain.Replicas) != cluster.ReplicationFactor {
+			return true
+		}
+		for _, replica := range chain.Replicas {
+			if replica.State != coordinator.ReplicaStateActive {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func cloneState(state State) State {
@@ -697,6 +950,25 @@ func cloneState(state State) State {
 	}
 	for id, applied := range state.AppliedCommands {
 		cloned.AppliedCommands[id] = cloneAppliedCommand(applied)
+	}
+	return cloned
+}
+
+func cloneStateForNextApplied(state State) State {
+	cloned := State{
+		Version:                 state.Version,
+		LastLogIndex:            state.LastLogIndex,
+		Cluster:                 cloneClusterState(state.Cluster),
+		SlotVersions:            cloneSlotVersions(state.SlotVersions),
+		CompletedProgressBySlot: cloneCompletedProgressMap(state.CompletedProgressBySlot),
+		NodeLivenessByID:        cloneNodeLivenessMap(state.NodeLivenessByID),
+		PendingBySlot:           clonePendingMap(state.PendingBySlot),
+		Outbox:                  cloneOutbox(state.Outbox),
+		LastPolicy:              state.LastPolicy,
+		AppliedCommands:         make(map[string]AppliedCommand, len(state.AppliedCommands)),
+	}
+	for id, applied := range state.AppliedCommands {
+		cloned.AppliedCommands[id] = applied
 	}
 	return cloned
 }
@@ -803,6 +1075,7 @@ func cloneCommand(cmd Command) Command {
 		cloned.Bootstrap = &BootstrapCommand{
 			Config: cmd.Bootstrap.Config,
 			Nodes:  cloneNodes(cmd.Bootstrap.Nodes),
+			Policy: cmd.Bootstrap.Policy,
 		}
 	}
 	if cmd.Reconfigure != nil {
@@ -814,6 +1087,13 @@ func cloneCommand(cmd Command) Command {
 	if cmd.Progress != nil {
 		cloned.Progress = &ProgressCommand{
 			Event: cloneEvent(cmd.Progress.Event),
+		}
+	}
+	if cmd.NodeReady != nil {
+		cloned.NodeReady = &NodeReadyCommand{
+			Status:             cloneNodeStatus(cmd.NodeReady.Status),
+			ObservedAtUnixNano: cmd.NodeReady.ObservedAtUnixNano,
+			FlapWindowNanos:    cmd.NodeReady.FlapWindowNanos,
 		}
 	}
 	if cmd.Heartbeat != nil {
@@ -833,7 +1113,10 @@ func cloneCommand(cmd Command) Command {
 		}
 	}
 	if cmd.AcknowledgeOutbox != nil {
-		cloned.AcknowledgeOutbox = &AcknowledgeOutboxCommand{EntryID: cmd.AcknowledgeOutbox.EntryID}
+		cloned.AcknowledgeOutbox = &AcknowledgeOutboxCommand{
+			EntryID:  cmd.AcknowledgeOutbox.EntryID,
+			EntryIDs: append([]string(nil), cmd.AcknowledgeOutbox.EntryIDs...),
+		}
 	}
 	return cloned
 }
@@ -844,9 +1127,25 @@ func nextNodeLiveness(
 ) map[string]NodeLivenessRecord {
 	next := cloneNodeLivenessMap(current)
 	switch cmd.Kind {
+	case CommandKindNodeReady:
+		record := next[cmd.NodeReady.Status.NodeID]
+		record.LastHeartbeatUnixNano = cmd.NodeReady.ObservedAtUnixNano
+		record.UpdatedAtUnixNano = cmd.NodeReady.ObservedAtUnixNano
+		record.LastStatus = cloneNodeStatus(cmd.NodeReady.Status)
+		record.SuspectTransitionsUnixNano = pruneSuspectTransitions(
+			record.SuspectTransitionsUnixNano,
+			cmd.NodeReady.ObservedAtUnixNano,
+			cmd.NodeReady.FlapWindowNanos,
+		)
+		if record.State != NodeLivenessStateDead {
+			record.State = NodeLivenessStateHealthy
+			record.DeadActionFired = false
+		}
+		next[cmd.NodeReady.Status.NodeID] = record
 	case CommandKindHeartbeat:
 		record := next[cmd.Heartbeat.Status.NodeID]
 		record.LastHeartbeatUnixNano = cmd.Heartbeat.ObservedAtUnixNano
+		record.UpdatedAtUnixNano = cmd.Heartbeat.ObservedAtUnixNano
 		record.LastStatus = cloneNodeStatus(cmd.Heartbeat.Status)
 		record.SuspectTransitionsUnixNano = pruneSuspectTransitions(
 			record.SuspectTransitionsUnixNano,
@@ -860,6 +1159,9 @@ func nextNodeLiveness(
 		next[cmd.Heartbeat.Status.NodeID] = record
 	case CommandKindLiveness:
 		record := next[cmd.Liveness.NodeID]
+		if cmd.Liveness.EvaluatedAtUnixNano != 0 {
+			record.UpdatedAtUnixNano = cmd.Liveness.EvaluatedAtUnixNano
+		}
 		record.SuspectTransitionsUnixNano = pruneSuspectTransitions(
 			record.SuspectTransitionsUnixNano,
 			cmd.Liveness.EvaluatedAtUnixNano,
@@ -888,6 +1190,7 @@ func cloneNodeLivenessMap(current map[string]NodeLivenessRecord) map[string]Node
 	for nodeID, record := range current {
 		cloned[nodeID] = NodeLivenessRecord{
 			LastHeartbeatUnixNano:      record.LastHeartbeatUnixNano,
+			UpdatedAtUnixNano:          record.UpdatedAtUnixNano,
 			State:                      record.State,
 			LastStatus:                 cloneNodeStatus(record.LastStatus),
 			DeadActionFired:            record.DeadActionFired,
@@ -943,6 +1246,9 @@ func cloneOutbox(current []OutboxEntry) []OutboxEntry {
 }
 
 func nextLastPolicy(current coordinator.ReconfigurationPolicy, cmd Command) coordinator.ReconfigurationPolicy {
+	if cmd.Kind == CommandKindBootstrap && cmd.Bootstrap != nil {
+		return cmd.Bootstrap.Policy
+	}
 	if cmd.Kind == CommandKindReconfigure && cmd.Reconfigure != nil {
 		return cmd.Reconfigure.Policy
 	}
@@ -970,7 +1276,7 @@ func nextPending(
 		if cmd.Progress != nil {
 			delete(next, cmd.Progress.Event.Slot)
 		}
-	case CommandKindHeartbeat, CommandKindLiveness, CommandKindAcknowledgeOutbox:
+	case CommandKindNodeReady, CommandKindHeartbeat, CommandKindLiveness, CommandKindAcknowledgeOutbox:
 		return next
 	}
 	return next
@@ -1047,9 +1353,13 @@ func nextOutbox(
 		if cmd.AcknowledgeOutbox == nil {
 			return cloneOutbox(current)
 		}
+		acked := make(map[string]struct{}, len(outboxAckEntryIDs(*cmd.AcknowledgeOutbox)))
+		for _, entryID := range outboxAckEntryIDs(*cmd.AcknowledgeOutbox) {
+			acked[entryID] = struct{}{}
+		}
 		next := make([]OutboxEntry, 0, len(current))
 		for _, entry := range current {
-			if entry.ID != cmd.AcknowledgeOutbox.EntryID {
+			if _, ok := acked[entry.ID]; !ok {
 				next = append(next, entry)
 			}
 		}
@@ -1109,22 +1419,6 @@ func outboxFromPlan(
 					Assignment: assignment,
 				})
 			}
-			skipped := map[string]bool{addedNodeID: true}
-			servingChain := activeServingChain(slotPlan.After)
-			for _, nodeID := range activeAfterNodeIDs(servingChain, skipped) {
-				assignment, err := assignmentForNode(servingChain, cluster.NodesByID, nodeID, slotVersions[slotPlan.Slot])
-				if err != nil {
-					continue
-				}
-				outbox = append(outbox, OutboxEntry{
-					ID:         outboxEntryID(version, slotPlan.Slot, nodeID, OutboxCommandKindUpdateChainPeers),
-					Slot:       slotPlan.Slot,
-					NodeID:     nodeID,
-					Kind:       OutboxCommandKindUpdateChainPeers,
-					CommandID:  outboxCommandID(version, slotPlan.Slot, nodeID, "update"),
-					Assignment: assignment,
-				})
-			}
 		case len(stepKinds) == 1 && stepKinds[0] == coordinator.StepKindMarkLeaving:
 			leavingNodeID := firstStepNodeID(slotPlan.Steps, coordinator.StepKindMarkLeaving)
 			if leavingNodeID == "" {
@@ -1165,6 +1459,25 @@ func outboxEntryExists(current []OutboxEntry, entryID string) bool {
 		}
 	}
 	return false
+}
+
+func outboxEntriesExist(current []OutboxEntry, entryIDs []string) bool {
+	for _, entryID := range entryIDs {
+		if outboxEntryExists(current, entryID) {
+			return true
+		}
+	}
+	return false
+}
+
+func outboxAckEntryIDs(cmd AcknowledgeOutboxCommand) []string {
+	if len(cmd.EntryIDs) > 0 {
+		return append([]string(nil), cmd.EntryIDs...)
+	}
+	if cmd.EntryID == "" {
+		return nil
+	}
+	return []string{cmd.EntryID}
 }
 
 func cloneNodeStatus(status storage.NodeStatus) storage.NodeStatus {
@@ -1228,6 +1541,14 @@ func cloneClusterState(state coordinator.ClusterState) coordinator.ClusterState 
 	}
 	for id, draining := range state.DrainingNodeIDs {
 		cloned.DrainingNodeIDs[id] = draining
+	}
+	return cloned
+}
+
+func cloneNodeHealthMap(healthByID map[string]coordinator.NodeHealth) map[string]coordinator.NodeHealth {
+	cloned := make(map[string]coordinator.NodeHealth, len(healthByID))
+	for nodeID, health := range healthByID {
+		cloned[nodeID] = health
 	}
 	return cloned
 }

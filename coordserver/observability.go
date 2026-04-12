@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/danthegoodman1/craq/coordinator"
 	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
 	"github.com/danthegoodman1/craq/gologger"
 	"github.com/danthegoodman1/craq/ops"
@@ -18,11 +19,23 @@ type AdminState struct {
 	Current             coordruntime.State                         `json:"current"`
 	RoutingSnapshot     RoutingSnapshot                            `json:"routing_snapshot"`
 	Pending             map[int]PendingWork                        `json:"pending"`
+	ActivePeerRefreshes int                                        `json:"active_peer_refresh_count"`
 	Heartbeats          map[string]storage.NodeStatus              `json:"heartbeats"`
 	Liveness            map[string]coordruntime.NodeLivenessRecord `json:"liveness"`
 	UnavailableReplicas map[string][]int                           `json:"unavailable_replicas"`
 	LastRecoveryReports map[string]storage.NodeRecoveryReport      `json:"last_recovery_reports"`
 	Recent              []ops.Event                                `json:"recent_events"`
+}
+
+type RoutingStatus struct {
+	RoutingSnapshot        RoutingSnapshot `json:"routing_snapshot"`
+	PendingCount           int             `json:"pending_count"`
+	OutboxCount            int             `json:"outbox_count"`
+	ActivePeerRefreshCount int             `json:"active_peer_refresh_count"`
+	SettledSlotCount       int             `json:"settled_slot_count"`
+	HealthyNodeCount       int             `json:"healthy_node_count"`
+	SuspectNodeCount       int             `json:"suspect_node_count"`
+	DeadNodeCount          int             `json:"dead_node_count"`
 }
 
 type serverEventRecorder struct {
@@ -189,6 +202,8 @@ func (s *Server) RecentEvents() []ops.Event {
 }
 
 func (s *Server) UnavailableReplicas() map[string][]int {
+	s.viewMu.RLock()
+	defer s.viewMu.RUnlock()
 	out := make(map[string][]int, len(s.unavailableReplicas))
 	for nodeID, slots := range s.unavailableReplicas {
 		if len(slots) == 0 {
@@ -205,6 +220,8 @@ func (s *Server) UnavailableReplicas() map[string][]int {
 }
 
 func (s *Server) LastRecoveryReports() map[string]storage.NodeRecoveryReport {
+	s.viewMu.RLock()
+	defer s.viewMu.RUnlock()
 	out := make(map[string]storage.NodeRecoveryReport, len(s.lastRecoveryReports))
 	for nodeID, report := range s.lastRecoveryReports {
 		out[nodeID] = cloneRecoveryReport(report)
@@ -214,16 +231,96 @@ func (s *Server) LastRecoveryReports() map[string]storage.NodeRecoveryReport {
 
 func (s *Server) AdminState(ctx context.Context) AdminState {
 	s.refreshMetricGauges()
-	snapshot, _ := s.RoutingSnapshot(ctx)
+	snapshot := s.routingSnapshotReadOnly()
+	current := s.Current()
+	pending := s.Pending()
+	heartbeats := s.Heartbeats()
+	liveness := s.Liveness()
+	unavailable := s.UnavailableReplicas()
+	lastRecovery := s.LastRecoveryReports()
+	if s.ha != nil {
+		if published, err := s.readHASnapshot(ctx); err == nil {
+			current = published.State
+			pending = pendingFromHASnapshot(published)
+			heartbeats = published.Heartbeats
+			liveness = mergeLivenessRecords(nil, published.State.NodeLivenessByID)
+			unavailable = make(map[string][]int, len(published.UnavailableReplicas))
+			for nodeID, slots := range published.UnavailableReplicas {
+				nodeSlots := make([]int, 0, len(slots))
+				for slot := range slots {
+					nodeSlots = append(nodeSlots, slot)
+				}
+				sort.Ints(nodeSlots)
+				unavailable[nodeID] = nodeSlots
+			}
+			lastRecovery = published.LastRecoveryReports
+		}
+	}
 	return AdminState{
-		Current:             s.Current(),
+		Current:             current,
 		RoutingSnapshot:     snapshot,
-		Pending:             s.Pending(),
-		Heartbeats:          s.Heartbeats(),
-		Liveness:            s.Liveness(),
-		UnavailableReplicas: s.UnavailableReplicas(),
-		LastRecoveryReports: s.LastRecoveryReports(),
+		Pending:             pending,
+		ActivePeerRefreshes: len(s.snapshotActivePeerRefreshSlots()),
+		Heartbeats:          heartbeats,
+		Liveness:            liveness,
+		UnavailableReplicas: unavailable,
+		LastRecoveryReports: lastRecovery,
 		Recent:              s.RecentEvents(),
+	}
+}
+
+func (s *Server) RoutingStatus(ctx context.Context) RoutingStatus {
+	s.refreshMetricGauges()
+	snapshot := s.routingSnapshotReadOnly()
+	current := s.currentState()
+	pendingCount := 0
+	liveness := map[string]coordruntime.NodeLivenessRecord{}
+	outboxCount := len(current.Outbox)
+	if s.ha != nil {
+		if published, err := s.readHASnapshot(ctx); err == nil {
+			current = published.State
+			pendingCount = len(published.State.PendingBySlot)
+			liveness = mergeLivenessRecords(nil, published.State.NodeLivenessByID)
+			outboxCount = len(published.Outbox)
+		}
+	} else {
+		s.viewMu.RLock()
+		pendingCount = len(s.pending)
+		liveness = mergeLivenessRecords(nil, s.liveness)
+		s.viewMu.RUnlock()
+	}
+	activePeerRefreshCount := len(s.snapshotActivePeerRefreshSlots())
+	settledSlotCount := 0
+	for _, chain := range current.Cluster.Chains {
+		if chainHasReplicaState(chain, coordinator.ReplicaStateJoining) || chainHasReplicaState(chain, coordinator.ReplicaStateLeaving) {
+			continue
+		}
+		if activeReplicaCount(chain) == current.Cluster.ReplicationFactor {
+			settledSlotCount++
+		}
+	}
+	healthyNodeCount := 0
+	suspectNodeCount := 0
+	deadNodeCount := 0
+	for _, record := range liveness {
+		switch record.State {
+		case coordruntime.NodeLivenessStateHealthy:
+			healthyNodeCount++
+		case coordruntime.NodeLivenessStateSuspect:
+			suspectNodeCount++
+		case coordruntime.NodeLivenessStateDead:
+			deadNodeCount++
+		}
+	}
+	return RoutingStatus{
+		RoutingSnapshot:        snapshot,
+		PendingCount:           pendingCount,
+		OutboxCount:            outboxCount,
+		ActivePeerRefreshCount: activePeerRefreshCount,
+		SettledSlotCount:       settledSlotCount,
+		HealthyNodeCount:       healthyNodeCount,
+		SuspectNodeCount:       suspectNodeCount,
+		DeadNodeCount:          deadNodeCount,
 	}
 }
 
@@ -231,11 +328,14 @@ func (s *Server) refreshMetricGauges() {
 	if s.metrics == nil {
 		return
 	}
-	s.metrics.pendingGauge.Set(float64(len(s.pending)))
+	s.viewMu.RLock()
+	pendingCount := len(s.pending)
 	count := 0
 	for _, slots := range s.unavailableReplicas {
 		count += len(slots)
 	}
+	s.viewMu.RUnlock()
+	s.metrics.pendingGauge.Set(float64(pendingCount))
 	s.metrics.unavailableGauge.Set(float64(count))
 }
 

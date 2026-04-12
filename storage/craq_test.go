@@ -10,7 +10,7 @@ func TestCRAQHeadLinearizableReadUsesTailCommittedWriteAfterDroppedCommitAck(t *
 	ctx := context.Background()
 	nodes, _, transport := setupActiveChainWithQueuedTransport(t, 12, []string{"head", "tail"})
 
-	if _, err := nodes["head"].SubmitPut(ctx, 12, "k", "v1"); err != nil {
+	if _, err := submitPutWithQueuedDelivery(t, ctx, nodes["head"], transport, 12, "k", "v1"); err != nil {
 		t.Fatalf("SubmitPut returned error: %v", err)
 	}
 
@@ -23,10 +23,10 @@ func TestCRAQHeadLinearizableReadUsesTailCommittedWriteAfterDroppedCommitAck(t *
 		transport.DropNext()
 	})
 
-	if _, err := nodes["head"].SubmitPut(ctx, 12, "k", "v2"); err == nil {
+	if _, err := submitPutWithQueuedDelivery(t, ctx, nodes["head"], transport, 12, "k", "v2"); err == nil {
 		t.Fatal("SubmitPut unexpectedly succeeded")
-	} else if !errors.Is(err, ErrStateMismatch) {
-		t.Fatalf("SubmitPut error = %v, want ErrStateMismatch", err)
+	} else if !errors.Is(err, ErrWriteTimeout) {
+		t.Fatalf("SubmitPut error = %v, want ErrWriteTimeout", err)
 	}
 
 	linearizable, err := nodes["head"].HandleClientGet(ctx, ClientGetRequest{
@@ -93,7 +93,7 @@ func TestCRAQMiddleReplicaDirtyReadsTrackLatestCommittedOperationForKey(t *testi
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			nodes, _, repl := setupActiveChainWithQueuedTransport(t, 13, []string{"head", "mid", "tail"})
-			if _, err := nodes["head"].SubmitPut(ctx, 13, "k", "v1"); err != nil {
+			if _, err := submitPutWithQueuedDelivery(t, ctx, nodes["head"], repl, 13, "k", "v1"); err != nil {
 				t.Fatalf("SubmitPut returned error: %v", err)
 			}
 
@@ -143,7 +143,7 @@ func TestCRAQDirtyReadsIgnoreUnrelatedDirtyKeys(t *testing.T) {
 	ctx := context.Background()
 	nodes, _, repl := setupActiveChainWithQueuedTransport(t, 14, []string{"head", "mid", "tail"})
 
-	if _, err := nodes["head"].SubmitPut(ctx, 14, "clean", "v1"); err != nil {
+	if _, err := submitPutWithQueuedDelivery(t, ctx, nodes["head"], repl, 14, "clean", "v1"); err != nil {
 		t.Fatalf("SubmitPut(clean) returned error: %v", err)
 	}
 	stageTailCommittedDirtyOps(t, ctx, nodes["mid"], repl, 14, "dirty", []WriteOperation{{
@@ -188,7 +188,7 @@ func TestCRAQDuplicateForwardAndCommitDoNotCorruptDirtyIndex(t *testing.T) {
 	ctx := context.Background()
 	nodes, _, repl := setupActiveChainWithQueuedTransport(t, 15, []string{"head", "mid", "tail"})
 
-	if _, err := nodes["head"].SubmitPut(ctx, 15, "k", "v1"); err != nil {
+	if _, err := submitPutWithQueuedDelivery(t, ctx, nodes["head"], repl, 15, "k", "v1"); err != nil {
 		t.Fatalf("SubmitPut returned error: %v", err)
 	}
 
@@ -201,7 +201,8 @@ func TestCRAQDuplicateForwardAndCommitDoNotCorruptDirtyIndex(t *testing.T) {
 			Value:    "v2",
 			Metadata: testObjectMetadata(2),
 		},
-		FromNodeID: "head",
+		FromNodeID:   "head",
+		ChainVersion: 1,
 	}
 	if err := nodes["mid"].HandleForwardWrite(ctx, req); err != nil {
 		t.Fatalf("first HandleForwardWrite returned error: %v", err)
@@ -236,9 +237,10 @@ func TestCRAQDuplicateForwardAndCommitDoNotCorruptDirtyIndex(t *testing.T) {
 		t.Fatalf("dirty entries after commit = %d, want 0", got)
 	}
 	if err := nodes["mid"].HandleCommitWrite(ctx, CommitWriteRequest{
-		Slot:       15,
-		Sequence:   2,
-		FromNodeID: "tail",
+		Slot:         15,
+		Sequence:     2,
+		FromNodeID:   "tail",
+		ChainVersion: 1,
 	}); err != nil {
 		t.Fatalf("duplicate HandleCommitWrite returned error: %v", err)
 	}
@@ -254,7 +256,7 @@ func TestCRAQBufferedFutureForwardIsNotReadVisibleUntilContiguousAndTailCommitte
 	ctx := context.Background()
 	nodes, _, repl := setupActiveChainWithQueuedTransport(t, 16, []string{"head", "mid", "tail"})
 
-	if _, err := nodes["head"].SubmitPut(ctx, 16, "k", "v1"); err != nil {
+	if _, err := submitPutWithQueuedDelivery(t, ctx, nodes["head"], repl, 16, "k", "v1"); err != nil {
 		t.Fatalf("SubmitPut returned error: %v", err)
 	}
 
@@ -267,7 +269,8 @@ func TestCRAQBufferedFutureForwardIsNotReadVisibleUntilContiguousAndTailCommitte
 			Value:    "v3",
 			Metadata: testObjectMetadata(3),
 		},
-		FromNodeID: "head",
+		FromNodeID:   "head",
+		ChainVersion: 1,
 	}); err != nil {
 		t.Fatalf("future HandleForwardWrite returned error: %v", err)
 	}
@@ -290,11 +293,12 @@ func TestCRAQBufferedFutureForwardIsNotReadVisibleUntilContiguousAndTailCommitte
 			Value:    "v2",
 			Metadata: testObjectMetadata(2),
 		},
-		FromNodeID: "head",
+		FromNodeID:   "head",
+		ChainVersion: 1,
 	}); err != nil {
 		t.Fatalf("contiguous HandleForwardWrite returned error: %v", err)
 	}
-	if err := repl.DeliverNext(ctx); err != nil {
+	if err := deliverQueuedForward(t, ctx, repl, "tail", 16, 2); err != nil {
 		t.Fatalf("DeliverNext(seq2 to tail) returned error: %v", err)
 	}
 
@@ -353,7 +357,7 @@ func TestCRAQReadDependencyUnavailableOnDirtyRead(t *testing.T) {
 	ctx := context.Background()
 	nodes, _, repl := setupActiveChainWithQueuedTransport(t, 17, []string{"head", "mid", "tail"})
 
-	if _, err := nodes["head"].SubmitPut(ctx, 17, "k", "v1"); err != nil {
+	if _, err := submitPutWithQueuedDelivery(t, ctx, nodes["head"], repl, 17, "k", "v1"); err != nil {
 		t.Fatalf("SubmitPut returned error: %v", err)
 	}
 	stageTailCommittedDirtyOps(t, ctx, nodes["mid"], repl, 17, "k", []WriteOperation{{
@@ -405,7 +409,7 @@ func stageTailCommittedDirtyOps(
 		op.Slot = slot
 		op.Sequence = uint64(i + 2)
 		op.Key = key
-		req := ForwardWriteRequest{Operation: op, FromNodeID: "head"}
+		req := ForwardWriteRequest{Operation: op, FromNodeID: "head", ChainVersion: 1}
 		if err := mid.HandleForwardWrite(ctx, req); err != nil {
 			t.Fatalf("HandleForwardWrite(%d) returned error: %v", op.Sequence, err)
 		}
@@ -452,7 +456,17 @@ func assertCRAQReadResult(t *testing.T, result ReadResult, wantFound bool, wantV
 }
 
 func dirtyEntryCountForKey(node *Node, slot int, key string) int {
-	record := node.ensureProtocolState(node.replicas[slot])
+	owner := node.ensureSlotOwner(slot)
+	done := make(chan struct{}, 1)
+	record := replicaRecord{}
+	if err := owner.dispatch(context.Background(), func(runtime *slotRuntime) {
+		record = cloneReplicaRecord(runtime.record)
+		done <- struct{}{}
+	}); err != nil {
+		panic(err)
+	}
+	<-done
+	record = ensureProtocolReplicaState(record)
 	return len(record.dirtyByKey[key])
 }
 
@@ -514,11 +528,11 @@ func deliverQueuedMessage(
 
 func misconfigureReplicaTail(t *testing.T, node *Node, slot int, tailNodeID string) {
 	t.Helper()
-	record, ok := node.replicas[slot]
+	record, ok := node.State().Replicas[slot]
 	if !ok {
 		t.Fatalf("slot %d missing from node %q", slot, node.nodeID)
 	}
-	assignment := cloneAssignment(record.assignment)
+	assignment := cloneAssignment(record.Assignment)
 	assignment.Peers.TailNodeID = tailNodeID
 	assignment.Peers.TailTarget = tailNodeID
 	if err := node.UpdateChainPeers(context.Background(), UpdateChainPeersCommand{Assignment: assignment}); err != nil {

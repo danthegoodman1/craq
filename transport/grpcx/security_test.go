@@ -253,7 +253,15 @@ func TestSecureEndToEndClusterOverGRPC(t *testing.T) {
 	nodeA := coordinator.Node{ID: "a", RPCAddress: mustReserveAddress(t), FailureDomains: map[string]string{"rack": "r1", "az": "az1"}}
 	nodeC := coordinator.Node{ID: "c", RPCAddress: mustReserveAddress(t), FailureDomains: map[string]string{"rack": "r2", "az": "az2"}}
 
-	aNode := mustSingleReplicaNode(t, ctx, "a", storage.Config{NodeID: "a"}, storage.NewInMemoryCoordinatorClient(), storage.NewInMemoryReplicationTransport(), 0, 1)
+	aCoordinatorPool := fixture.mustClientPool(grpcx.ClientTLSConfig{
+		CAFile:     fixture.clusterCA.caPath,
+		CertFile:   aFiles.certPath,
+		KeyFile:    aFiles.keyPath,
+		ServerName: "coordinator",
+	})
+	aNode := mustSingleReplicaNode(t, ctx, "a", storage.Config{NodeID: "a"}, &suppressingReadyCoordinatorClient{
+		delegate: grpcx.NewCoordinatorReporterClient("a", coordAddress, aCoordinatorPool),
+	}, storage.NewInMemoryReplicationTransport(), 0, 1)
 	aServer := mustStartSecureStorageServerAt(t, aNode, nodeA.RPCAddress, aFiles, grpcx.ServerTLSConfig{
 		CAFile:     fixture.clusterCA.caPath,
 		CertFile:   aFiles.certPath,
@@ -314,6 +322,29 @@ func TestSecureEndToEndClusterOverGRPC(t *testing.T) {
 	coordStorageClient := grpcx.NewStorageNodeClient(nodeC.RPCAddress, coordPool)
 	if err := coordStorageClient.ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: 0}); err != nil {
 		t.Fatalf("ActivateReplica returned error: %v", err)
+	}
+	if err := grpcx.NewStorageNodeClient(nodeA.RPCAddress, coordPool).RemoveReplica(ctx, storage.RemoveReplicaCommand{Slot: 0}); err != nil {
+		t.Fatalf("RemoveReplica returned error: %v", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	for {
+		snapCtx, snapCancel := context.WithTimeout(waitCtx, 100*time.Millisecond)
+		snapshot, err := admin.RoutingSnapshot(snapCtx)
+		snapCancel()
+		if err == nil &&
+			snapshot.SlotCount == 1 &&
+			len(snapshot.Slots) == 1 &&
+			snapshot.Slots[0].Readable &&
+			snapshot.Slots[0].Writable {
+			break
+		}
+		select {
+		case <-waitCtx.Done():
+			t.Fatalf("timed out waiting for secure drained cluster to become writable: %v", waitCtx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 
 	routerPool := fixture.mustClientPool(grpcx.ClientTLSConfig{CAFile: fixture.clusterCA.caPath, ServerName: "storage"})
@@ -408,6 +439,30 @@ func (f *securityFixture) mustClientPool(cfg grpcx.ClientTLSConfig) *grpcx.ConnP
 	}
 	f.t.Cleanup(func() { _ = pool.Close() })
 	return pool
+}
+
+type suppressingReadyCoordinatorClient struct {
+	delegate storage.CoordinatorClient
+}
+
+func (c *suppressingReadyCoordinatorClient) RegisterNode(ctx context.Context, reg storage.NodeRegistration) error {
+	return c.delegate.RegisterNode(ctx, reg)
+}
+
+func (c *suppressingReadyCoordinatorClient) ReportReplicaReady(ctx context.Context, slot int, epoch uint64) error {
+	return nil
+}
+
+func (c *suppressingReadyCoordinatorClient) ReportReplicaRemoved(ctx context.Context, slot int, epoch uint64) error {
+	return c.delegate.ReportReplicaRemoved(ctx, slot, epoch)
+}
+
+func (c *suppressingReadyCoordinatorClient) ReportNodeRecovered(ctx context.Context, report storage.NodeRecoveryReport) error {
+	return c.delegate.ReportNodeRecovered(ctx, report)
+}
+
+func (c *suppressingReadyCoordinatorClient) ReportNodeHeartbeat(ctx context.Context, status storage.NodeStatus) error {
+	return c.delegate.ReportNodeHeartbeat(ctx, status)
 }
 
 type certFiles struct {

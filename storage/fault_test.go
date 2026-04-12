@@ -20,10 +20,10 @@ func TestFaultInjectedDroppedCommitAckLeavesHeadUncommitted(t *testing.T) {
 		transport.DropNext()
 	})
 
-	if _, err := nodes["head"].SubmitPut(ctx, 6, "k", "v"); err == nil {
+	if _, err := submitPutWithQueuedDelivery(t, ctx, nodes["head"], transport, 6, "k", "v"); err == nil {
 		t.Fatal("SubmitPut unexpectedly succeeded")
-	} else if !errors.Is(err, ErrStateMismatch) {
-		t.Fatalf("error = %v, want state mismatch", err)
+	} else if !errors.Is(err, ErrWriteTimeout) {
+		t.Fatalf("error = %v, want write timeout", err)
 	}
 
 	if got, want := mustNodeCommittedSnapshot(t, nodes["head"], 6), map[string]string{}; !reflect.DeepEqual(got, want) {
@@ -89,7 +89,7 @@ func runQueuedReplicaFaultHistory(t *testing.T) queuedReplicaFaultHistory {
 		}
 	})
 
-	if result, err := nodes["head"].SubmitPut(ctx, 9, "k", "v"); err != nil {
+	if result, err := submitPutWithQueuedDelivery(t, ctx, nodes["head"], transport, 9, "k", "v"); err != nil {
 		t.Fatalf("SubmitPut returned error: %v", err)
 	} else {
 		assertAppliedCommitResult(t, result, 9, 1)

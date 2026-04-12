@@ -92,10 +92,10 @@ func TestPlanReconfigurationAddNodeUsesExpectedChainAndTailAppend(t *testing.T) 
 	if got, want := slotPlan.Slot, 1; got != want {
 		t.Fatalf("changed slot = %d, want %d", got, want)
 	}
-	if got, want := replicaNodeStates(slotPlan.Before), []string{"b:active", "a:active", "c:active"}; !reflect.DeepEqual(got, want) {
+	if got, want := replicaNodeStates(slotPlan.Before), []string{"b:active", "c:active", "a:active"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("before = %v, want %v", got, want)
 	}
-	if got, want := replicaNodeStates(slotPlan.After), []string{"b:active", "a:active", "c:active", "d:joining"}; !reflect.DeepEqual(got, want) {
+	if got, want := replicaNodeStates(slotPlan.After), []string{"b:active", "c:active", "a:active", "d:joining"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("after = %v, want %v", got, want)
 	}
 	if got, want := slotPlan.Steps, []ReconfigurationStep{{

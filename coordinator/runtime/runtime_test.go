@@ -94,6 +94,101 @@ func TestHeartbeatDuplicateCommandIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestNodeReadyPersistsAndRecovers(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryStore()
+	rt := mustOpenRuntime(t, store)
+	if _, err := rt.Bootstrap(ctx, Command{
+		ID:              "bootstrap-1",
+		ExpectedVersion: 0,
+		Kind:            CommandKindBootstrap,
+		Bootstrap: &BootstrapCommand{
+			Config: coordinator.Config{SlotCount: 1, ReplicationFactor: 1},
+			Nodes:  []coordinator.Node{uniqueNode("a")},
+		},
+	}); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+
+	state, err := rt.MarkNodeReady(ctx, Command{
+		ID:              "node-ready-a-1",
+		ExpectedVersion: 1,
+		Kind:            CommandKindNodeReady,
+		NodeReady: &NodeReadyCommand{
+			Status:             uniqueNodeStatus("a"),
+			ObservedAtUnixNano: 101,
+		},
+	})
+	if err != nil {
+		t.Fatalf("MarkNodeReady returned error: %v", err)
+	}
+	if !state.Cluster.ReadyNodeIDs["a"] {
+		t.Fatal("node a was not marked ready")
+	}
+	record := state.NodeLivenessByID["a"]
+	if got, want := record.State, NodeLivenessStateHealthy; got != want {
+		t.Fatalf("liveness state = %q, want %q", got, want)
+	}
+	if got, want := record.LastHeartbeatUnixNano, int64(101); got != want {
+		t.Fatalf("last heartbeat = %d, want %d", got, want)
+	}
+	if got, want := record.UpdatedAtUnixNano, int64(101); got != want {
+		t.Fatalf("updated at = %d, want %d", got, want)
+	}
+	reopened := mustOpenRuntime(t, store)
+	if got := reopened.Current(); !reflect.DeepEqual(got, state) {
+		t.Fatalf("recovered state mismatch\nrecovered=%#v\nwant=%#v", got, state)
+	}
+}
+
+func TestCurrentViewReturnsHotStateWithoutAppliedCommandHistory(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryStore()
+	rt := mustOpenRuntime(t, store)
+	if _, err := rt.Bootstrap(ctx, Command{
+		ID:              "bootstrap-1",
+		ExpectedVersion: 0,
+		Kind:            CommandKindBootstrap,
+		Bootstrap: &BootstrapCommand{
+			Config: coordinator.Config{SlotCount: 1, ReplicationFactor: 1},
+			Nodes:  []coordinator.Node{uniqueNode("a")},
+		},
+	}); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+
+	state, err := rt.MarkNodeReady(ctx, Command{
+		ID:              "node-ready-a-1",
+		ExpectedVersion: 1,
+		Kind:            CommandKindNodeReady,
+		NodeReady: &NodeReadyCommand{
+			Status:             uniqueNodeStatus("a"),
+			ObservedAtUnixNano: 101,
+		},
+	})
+	if err != nil {
+		t.Fatalf("MarkNodeReady returned error: %v", err)
+	}
+	view := rt.CurrentView()
+	if got, want := view.Version, state.Version; got != want {
+		t.Fatalf("view version = %d, want %d", got, want)
+	}
+	if got, want := view.LastLogIndex, state.LastLogIndex; got != want {
+		t.Fatalf("view last log index = %d, want %d", got, want)
+	}
+	if !reflect.DeepEqual(view.Cluster, state.Cluster) {
+		t.Fatalf("view cluster mismatch\ngot=%#v\nwant=%#v", view.Cluster, state.Cluster)
+	}
+	view.Cluster.ReadyNodeIDs["a"] = false
+	view.NodeLivenessByID["a"] = NodeLivenessRecord{}
+	if !rt.Current().Cluster.ReadyNodeIDs["a"] {
+		t.Fatal("mutating view changed runtime cluster state")
+	}
+	if got := rt.Current().NodeLivenessByID["a"].State; got != NodeLivenessStateHealthy {
+		t.Fatalf("runtime liveness after mutating view = %q, want healthy", got)
+	}
+}
+
 func TestLivenessTransitionPersistsAndCheckpointRecovers(t *testing.T) {
 	ctx := context.Background()
 	store := NewInMemoryStore()
@@ -452,7 +547,7 @@ func TestReconfigureAndApplyProgressPersistAndRecover(t *testing.T) {
 	store := NewInMemoryStore()
 	rt := mustOpenRuntime(t, store)
 
-	state, err := rt.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 8, 3, "a", "b", "c"))
+	state, err := rt.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 16, 3, "a", "b", "c"))
 	if err != nil {
 		t.Fatalf("Bootstrap returned error: %v", err)
 	}
@@ -511,7 +606,7 @@ func TestReconcileAfterRemovedProgressMovesPendingOffCompletedSlot(t *testing.T)
 	store := NewInMemoryStore()
 	rt := mustOpenRuntime(t, store)
 
-	state, err := rt.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 8, 3, "a", "b", "c"))
+	state, err := rt.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 16, 3, "a", "b", "c"))
 	if err != nil {
 		t.Fatalf("Bootstrap returned error: %v", err)
 	}
@@ -715,6 +810,165 @@ func TestCheckpointPreservesCompletedProgressWhileAnotherSlotRemainsPending(t *t
 	}
 }
 
+func TestInterleavedRepairHeartbeatLivenessAndCheckpointReplay(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryStore()
+	rt := mustOpenRuntime(t, store)
+
+	state, err := rt.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 8, 3, "a", "b", "c"))
+	if err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	state, err = rt.Heartbeat(ctx, Command{
+		ID:              "heartbeat-a",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindHeartbeat,
+		Heartbeat: &HeartbeatCommand{
+			Status:             uniqueNodeStatus("a"),
+			ObservedAtUnixNano: int64((10 * time.Second).Nanoseconds()),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Heartbeat(a) returned error: %v", err)
+	}
+	state, err = rt.Heartbeat(ctx, Command{
+		ID:              "heartbeat-b",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindHeartbeat,
+		Heartbeat: &HeartbeatCommand{
+			Status:             uniqueNodeStatus("b"),
+			ObservedAtUnixNano: int64((11 * time.Second).Nanoseconds()),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Heartbeat(b) returned error: %v", err)
+	}
+
+	plan, state, err := rt.Reconfigure(ctx, Command{
+		ID:              "add-d",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindReconfigure,
+		Reconfigure: &ReconfigureCommand{
+			Events: []coordinator.Event{{Kind: coordinator.EventKindAddNode, Node: uniqueNode("d")}},
+			Policy: coordinator.ReconfigurationPolicy{MaxChangedChains: 2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconfigure(add-d) returned error: %v", err)
+	}
+	if got, want := len(plan.ChangedSlots), 2; got != want {
+		t.Fatalf("changed slot count = %d, want %d", got, want)
+	}
+
+	firstSlot := plan.ChangedSlots[0].Slot
+	secondSlot := plan.ChangedSlots[1].Slot
+	joiningNodeID := plan.ChangedSlots[0].Steps[0].NodeID
+	ackedFirstSlot := false
+	for i, entry := range append([]OutboxEntry(nil), state.Outbox...) {
+		if entry.Slot != firstSlot {
+			continue
+		}
+		ackedFirstSlot = true
+		state, err = rt.AcknowledgeOutbox(ctx, Command{
+			ID:              fmt.Sprintf("ack-first-slot-%d", i),
+			ExpectedVersion: state.Version,
+			Kind:            CommandKindAcknowledgeOutbox,
+			AcknowledgeOutbox: &AcknowledgeOutboxCommand{
+				EntryID: entry.ID,
+			},
+		})
+		if err != nil {
+			t.Fatalf("AcknowledgeOutbox(%s) returned error: %v", entry.ID, err)
+		}
+	}
+	if !ackedFirstSlot {
+		t.Fatal("failed to acknowledge any first-slot outbox entry")
+	}
+
+	state, err = rt.ApplyProgress(ctx, Command{
+		ID:              "progress-ready-d",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindProgress,
+		Progress: &ProgressCommand{
+			Event: coordinator.Event{
+				Kind:   coordinator.EventKindReplicaBecameActive,
+				Slot:   firstSlot,
+				NodeID: joiningNodeID,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplyProgress(ready) returned error: %v", err)
+	}
+	_, state, err = rt.Reconfigure(ctx, Command{
+		ID:              "reconcile-after-ready",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindReconfigure,
+		Reconfigure: &ReconfigureCommand{
+			Events: nil,
+			Policy: coordinator.ReconfigurationPolicy{MaxChangedChains: 2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconfigure(after ready) returned error: %v", err)
+	}
+	if got, want := state.PendingBySlot[firstSlot].Kind, PendingKindRemoved; got != want {
+		t.Fatalf("first slot pending kind = %q, want %q", got, want)
+	}
+	if got, want := state.PendingBySlot[secondSlot].Kind, PendingKindReady; got != want {
+		t.Fatalf("second slot pending kind = %q, want %q", got, want)
+	}
+	if got := countOutboxEntriesForSlot(state.Outbox, secondSlot); got == 0 {
+		t.Fatal("second slot unexpectedly lost its outbox work")
+	}
+
+	state, err = rt.Heartbeat(ctx, Command{
+		ID:              "heartbeat-d",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindHeartbeat,
+		Heartbeat: &HeartbeatCommand{
+			Status:             uniqueNodeStatus("d"),
+			ObservedAtUnixNano: int64((12 * time.Second).Nanoseconds()),
+			FlapWindowNanos:    int64((30 * time.Second).Nanoseconds()),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Heartbeat(d) returned error: %v", err)
+	}
+	state, err = rt.ApplyLiveness(ctx, Command{
+		ID:              "liveness-b-suspect",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindLiveness,
+		Liveness: &LivenessCommand{
+			NodeID:              "b",
+			State:               NodeLivenessStateSuspect,
+			EvaluatedAtUnixNano: int64((13 * time.Second).Nanoseconds()),
+			FlapWindowNanos:     int64((30 * time.Second).Nanoseconds()),
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplyLiveness returned error: %v", err)
+	}
+
+	if err := rt.Checkpoint(ctx); err != nil {
+		t.Fatalf("Checkpoint returned error: %v", err)
+	}
+	reopened := mustOpenRuntime(t, store)
+
+	want := state
+	want.AppliedCommands = map[string]AppliedCommand{}
+	if got := reopened.Current(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("recovered state mismatch\nrecovered=%#v\nwant=%#v", got, want)
+	}
+	if got, want := reopened.Current().NodeLivenessByID["b"].State, NodeLivenessStateSuspect; got != want {
+		t.Fatalf("reopened liveness state = %q, want %q", got, want)
+	}
+	if got, want := len(reopened.Current().CompletedProgressBySlot[firstSlot]), 1; got != want {
+		t.Fatalf("completed progress record count after reopen = %d, want %d", got, want)
+	}
+	assertCoordinatorStateValid(t, reopened.Current().Cluster)
+}
+
 func TestDuplicateOutboxAcknowledgeIsIdempotentBeforeAndAfterReopen(t *testing.T) {
 	ctx := context.Background()
 	store := NewInMemoryStore()
@@ -767,6 +1021,114 @@ func TestDuplicateOutboxAcknowledgeIsIdempotentBeforeAndAfterReopen(t *testing.T
 	}
 	if !reflect.DeepEqual(reopenedDuplicate, acked) {
 		t.Fatalf("reopened duplicate ack snapshot mismatch\nreopened=%#v\nacked=%#v", reopenedDuplicate, acked)
+	}
+}
+
+func TestDuplicateBatchedOutboxAcknowledgeIsIdempotentBeforeAndAfterReopen(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryStore()
+	rt := mustOpenRuntime(t, store)
+
+	state, err := rt.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 8, 3, "a", "b", "c"))
+	if err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	_, state, err = rt.Reconfigure(ctx, Command{
+		ID:              "add-d",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindReconfigure,
+		Reconfigure: &ReconfigureCommand{
+			Events: []coordinator.Event{{Kind: coordinator.EventKindAddNode, Node: uniqueNode("d")}},
+			Policy: coordinator.ReconfigurationPolicy{MaxChangedChains: 2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconfigure(add-d) returned error: %v", err)
+	}
+	if got := len(state.Outbox); got < 2 {
+		t.Fatalf("outbox size = %d, want at least 2", got)
+	}
+
+	entryIDs := []string{state.Outbox[1].ID, state.Outbox[0].ID}
+	ack := Command{
+		ID:              "ack-outbox-batch-1",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindAcknowledgeOutbox,
+		AcknowledgeOutbox: &AcknowledgeOutboxCommand{
+			EntryIDs: append([]string(nil), entryIDs...),
+		},
+	}
+	acked, err := rt.AcknowledgeOutbox(ctx, ack)
+	if err != nil {
+		t.Fatalf("AcknowledgeOutbox(batch) returned error: %v", err)
+	}
+	duplicate, err := rt.AcknowledgeOutbox(ctx, ack)
+	if err != nil {
+		t.Fatalf("duplicate batched AcknowledgeOutbox returned error: %v", err)
+	}
+	if !reflect.DeepEqual(duplicate, acked) {
+		t.Fatalf("duplicate batch ack snapshot mismatch\nduplicate=%#v\nacked=%#v", duplicate, acked)
+	}
+
+	reopened := mustOpenRuntime(t, store)
+	reopenedDuplicate, err := reopened.AcknowledgeOutbox(ctx, ack)
+	if err != nil {
+		t.Fatalf("reopened duplicate batched AcknowledgeOutbox returned error: %v", err)
+	}
+	if !reflect.DeepEqual(reopenedDuplicate, acked) {
+		t.Fatalf("reopened duplicate batch ack snapshot mismatch\nreopened=%#v\nacked=%#v", reopenedDuplicate, acked)
+	}
+}
+
+func TestDuplicateCommandConflictForDifferentBatchedOutboxEntries(t *testing.T) {
+	ctx := context.Background()
+	rt := mustOpenRuntime(t, NewInMemoryStore())
+
+	state, err := rt.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 8, 3, "a", "b", "c"))
+	if err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	_, state, err = rt.Reconfigure(ctx, Command{
+		ID:              "add-d",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindReconfigure,
+		Reconfigure: &ReconfigureCommand{
+			Events: []coordinator.Event{{Kind: coordinator.EventKindAddNode, Node: uniqueNode("d")}},
+			Policy: coordinator.ReconfigurationPolicy{MaxChangedChains: 2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconfigure(add-d) returned error: %v", err)
+	}
+	if got := len(state.Outbox); got < 2 {
+		t.Fatalf("outbox size = %d, want at least 2", got)
+	}
+
+	first := Command{
+		ID:              "ack-outbox-batch-conflict",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindAcknowledgeOutbox,
+		AcknowledgeOutbox: &AcknowledgeOutboxCommand{
+			EntryIDs: []string{state.Outbox[0].ID},
+		},
+	}
+	if _, err := rt.AcknowledgeOutbox(ctx, first); err != nil {
+		t.Fatalf("AcknowledgeOutbox(first batch) returned error: %v", err)
+	}
+
+	_, err = rt.AcknowledgeOutbox(ctx, Command{
+		ID:              first.ID,
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindAcknowledgeOutbox,
+		AcknowledgeOutbox: &AcknowledgeOutboxCommand{
+			EntryIDs: []string{state.Outbox[0].ID, state.Outbox[1].ID},
+		},
+	})
+	if err == nil {
+		t.Fatal("conflicting duplicate batch ack unexpectedly succeeded")
+	}
+	if !errors.Is(err, ErrCommandConflict) {
+		t.Fatalf("error = %v, want command conflict", err)
 	}
 }
 
@@ -835,6 +1197,48 @@ func TestMultiSlotReconcilePreservesUntouchedSlotPendingOutboxAndVersion(t *test
 	}
 	if got, want := countOutboxEntriesForSlot(state.Outbox, secondSlot), secondOutboxBefore; got != want {
 		t.Fatalf("second slot outbox count = %d, want %d", got, want)
+	}
+}
+
+func TestAcknowledgeOutboxMissingEntryDoesNotAdvanceVersion(t *testing.T) {
+	ctx := context.Background()
+	rt := mustOpenRuntime(t, NewInMemoryStore())
+
+	state, err := rt.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 8, 3, "a", "b", "c"))
+	if err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	_, state, err = rt.Reconfigure(ctx, Command{
+		ID:              "add-d",
+		ExpectedVersion: state.Version,
+		Kind:            CommandKindReconfigure,
+		Reconfigure: &ReconfigureCommand{
+			Events: []coordinator.Event{{Kind: coordinator.EventKindAddNode, Node: uniqueNode("d")}},
+			Policy: coordinator.ReconfigurationPolicy{MaxChangedChains: 1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconfigure(add-d) returned error: %v", err)
+	}
+
+	before := rt.Current()
+	missing, err := rt.AcknowledgeOutbox(ctx, Command{
+		ID:              "ack-outbox-missing",
+		ExpectedVersion: before.Version,
+		Kind:            CommandKindAcknowledgeOutbox,
+		AcknowledgeOutbox: &AcknowledgeOutboxCommand{
+			EntryID: "does-not-exist",
+		},
+	})
+	if err != nil {
+		t.Fatalf("AcknowledgeOutbox(missing) returned error: %v", err)
+	}
+	after := rt.Current()
+	if got, want := after.Version, before.Version; got != want {
+		t.Fatalf("runtime version after missing ack = %d, want %d", got, want)
+	}
+	if !reflect.DeepEqual(missing, before) {
+		t.Fatalf("missing ack snapshot mismatch\nmissing=%#v\nbefore=%#v", missing, before)
 	}
 }
 
@@ -1264,6 +1668,31 @@ func bootstrapCommand(id string, expected uint64, slotCount int, replicationFact
 			},
 			Nodes: uniqueNodes(nodeIDs...),
 		},
+	}
+}
+
+func TestBootstrapPersistsReconfigurationPolicy(t *testing.T) {
+	rt := mustOpenRuntime(t, NewInMemoryStore())
+	state, err := rt.Bootstrap(context.Background(), Command{
+		ID:              "bootstrap-policy",
+		ExpectedVersion: 0,
+		Kind:            CommandKindBootstrap,
+		Bootstrap: &BootstrapCommand{
+			Config: coordinator.Config{
+				SlotCount:         8,
+				ReplicationFactor: 3,
+			},
+			Policy: coordinator.ReconfigurationPolicy{MaxChangedChains: 32},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	if got, want := state.LastPolicy.MaxChangedChains, 32; got != want {
+		t.Fatalf("state.LastPolicy.MaxChangedChains = %d, want %d", got, want)
+	}
+	if got, want := rt.Current().LastPolicy.MaxChangedChains, 32; got != want {
+		t.Fatalf("runtime current LastPolicy.MaxChangedChains = %d, want %d", got, want)
 	}
 }
 

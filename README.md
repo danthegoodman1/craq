@@ -20,11 +20,93 @@ Highlights:
 Documentation:
 
 - [Architecture](./ARCHITECTURE.md)
+- [Benchmarking](./BENCHMARKING.md)
 - [Coordinator HA Store](./HA_STORE.md)
 - [Coordinator](./coordinator/README.md)
 - [Observability](./OBSERVABILITY.md)
 - [Quickstart](./QUICKSTART.md)
 - [Security](./SECURITY.md)
+
+## Testing
+
+Normal functional coverage stays on the standard Go test path:
+
+```bash
+go test ./...
+```
+
+For concurrency-sensitive control-plane and storage changes, run the targeted
+core race suite before pushing or before a cloud benchmark:
+
+```bash
+scripts/test-race-core.sh
+```
+
+That race suite intentionally covers the packages with the most live
+concurrency:
+
+- `./storage`
+- `./benchmark`
+- `./coordserver`
+- `./coordinator/runtime`
+- `./transport/grpcx`
+- `./client`
+- `./adminhttp`
+
+For the benchmark-critical coordination stack, the more focused pre-benchmark
+race command is:
+
+```bash
+go test -race -count=1 ./coordserver ./coordinator/runtime ./benchmark ./client ./transport/grpcx
+```
+
+External or env-gated suites stay opt-in. For example, Postgres-backed
+coordinator HA tests are still gated by `CRAQ_TEST_POSTGRES_DSN` and are not
+part of the default race script. When those tests are needed, run them
+explicitly with the same env var set instead of folding them into the default
+core workflow. A typical manual invocation is:
+
+```bash
+CRAQ_TEST_POSTGRES_DSN=postgres://... go test -race -count=1 ./coordserver -run TestPostgres
+```
+
+For benchmark startup and convergence changes, run the local preflight suite
+before doing a real cloud run:
+
+```bash
+scripts/test-benchmark-preflight.sh
+```
+
+That script keeps the coverage local-only and focuses on the real benchmark
+bring-up path:
+
+- routing convergence under benchmark startup pressure
+- control-plane timeout behavior under large pending work
+- storage/control-plane overlap
+- real-process local benchmark startup
+
+For a heavier local-only startup soak that mirrors the real cloud benchmark
+shape more closely, run:
+
+```bash
+scripts/test-benchmark-soak-local.sh
+```
+
+That soak intentionally stays out of the everyday fast path. It is the local
+gate for catching the older GCP-style failure shape where routing progress
+advances a little and then collapses or churns instead of converging.
+
+The recommended pre-cloud benchmark workflow is:
+
+```bash
+scripts/test-race-core.sh
+scripts/test-benchmark-preflight.sh
+scripts/test-benchmark-soak-local.sh
+go build -o ./bin/craq-bench ./cmd/craq-bench
+./bin/craq-bench smoke-local
+./bin/craq-bench smoke-local --profile profiles/bench/local_smoke_cloud_shape.yaml --run-name cloud-shape
+./bin/craq-bench run --profile profiles/bench/gcp_c4a_steady.yaml --run-name my-bench
+```
 
 ## Ops Surfaces
 
@@ -42,6 +124,8 @@ The admin listener is unauthenticated in v1 and is intended for loopback or a
 trusted network only.
 
 ## Performance Notes
+
+For cloud benchmark orchestration, see [BENCHMARKING.md](./BENCHMARKING.md).
 
 The repo includes an end-to-end localhost gRPC benchmark in
 [`transport/grpcx/grpc_benchmark_test.go`](./transport/grpcx/grpc_benchmark_test.go).
@@ -76,3 +160,9 @@ These are localhost benchmark numbers, not SLOs or cross-machine production guar
 They include gRPC and durable local storage costs, but not network latency, TLS, or
 multi-host deployment effects. The read path likely reflects cache-warm access through
 Badger and the OS page cache rather than cold disk-read latency.
+
+Those localhost transport benchmarks are steady-state latency checks. They are
+not the benchmark startup/convergence gate; use `scripts/test-benchmark-preflight.sh`
+and `craq-bench smoke-local` for that. Use `scripts/test-benchmark-soak-local.sh`
+and the cloud-shape smoke profile when you need the heavier local startup soak
+before spending money on a real cloud run.

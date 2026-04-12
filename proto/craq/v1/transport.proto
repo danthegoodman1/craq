@@ -248,12 +248,28 @@ message WriteOperation {
 message ForwardWriteRequest {
   WriteOperation operation = 1;
   string from_node_id = 2;
+  uint64 chain_version = 3;
 }
 
 message CommitWriteRequest {
   int32 slot = 1;
   uint64 sequence = 2;
   string from_node_id = 3;
+  uint64 chain_version = 4;
+}
+
+message ReplicationAck {
+  bool success = 1;
+  bytes encoded_error = 2;
+}
+
+message ReplicationFrame {
+  uint64 request_id = 1;
+  oneof payload {
+    ForwardWriteRequest forward_write = 2;
+    CommitWriteRequest commit_write = 3;
+    ReplicationAck ack = 4;
+  }
 }
 
 message FetchSnapshotRequest {
@@ -352,6 +368,7 @@ service StorageService {
   rpc DropRecoveredReplica(DropRecoveredReplicaCommand) returns (Empty);
   rpc ForwardWrite(ForwardWriteRequest) returns (Empty);
   rpc CommitWrite(CommitWriteRequest) returns (Empty);
+  rpc Replicate(stream ReplicationFrame) returns (stream ReplicationFrame);
   rpc FetchSnapshot(FetchSnapshotRequest) returns (stream SnapshotEntry);
   rpc FetchCommittedSequence(FetchCommittedSequenceRequest) returns (FetchCommittedSequenceResponse);
 }

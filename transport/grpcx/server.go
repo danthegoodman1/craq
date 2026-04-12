@@ -3,6 +3,8 @@ package grpcx
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"sync"
 
@@ -13,6 +15,9 @@ import (
 	"github.com/danthegoodman1/craq/storage"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 type CoordinatorGRPCServer struct {
@@ -20,7 +25,6 @@ type CoordinatorGRPCServer struct {
 	server     *coordserver.Server
 	grpc       *grpc.Server
 	lis        net.Listener
-	mu         sync.Mutex
 	authorizer *rpcAuthorizer
 	logger     zerolog.Logger
 	observer   *grpcObserver
@@ -84,8 +88,6 @@ func (s *CoordinatorGRPCServer) Close() error {
 }
 
 func (s *CoordinatorGRPCServer) Bootstrap(ctx context.Context, req *grpcproto.BootstrapRequest) (*grpcproto.ServerState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	nodes := make([]coordinator.Node, 0, len(req.Nodes))
 	for _, node := range req.Nodes {
 		nodes = append(nodes, fromProtoNode(node))
@@ -109,8 +111,6 @@ func (s *CoordinatorGRPCServer) Bootstrap(ctx context.Context, req *grpcproto.Bo
 }
 
 func (s *CoordinatorGRPCServer) RegisterNode(ctx context.Context, req *grpcproto.RegisterNodeRequest) (*grpcproto.ServerState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	state, err := s.server.RegisterNode(ctx, storage.NodeRegistration{
 		NodeID:         req.Node.Id,
 		RPCAddress:     req.Node.RpcAddress,
@@ -123,20 +123,14 @@ func (s *CoordinatorGRPCServer) RegisterNode(ctx context.Context, req *grpcproto
 }
 
 func (s *CoordinatorGRPCServer) AddNode(ctx context.Context, req *grpcproto.MembershipMutationRequest) (*grpcproto.ServerState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.applyMembership(ctx, coordinator.EventKindAddNode, req)
 }
 
 func (s *CoordinatorGRPCServer) BeginDrainNode(ctx context.Context, req *grpcproto.MembershipMutationRequest) (*grpcproto.ServerState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.applyMembership(ctx, coordinator.EventKindBeginDrainNode, req)
 }
 
 func (s *CoordinatorGRPCServer) MarkNodeDead(ctx context.Context, req *grpcproto.MembershipMutationRequest) (*grpcproto.ServerState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.applyMembership(ctx, coordinator.EventKindMarkNodeDead, req)
 }
 
@@ -185,8 +179,6 @@ func mapMembershipMethod(
 }
 
 func (s *CoordinatorGRPCServer) RoutingSnapshot(ctx context.Context, _ *grpcproto.RoutingSnapshotRequest) (*grpcproto.RoutingSnapshotResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	snapshot, err := s.server.RoutingSnapshot(ctx)
 	if err != nil {
 		return nil, encodeError(err)
@@ -195,8 +187,6 @@ func (s *CoordinatorGRPCServer) RoutingSnapshot(ctx context.Context, _ *grpcprot
 }
 
 func (s *CoordinatorGRPCServer) ReportReplicaReady(ctx context.Context, req *grpcproto.ReplicaReadyReport) (*grpcproto.ServerState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.authorizer != nil {
 		if err := s.authorizer.requireStorageIdentityMatch(ctx, req.NodeId); err != nil {
 			return nil, encodeError(err)
@@ -210,8 +200,6 @@ func (s *CoordinatorGRPCServer) ReportReplicaReady(ctx context.Context, req *grp
 }
 
 func (s *CoordinatorGRPCServer) ReportReplicaRemoved(ctx context.Context, req *grpcproto.ReplicaRemovedReport) (*grpcproto.ServerState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.authorizer != nil {
 		if err := s.authorizer.requireStorageIdentityMatch(ctx, req.NodeId); err != nil {
 			return nil, encodeError(err)
@@ -225,8 +213,6 @@ func (s *CoordinatorGRPCServer) ReportReplicaRemoved(ctx context.Context, req *g
 }
 
 func (s *CoordinatorGRPCServer) ReportNodeHeartbeat(ctx context.Context, req *grpcproto.NodeStatus) (*grpcproto.Empty, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.authorizer != nil {
 		if err := s.authorizer.requireStorageIdentityMatch(ctx, req.NodeId); err != nil {
 			return nil, encodeError(err)
@@ -239,8 +225,6 @@ func (s *CoordinatorGRPCServer) ReportNodeHeartbeat(ctx context.Context, req *gr
 }
 
 func (s *CoordinatorGRPCServer) ReportNodeRecovered(ctx context.Context, req *grpcproto.NodeRecoveryReport) (*grpcproto.Empty, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.authorizer != nil {
 		if err := s.authorizer.requireStorageIdentityMatch(ctx, req.NodeId); err != nil {
 			return nil, encodeError(err)
@@ -253,12 +237,10 @@ func (s *CoordinatorGRPCServer) ReportNodeRecovered(ctx context.Context, req *gr
 }
 
 func (s *CoordinatorGRPCServer) EvaluateLiveness(ctx context.Context, _ *grpcproto.Empty) (*grpcproto.ServerState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := s.server.EvaluateLiveness(ctx); err != nil {
 		return nil, encodeError(err)
 	}
-	return protoServerState(s.server.Current()), nil
+	return &grpcproto.ServerState{Version: s.server.CurrentVersion()}, nil
 }
 
 type StorageGRPCServer struct {
@@ -452,7 +434,8 @@ func (s *StorageGRPCServer) ForwardWrite(ctx context.Context, req *grpcproto.For
 			Value:    req.Operation.Value,
 			Metadata: derefObjectMetadata(fromProtoObjectMetadata(req.Operation.Metadata)),
 		},
-		FromNodeID: req.FromNodeId,
+		FromNodeID:   req.FromNodeId,
+		ChainVersion: req.ChainVersion,
 	}); err != nil {
 		return nil, encodeError(err)
 	}
@@ -466,17 +449,98 @@ func (s *StorageGRPCServer) CommitWrite(ctx context.Context, req *grpcproto.Comm
 		}
 	}
 	if err := s.node.HandleCommitWrite(ctx, storage.CommitWriteRequest{
-		Slot:       int(req.Slot),
-		Sequence:   req.Sequence,
-		FromNodeID: req.FromNodeId,
+		Slot:         int(req.Slot),
+		Sequence:     req.Sequence,
+		FromNodeID:   req.FromNodeId,
+		ChainVersion: req.ChainVersion,
 	}); err != nil {
 		return nil, encodeError(err)
 	}
 	return &grpcproto.Empty{}, nil
 }
 
+func (s *StorageGRPCServer) Replicate(stream grpcproto.StorageService_ReplicateServer) error {
+	var sendMu sync.Mutex
+	var workers sync.WaitGroup
+	defer workers.Wait()
+
+	sendAck := func(requestID uint64, err error) error {
+		frame := &grpcproto.ReplicationFrame{
+			RequestId: requestID,
+			Payload: &grpcproto.ReplicationFrame_Ack{
+				Ack: &grpcproto.ReplicationAck{
+					Success:      err == nil,
+					EncodedError: marshalEncodedError(err),
+				},
+			},
+		}
+		sendMu.Lock()
+		defer sendMu.Unlock()
+		return stream.Send(frame)
+	}
+
+	for {
+		frame, err := stream.Recv()
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		workers.Add(1)
+		go func(frame *grpcproto.ReplicationFrame) {
+			defer workers.Done()
+			var handleErr error
+			switch payload := frame.GetPayload().(type) {
+			case *grpcproto.ReplicationFrame_ForwardWrite:
+				req := payload.ForwardWrite
+				if s.authorizer != nil {
+					if authErr := s.authorizer.requireStorageIdentityMatch(stream.Context(), req.FromNodeId); authErr != nil {
+						handleErr = authErr
+						break
+					}
+				}
+				handleErr = s.node.AcceptForwardWrite(stream.Context(), storage.ForwardWriteRequest{
+					Operation: storage.WriteOperation{
+						Slot:     int(req.Operation.Slot),
+						Sequence: req.Operation.Sequence,
+						Kind:     storage.OperationKind(req.Operation.Kind),
+						Key:      req.Operation.Key,
+						Value:    req.Operation.Value,
+						Metadata: derefObjectMetadata(fromProtoObjectMetadata(req.Operation.Metadata)),
+					},
+					FromNodeID:   req.FromNodeId,
+					ChainVersion: req.ChainVersion,
+				})
+			case *grpcproto.ReplicationFrame_CommitWrite:
+				req := payload.CommitWrite
+				if s.authorizer != nil {
+					if authErr := s.authorizer.requireStorageIdentityMatch(stream.Context(), req.FromNodeId); authErr != nil {
+						handleErr = authErr
+						break
+					}
+				}
+				handleErr = s.node.AcceptCommitWrite(stream.Context(), storage.CommitWriteRequest{
+					Slot:         int(req.Slot),
+					Sequence:     req.Sequence,
+					FromNodeID:   req.FromNodeId,
+					ChainVersion: req.ChainVersion,
+				})
+			default:
+				handleErr = status.Error(codes.InvalidArgument, "replication frame payload required")
+			}
+			if ackErr := sendAck(frame.GetRequestId(), handleErr); ackErr != nil && !errors.Is(ackErr, context.Canceled) {
+				s.logger.Debug().Err(ackErr).Msg("replication stream ack failed")
+			}
+		}(frame)
+	}
+}
+
 func (s *StorageGRPCServer) FetchSnapshot(req *grpcproto.FetchSnapshotRequest, stream grpcproto.StorageService_FetchSnapshotServer) error {
-	snapshot, err := s.node.CommittedSnapshot(int(req.Slot))
+	snapshot, committedSequence, err := s.node.CommittedSnapshotWithSequence(int(req.Slot))
 	if err != nil {
 		return encodeError(err)
 	}
@@ -485,6 +549,7 @@ func (s *StorageGRPCServer) FetchSnapshot(req *grpcproto.FetchSnapshotRequest, s
 			return err
 		}
 	}
+	stream.SetTrailer(metadata.Pairs("x-craq-committed-sequence", fmt.Sprintf("%d", committedSequence)))
 	return nil
 }
 

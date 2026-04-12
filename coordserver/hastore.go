@@ -47,11 +47,21 @@ type OutboxEntry struct {
 	SourceNodeID string
 }
 
+type HAActivePeerRefreshState struct {
+	FallbackServingChain coordinator.Chain `json:"fallback_serving_chain"`
+	AssignmentChain      coordinator.Chain `json:"assignment_chain"`
+	UseFallbackRoute     bool              `json:"use_fallback_route"`
+	AllowWhilePending    bool              `json:"allow_while_pending"`
+	RemainingNodeIDs     map[string]bool   `json:"remaining_node_ids"`
+}
+
 type HASnapshot struct {
 	SnapshotVersion     uint64
 	State               coordruntime.State
-	Pending             map[int]PendingWork
-	LastPolicy          coordinator.ReconfigurationPolicy
+	PendingEpochBySlot  map[int]uint64
+	Heartbeats          map[string]storage.NodeStatus
+	ActivePeerRefresh   map[int]HAActivePeerRefreshState
+	StartupBudgetActive bool
 	UnavailableReplicas map[string]map[int]bool
 	LastRecoveryReports map[string]storage.NodeRecoveryReport
 	Outbox              []OutboxEntry
@@ -67,8 +77,17 @@ type HAStore interface {
 
 func zeroHASnapshot() HASnapshot {
 	return HASnapshot{
-		State:               coordruntime.State{SlotVersions: map[int]uint64{}, CompletedProgressBySlot: map[int][]coordruntime.CompletedProgressRecord{}, NodeLivenessByID: map[string]coordruntime.NodeLivenessRecord{}, AppliedCommands: map[string]coordruntime.AppliedCommand{}},
-		Pending:             map[int]PendingWork{},
+		State: coordruntime.State{
+			SlotVersions:            map[int]uint64{},
+			CompletedProgressBySlot: map[int][]coordruntime.CompletedProgressRecord{},
+			NodeLivenessByID:        map[string]coordruntime.NodeLivenessRecord{},
+			PendingBySlot:           map[int]coordruntime.PendingWork{},
+			Outbox:                  []coordruntime.OutboxEntry{},
+			AppliedCommands:         map[string]coordruntime.AppliedCommand{},
+		},
+		PendingEpochBySlot:  map[int]uint64{},
+		Heartbeats:          map[string]storage.NodeStatus{},
+		ActivePeerRefresh:   map[int]HAActivePeerRefreshState{},
 		UnavailableReplicas: map[string]map[int]bool{},
 		LastRecoveryReports: map[string]storage.NodeRecoveryReport{},
 		Outbox:              []OutboxEntry{},
@@ -86,11 +105,23 @@ func normalizeHASnapshot(snapshot HASnapshot) HASnapshot {
 	if normalized.State.NodeLivenessByID == nil {
 		normalized.State.NodeLivenessByID = map[string]coordruntime.NodeLivenessRecord{}
 	}
+	if normalized.State.PendingBySlot == nil {
+		normalized.State.PendingBySlot = map[int]coordruntime.PendingWork{}
+	}
+	if normalized.State.Outbox == nil {
+		normalized.State.Outbox = []coordruntime.OutboxEntry{}
+	}
 	if normalized.State.AppliedCommands == nil {
 		normalized.State.AppliedCommands = map[string]coordruntime.AppliedCommand{}
 	}
-	if normalized.Pending == nil {
-		normalized.Pending = map[int]PendingWork{}
+	if normalized.PendingEpochBySlot == nil {
+		normalized.PendingEpochBySlot = map[int]uint64{}
+	}
+	if normalized.Heartbeats == nil {
+		normalized.Heartbeats = map[string]storage.NodeStatus{}
+	}
+	if normalized.ActivePeerRefresh == nil {
+		normalized.ActivePeerRefresh = map[int]HAActivePeerRefreshState{}
 	}
 	if normalized.UnavailableReplicas == nil {
 		normalized.UnavailableReplicas = map[string]map[int]bool{}
@@ -117,8 +148,12 @@ func cloneHASnapshot(snapshot HASnapshot) HASnapshot {
 	if snapshot.State.SlotVersions == nil &&
 		snapshot.State.CompletedProgressBySlot == nil &&
 		snapshot.State.NodeLivenessByID == nil &&
+		snapshot.State.PendingBySlot == nil &&
+		snapshot.State.Outbox == nil &&
 		snapshot.State.AppliedCommands == nil &&
-		snapshot.Pending == nil &&
+		snapshot.PendingEpochBySlot == nil &&
+		snapshot.Heartbeats == nil &&
+		snapshot.ActivePeerRefresh == nil &&
 		snapshot.UnavailableReplicas == nil &&
 		snapshot.LastRecoveryReports == nil &&
 		snapshot.Outbox == nil {
@@ -129,15 +164,23 @@ func cloneHASnapshot(snapshot HASnapshot) HASnapshot {
 	cloned := HASnapshot{
 		SnapshotVersion:     snapshot.SnapshotVersion,
 		State:               snapshot.State,
-		Pending:             make(map[int]PendingWork, len(snapshot.Pending)),
-		LastPolicy:          snapshot.LastPolicy,
+		PendingEpochBySlot:  make(map[int]uint64, len(snapshot.PendingEpochBySlot)),
+		Heartbeats:          make(map[string]storage.NodeStatus, len(snapshot.Heartbeats)),
+		ActivePeerRefresh:   make(map[int]HAActivePeerRefreshState, len(snapshot.ActivePeerRefresh)),
+		StartupBudgetActive: snapshot.StartupBudgetActive,
 		UnavailableReplicas: make(map[string]map[int]bool, len(snapshot.UnavailableReplicas)),
 		LastRecoveryReports: make(map[string]storage.NodeRecoveryReport, len(snapshot.LastRecoveryReports)),
 		Outbox:              make([]OutboxEntry, 0, len(snapshot.Outbox)),
 	}
 	cloned.State = coordruntime.OpenInMemoryFromState(snapshot.State).Current()
-	for slot, pending := range snapshot.Pending {
-		cloned.Pending[slot] = pending
+	for slot, epoch := range snapshot.PendingEpochBySlot {
+		cloned.PendingEpochBySlot[slot] = epoch
+	}
+	for nodeID, status := range snapshot.Heartbeats {
+		cloned.Heartbeats[nodeID] = cloneNodeStatus(status)
+	}
+	for slot, state := range snapshot.ActivePeerRefresh {
+		cloned.ActivePeerRefresh[slot] = cloneHAActivePeerRefreshState(state)
 	}
 	for nodeID, slots := range snapshot.UnavailableReplicas {
 		clonedSlots := make(map[int]bool, len(slots))
@@ -187,4 +230,20 @@ func cloneReplicaAssignment(assignment storage.ReplicaAssignment) storage.Replic
 			TailTarget:        assignment.Peers.TailTarget,
 		},
 	}
+}
+
+func cloneHAActivePeerRefreshState(state HAActivePeerRefreshState) HAActivePeerRefreshState {
+	cloned := HAActivePeerRefreshState{
+		FallbackServingChain: cloneCoordinatorChain(state.FallbackServingChain),
+		AssignmentChain:      cloneCoordinatorChain(state.AssignmentChain),
+		UseFallbackRoute:     state.UseFallbackRoute,
+		AllowWhilePending:    state.AllowWhilePending,
+	}
+	if len(state.RemainingNodeIDs) > 0 {
+		cloned.RemainingNodeIDs = make(map[string]bool, len(state.RemainingNodeIDs))
+		for nodeID, remaining := range state.RemainingNodeIDs {
+			cloned.RemainingNodeIDs[nodeID] = remaining
+		}
+	}
+	return cloned
 }

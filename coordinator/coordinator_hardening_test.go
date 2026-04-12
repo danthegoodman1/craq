@@ -533,7 +533,7 @@ func TestPlanReconfigurationJoinUsesDeterministicSlotSelection(t *testing.T) {
 		t.Fatalf("PlanReconfiguration returned error: %v", err)
 	}
 
-	if got, want := changedSlotIDs(plan.ChangedSlots), []int{1, 2}; !reflect.DeepEqual(got, want) {
+	if got, want := changedSlotIDs(plan.ChangedSlots), []int{1, 4}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("changed slots = %v, want %v", got, want)
 	}
 }
@@ -549,6 +549,128 @@ func TestPlanReconfigurationMandatoryRepairIgnoresDisruptionBudget(t *testing.T)
 	}
 	if len(plan.ChangedSlots) == 0 {
 		t.Fatal("expected mandatory repair even with zero disruption budget")
+	}
+}
+
+func TestPlanReconfigurationStartupAppendHonorsChangedChainBudget(t *testing.T) {
+	state := ClusterState{
+		Chains:            emptyChains(8),
+		NodesByID:         map[string]Node{"a": uniqueNode("a"), "b": uniqueNode("b"), "c": uniqueNode("c")},
+		NodeHealthByID:    map[string]NodeHealth{"a": NodeHealthAlive, "b": NodeHealthAlive, "c": NodeHealthAlive},
+		ReadyNodeIDs:      map[string]bool{"a": true, "b": true, "c": true},
+		DrainingNodeIDs:   map[string]bool{},
+		NodeOrder:         []string{"a", "b", "c"},
+		SlotCount:         8,
+		ReplicationFactor: 3,
+	}
+
+	plan, err := PlanReconfiguration(state, nil, ReconfigurationPolicy{MaxChangedChains: 2})
+	if err != nil {
+		t.Fatalf("PlanReconfiguration returned error: %v", err)
+	}
+	if got, want := len(plan.ChangedSlots), 2; got != want {
+		t.Fatalf("changed slot count = %d, want %d", got, want)
+	}
+	for _, slotPlan := range plan.ChangedSlots {
+		if got, want := len(slotPlan.After.Replicas), 1; got != want {
+			t.Fatalf("slot %d replica count after startup append = %d, want %d", slotPlan.Slot, got, want)
+		}
+		if got, want := slotPlan.After.Replicas[0].State, ReplicaStateJoining; got != want {
+			t.Fatalf("slot %d replica state = %q, want %q", slotPlan.Slot, got, want)
+		}
+	}
+}
+
+func TestPlanReconfigurationSecondWaveAppendHonorsChangedChainBudget(t *testing.T) {
+	desired := mustBuildInitialState(t, Config{SlotCount: 8, ReplicationFactor: 3}, uniqueNodes("a", "b", "c"))
+	state := ClusterState{
+		Chains:            make([]Chain, len(desired.Chains)),
+		NodesByID:         map[string]Node{},
+		NodeHealthByID:    map[string]NodeHealth{},
+		ReadyNodeIDs:      map[string]bool{},
+		DrainingNodeIDs:   map[string]bool{},
+		NodeOrder:         append([]string(nil), desired.NodeOrder...),
+		SlotCount:         desired.SlotCount,
+		ReplicationFactor: desired.ReplicationFactor,
+	}
+	for nodeID, node := range desired.NodesByID {
+		state.NodesByID[nodeID] = node
+	}
+	for nodeID, health := range desired.NodeHealthByID {
+		state.NodeHealthByID[nodeID] = health
+	}
+	for nodeID, ready := range desired.ReadyNodeIDs {
+		state.ReadyNodeIDs[nodeID] = ready
+	}
+	for nodeID, draining := range desired.DrainingNodeIDs {
+		state.DrainingNodeIDs[nodeID] = draining
+	}
+	for i, chain := range desired.Chains {
+		state.Chains[i] = Chain{
+			Slot:     chain.Slot,
+			Replicas: append([]Replica(nil), chain.Replicas...),
+		}
+	}
+	for slot := range state.Chains {
+		state.Chains[slot].Replicas = []Replica{state.Chains[slot].Replicas[0]}
+	}
+
+	plan, err := PlanReconfiguration(state, nil, ReconfigurationPolicy{MaxChangedChains: 2})
+	if err != nil {
+		t.Fatalf("PlanReconfiguration returned error: %v", err)
+	}
+	if got, want := len(plan.ChangedSlots), 2; got != want {
+		t.Fatalf("changed slot count = %d, want %d", got, want)
+	}
+	for _, slotPlan := range plan.ChangedSlots {
+		if got, want := len(slotPlan.After.Replicas), 2; got != want {
+			t.Fatalf("slot %d replica count after second-wave append = %d, want %d", slotPlan.Slot, got, want)
+		}
+		if got, want := slotPlan.After.Replicas[1].State, ReplicaStateJoining; got != want {
+			t.Fatalf("slot %d tail replica state = %q, want %q", slotPlan.Slot, got, want)
+		}
+	}
+}
+
+func TestPlanReconfigurationStartupAppendPrioritizesEmptyChainsBeforeDeepening(t *testing.T) {
+	desired := mustBuildInitialState(t, Config{SlotCount: 4, ReplicationFactor: 3}, uniqueNodes("a", "b", "c"))
+	state := ClusterState{
+		Chains:            make([]Chain, len(desired.Chains)),
+		NodesByID:         map[string]Node{},
+		NodeHealthByID:    map[string]NodeHealth{},
+		ReadyNodeIDs:      map[string]bool{},
+		DrainingNodeIDs:   map[string]bool{},
+		NodeOrder:         append([]string(nil), desired.NodeOrder...),
+		SlotCount:         desired.SlotCount,
+		ReplicationFactor: desired.ReplicationFactor,
+	}
+	for nodeID, node := range desired.NodesByID {
+		state.NodesByID[nodeID] = node
+	}
+	for nodeID, health := range desired.NodeHealthByID {
+		state.NodeHealthByID[nodeID] = health
+	}
+	for nodeID, ready := range desired.ReadyNodeIDs {
+		state.ReadyNodeIDs[nodeID] = ready
+	}
+	for nodeID, draining := range desired.DrainingNodeIDs {
+		state.DrainingNodeIDs[nodeID] = draining
+	}
+	for i, chain := range desired.Chains {
+		state.Chains[i] = Chain{
+			Slot:     chain.Slot,
+			Replicas: nil,
+		}
+	}
+	state.Chains[0].Replicas = []Replica{{NodeID: desired.Chains[0].Replicas[0].NodeID, State: ReplicaStateActive}}
+	state.Chains[1].Replicas = []Replica{{NodeID: desired.Chains[1].Replicas[0].NodeID, State: ReplicaStateActive}}
+
+	plan, err := PlanReconfiguration(state, nil, ReconfigurationPolicy{MaxChangedChains: 2})
+	if err != nil {
+		t.Fatalf("PlanReconfiguration returned error: %v", err)
+	}
+	if got, want := changedSlotIDs(plan.ChangedSlots), []int{2, 3}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("changed slots = %v, want %v", got, want)
 	}
 }
 

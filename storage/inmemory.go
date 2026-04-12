@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"sync"
 )
 
 type stagedOperation struct {
@@ -14,12 +15,14 @@ type stagedOperation struct {
 }
 
 type replicaData struct {
-	committed        Snapshot
-	staged           map[uint64]stagedOperation
-	highestCommitted uint64
+	committed                Snapshot
+	staged                   map[uint64]stagedOperation
+	highestCommitted         uint64
+	highestUpstreamConfirmed uint64
 }
 
 type InMemoryBackend struct {
+	mu       sync.RWMutex
 	replicas map[int]*replicaData
 	local    LocalStateStore
 }
@@ -31,10 +34,14 @@ func NewInMemoryBackend() *InMemoryBackend {
 }
 
 func (b *InMemoryBackend) BindLocalStateStore(local LocalStateStore) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.local = local
 }
 
 func (b *InMemoryBackend) CreateReplica(slot int) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if _, exists := b.replicas[slot]; exists {
 		return fmt.Errorf("%w: slot %d", ErrReplicaExists, slot)
 	}
@@ -46,6 +53,8 @@ func (b *InMemoryBackend) CreateReplica(slot int) error {
 }
 
 func (b *InMemoryBackend) DeleteReplica(slot int) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if _, exists := b.replicas[slot]; !exists {
 		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
 	}
@@ -54,6 +63,8 @@ func (b *InMemoryBackend) DeleteReplica(slot int) error {
 }
 
 func (b *InMemoryBackend) Snapshot(slot int) (Snapshot, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return nil, fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -62,6 +73,8 @@ func (b *InMemoryBackend) Snapshot(slot int) (Snapshot, error) {
 }
 
 func (b *InMemoryBackend) InstallSnapshot(slot int, snap Snapshot) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -72,51 +85,88 @@ func (b *InMemoryBackend) InstallSnapshot(slot int, snap Snapshot) error {
 }
 
 func (b *InMemoryBackend) SetHighestCommittedSequence(slot int, sequence uint64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
 	}
 	replica.highestCommitted = sequence
+	replica.highestUpstreamConfirmed = sequence
 	replica.staged = map[uint64]stagedOperation{}
 	return nil
 }
 
 func (b *InMemoryBackend) ApplyCommitted(ctx context.Context, nodeID string, operation WriteOperation, persisted *PersistedReplica) error {
-	replica, exists := b.replicas[operation.Slot]
-	if !exists {
-		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, operation.Slot)
+	upstreamConfirmed := operation.Sequence
+	if persisted != nil {
+		upstreamConfirmed = persisted.HighestUpstreamConfirmedSequence
 	}
-	if operation.Sequence != replica.highestCommitted+1 {
-		return fmt.Errorf(
-			"%w: slot %d expected commit sequence %d, got %d",
-			ErrSequenceMismatch,
-			operation.Slot,
-			replica.highestCommitted+1,
-			operation.Sequence,
-		)
-	}
-	switch operation.Kind {
-	case OperationKindPut:
-		replica.committed[operation.Key] = CommittedObject{
-			Value:    operation.Value,
-			Metadata: cloneObjectMetadata(operation.Metadata),
+	return b.ApplyCommittedBatch(ctx, nodeID, []DurableCommit{{
+		Operation:                 operation,
+		UpstreamConfirmedSequence: upstreamConfirmed,
+	}})
+}
+
+func (b *InMemoryBackend) ApplyCommittedBatch(_ context.Context, _ string, commits []DurableCommit) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, commit := range commits {
+		replica, exists := b.replicas[commit.Operation.Slot]
+		if !exists {
+			return fmt.Errorf("%w: slot %d", ErrUnknownReplica, commit.Operation.Slot)
 		}
-	case OperationKindDelete:
-		delete(replica.committed, operation.Key)
-	default:
-		return fmt.Errorf("%w: unsupported operation kind %q", ErrInvalidConfig, operation.Kind)
-	}
-	delete(replica.staged, operation.Sequence)
-	replica.highestCommitted = operation.Sequence
-	if persisted != nil && b.local != nil {
-		if err := b.local.UpsertReplica(ctx, nodeID, *persisted); err != nil {
-			return fmt.Errorf("err in b.local.UpsertReplica: %w", err)
+		if commit.Operation.Sequence != replica.highestCommitted+1 {
+			return fmt.Errorf(
+				"%w: slot %d expected commit sequence %d, got %d",
+				ErrSequenceMismatch,
+				commit.Operation.Slot,
+				replica.highestCommitted+1,
+				commit.Operation.Sequence,
+			)
 		}
+		switch commit.Operation.Kind {
+		case OperationKindPut:
+			replica.committed[commit.Operation.Key] = CommittedObject{
+				Value:    commit.Operation.Value,
+				Metadata: cloneObjectMetadata(commit.Operation.Metadata),
+			}
+		case OperationKindDelete:
+			delete(replica.committed, commit.Operation.Key)
+		default:
+			return fmt.Errorf("%w: unsupported operation kind %q", ErrInvalidConfig, commit.Operation.Kind)
+		}
+		delete(replica.staged, commit.Operation.Sequence)
+		replica.highestCommitted = commit.Operation.Sequence
+		replica.highestUpstreamConfirmed = commit.UpstreamConfirmedSequence
 	}
 	return nil
 }
 
+func (b *InMemoryBackend) HighestUpstreamConfirmedSequence(slot int) (uint64, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	replica, exists := b.replicas[slot]
+	if !exists {
+		return 0, fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
+	}
+	return replica.highestUpstreamConfirmed, nil
+}
+
+func (b *InMemoryBackend) SetHighestUpstreamConfirmedSequence(slot int, sequence uint64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	replica, exists := b.replicas[slot]
+	if !exists {
+		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
+	}
+	replica.highestUpstreamConfirmed = sequence
+	return nil
+}
+
 func (b *InMemoryBackend) Put(slot int, key string, value string, metadata ObjectMetadata) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -130,6 +180,8 @@ func (b *InMemoryBackend) ReplicaData(slot int) (Snapshot, error) {
 }
 
 func (b *InMemoryBackend) StagePut(slot int, sequence uint64, key string, value string, metadata ObjectMetadata) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -147,6 +199,8 @@ func (b *InMemoryBackend) StagePut(slot int, sequence uint64, key string, value 
 }
 
 func (b *InMemoryBackend) StageDelete(slot int, sequence uint64, key string, metadata ObjectMetadata) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -163,6 +217,8 @@ func (b *InMemoryBackend) StageDelete(slot int, sequence uint64, key string, met
 }
 
 func (b *InMemoryBackend) CommitSequence(slot int, sequence uint64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -193,6 +249,7 @@ func (b *InMemoryBackend) CommitSequence(slot int, sequence uint64) error {
 	}
 	delete(replica.staged, sequence)
 	replica.highestCommitted = sequence
+	replica.highestUpstreamConfirmed = sequence
 	return nil
 }
 
@@ -201,6 +258,8 @@ func (b *InMemoryBackend) CommittedSnapshot(slot int) (Snapshot, error) {
 }
 
 func (b *InMemoryBackend) GetCommitted(slot int, key string) (CommittedObject, bool, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return CommittedObject{}, false, fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -210,6 +269,8 @@ func (b *InMemoryBackend) GetCommitted(slot int, key string) (CommittedObject, b
 }
 
 func (b *InMemoryBackend) HighestCommittedSequence(slot int) (uint64, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return 0, fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -218,6 +279,8 @@ func (b *InMemoryBackend) HighestCommittedSequence(slot int) (uint64, error) {
 }
 
 func (b *InMemoryBackend) StagedSequences(slot int) ([]uint64, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	replica, exists := b.replicas[slot]
 	if !exists {
 		return nil, fmt.Errorf("%w: slot %d", ErrUnknownReplica, slot)
@@ -237,7 +300,8 @@ func (b *InMemoryBackend) Close() error {
 }
 
 type InMemoryCoordinatorClient struct {
-	Registrations    []NodeRegistration
+	mu              sync.Mutex
+	Registrations   []NodeRegistration
 	ReadySlots      []int
 	RemovedSlots    []int
 	RecoveryReports []NodeRecoveryReport
@@ -254,6 +318,8 @@ func NewInMemoryCoordinatorClient() *InMemoryCoordinatorClient {
 }
 
 func (c *InMemoryCoordinatorClient) RegisterNode(_ context.Context, reg NodeRegistration) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.RegisterErr != nil {
 		return c.RegisterErr
 	}
@@ -266,6 +332,8 @@ func (c *InMemoryCoordinatorClient) RegisterNode(_ context.Context, reg NodeRegi
 }
 
 func (c *InMemoryCoordinatorClient) ReportReplicaReady(_ context.Context, slot int, _ uint64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.ReadyErr != nil {
 		return c.ReadyErr
 	}
@@ -274,6 +342,8 @@ func (c *InMemoryCoordinatorClient) ReportReplicaReady(_ context.Context, slot i
 }
 
 func (c *InMemoryCoordinatorClient) ReportReplicaRemoved(_ context.Context, slot int, _ uint64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.RemovedErr != nil {
 		return c.RemovedErr
 	}
@@ -282,6 +352,8 @@ func (c *InMemoryCoordinatorClient) ReportReplicaRemoved(_ context.Context, slot
 }
 
 func (c *InMemoryCoordinatorClient) ReportNodeRecovered(_ context.Context, report NodeRecoveryReport) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.RecoveredErr != nil {
 		return c.RecoveredErr
 	}
@@ -290,6 +362,8 @@ func (c *InMemoryCoordinatorClient) ReportNodeRecovered(_ context.Context, repor
 }
 
 func (c *InMemoryCoordinatorClient) ReportNodeHeartbeat(_ context.Context, status NodeStatus) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.HeartbeatErr != nil {
 		return c.HeartbeatErr
 	}
@@ -298,16 +372,21 @@ func (c *InMemoryCoordinatorClient) ReportNodeHeartbeat(_ context.Context, statu
 }
 
 type InMemoryLocalStateStore struct {
-	nodes map[string]PersistedNodeState
+	mu       sync.RWMutex
+	nodes    map[string]PersistedNodeState
+	journals map[string]*inMemoryCommitJournal
 }
 
 func NewInMemoryLocalStateStore() *InMemoryLocalStateStore {
 	return &InMemoryLocalStateStore{
-		nodes: map[string]PersistedNodeState{},
+		nodes:    map[string]PersistedNodeState{},
+		journals: map[string]*inMemoryCommitJournal{},
 	}
 }
 
 func (s *InMemoryLocalStateStore) LoadNode(_ context.Context, nodeID string) (PersistedNodeState, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	state, ok := s.nodes[nodeID]
 	if !ok {
 		return PersistedNodeState{NodeID: nodeID}, nil
@@ -316,6 +395,8 @@ func (s *InMemoryLocalStateStore) LoadNode(_ context.Context, nodeID string) (Pe
 }
 
 func (s *InMemoryLocalStateStore) UpsertReplica(_ context.Context, nodeID string, replica PersistedReplica) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	state, ok := s.nodes[nodeID]
 	if !ok {
 		state = PersistedNodeState{NodeID: nodeID}
@@ -339,6 +420,8 @@ func (s *InMemoryLocalStateStore) UpsertReplica(_ context.Context, nodeID string
 }
 
 func (s *InMemoryLocalStateStore) DeleteReplica(_ context.Context, nodeID string, slot int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	state, ok := s.nodes[nodeID]
 	if !ok {
 		return nil
@@ -356,6 +439,8 @@ func (s *InMemoryLocalStateStore) DeleteReplica(_ context.Context, nodeID string
 }
 
 func (s *InMemoryLocalStateStore) SetHighestAcceptedCoordinatorEpoch(_ context.Context, nodeID string, epoch uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	state, ok := s.nodes[nodeID]
 	if !ok {
 		state = PersistedNodeState{NodeID: nodeID}
@@ -367,6 +452,22 @@ func (s *InMemoryLocalStateStore) SetHighestAcceptedCoordinatorEpoch(_ context.C
 
 func (s *InMemoryLocalStateStore) Close() error {
 	return nil
+}
+
+func (s *InMemoryLocalStateStore) CommitJournal(nodeID string) (CommitJournalStore, error) {
+	return s.CommitJournalShard(nodeID, 0)
+}
+
+func (s *InMemoryLocalStateStore) CommitJournalShard(nodeID string, shard int) (CommitJournalStore, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := fmt.Sprintf("%s-%02d", nodeID, shard)
+	if journal, ok := s.journals[key]; ok {
+		return journal, nil
+	}
+	journal := newInMemoryCommitJournal()
+	s.journals[key] = journal
+	return journal, nil
 }
 
 type InMemoryReplicationTransport struct {
@@ -389,17 +490,30 @@ func (t *InMemoryReplicationTransport) RegisterNode(nodeID string, node replicat
 	t.nodes[nodeID] = node
 }
 
-func (t *InMemoryReplicationTransport) FetchSnapshot(_ context.Context, fromNodeID string, slot int) (Snapshot, error) {
+func (t *InMemoryReplicationTransport) FetchSnapshot(_ context.Context, fromNodeID string, slot int) (Snapshot, uint64, error) {
+	if node, ok := t.nodes[fromNodeID]; ok {
+		if snapshotNode, ok := node.(replicationSnapshotHandler); ok {
+			snapshot, sequence, err := snapshotNode.CommittedSnapshotWithSequence(slot)
+			if err != nil {
+				return nil, 0, fmt.Errorf("err in node.CommittedSnapshotWithSequence: %w", err)
+			}
+			return snapshot, sequence, nil
+		}
+	}
 	backend, ok := t.backends[fromNodeID]
 	if !ok {
-		return nil, fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, fromNodeID)
+		return nil, 0, fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, fromNodeID)
 	}
 
 	snapshot, err := backend.Snapshot(slot)
 	if err != nil {
-		return nil, fmt.Errorf("err in backend.Snapshot: %w", err)
+		return nil, 0, fmt.Errorf("err in backend.Snapshot: %w", err)
 	}
-	return cloneSnapshot(snapshot), nil
+	sequence, err := backend.HighestCommittedSequence(slot)
+	if err != nil {
+		return nil, 0, fmt.Errorf("err in backend.HighestCommittedSequence: %w", err)
+	}
+	return cloneSnapshot(snapshot), sequence, nil
 }
 
 func (t *InMemoryReplicationTransport) ForwardWrite(ctx context.Context, toNodeID string, req ForwardWriteRequest) error {
@@ -414,6 +528,15 @@ func (t *InMemoryReplicationTransport) ForwardWrite(ctx context.Context, toNodeI
 }
 
 func (t *InMemoryReplicationTransport) FetchCommittedSequence(_ context.Context, fromNodeID string, slot int) (uint64, error) {
+	if node, ok := t.nodes[fromNodeID]; ok {
+		if snapshotNode, ok := node.(replicationSnapshotHandler); ok {
+			sequence, err := snapshotNode.HighestCommittedSequence(slot)
+			if err != nil {
+				return 0, fmt.Errorf("err in node.HighestCommittedSequence: %w", err)
+			}
+			return sequence, nil
+		}
+	}
 	backend, ok := t.backends[fromNodeID]
 	if !ok {
 		return 0, fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, fromNodeID)
@@ -442,6 +565,12 @@ type replicationHandler interface {
 	HandleCommitWrite(ctx context.Context, req CommitWriteRequest) error
 }
 
+type replicationSnapshotHandler interface {
+	replicationHandler
+	CommittedSnapshotWithSequence(slot int) (Snapshot, uint64, error)
+	HighestCommittedSequence(slot int) (uint64, error)
+}
+
 type QueuedReplicationMessage struct {
 	ToNodeID string
 	Forward  *ForwardWriteRequest
@@ -449,6 +578,7 @@ type QueuedReplicationMessage struct {
 }
 
 type QueuedInMemoryReplicationTransport struct {
+	mu                  sync.Mutex
 	backends            map[string]Backend
 	nodes               map[string]replicationHandler
 	queue               []QueuedReplicationMessage
@@ -468,44 +598,88 @@ func NewQueuedInMemoryReplicationTransport() *QueuedInMemoryReplicationTransport
 }
 
 func (t *QueuedInMemoryReplicationTransport) Register(nodeID string, backend Backend) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.backends[nodeID] = backend
 }
 
 func (t *QueuedInMemoryReplicationTransport) RegisterNode(nodeID string, node replicationHandler) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.nodes[nodeID] = node
 }
 
-func (t *QueuedInMemoryReplicationTransport) FetchSnapshot(ctx context.Context, fromNodeID string, slot int) (Snapshot, error) {
-	if t.beforeFetchSnapshot != nil {
-		t.beforeFetchSnapshot(fromNodeID, slot)
+func (t *QueuedInMemoryReplicationTransport) FetchSnapshot(ctx context.Context, fromNodeID string, slot int) (Snapshot, uint64, error) {
+	t.mu.Lock()
+	hook := t.beforeFetchSnapshot
+	blockSnapshot := t.blockSnapshot
+	backend, ok := t.backends[fromNodeID]
+	node := t.nodes[fromNodeID]
+	t.mu.Unlock()
+	if hook != nil {
+		hook(fromNodeID, slot)
 	}
-	if t.blockSnapshot != nil {
+	if blockSnapshot != nil {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-t.blockSnapshot:
+			return nil, 0, ctx.Err()
+		case <-blockSnapshot:
 		}
 	}
-	inline := InMemoryReplicationTransport{backends: t.backends}
-	return inline.FetchSnapshot(ctx, fromNodeID, slot)
+	if snapshotNode, ok := node.(replicationSnapshotHandler); ok {
+		snapshot, sequence, err := snapshotNode.CommittedSnapshotWithSequence(slot)
+		if err != nil {
+			return nil, 0, fmt.Errorf("err in node.CommittedSnapshotWithSequence: %w", err)
+		}
+		return snapshot, sequence, nil
+	}
+	if !ok {
+		return nil, 0, fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, fromNodeID)
+	}
+	snap, err := backend.Snapshot(slot)
+	if err != nil {
+		return nil, 0, fmt.Errorf("err in backend.Snapshot: %w", err)
+	}
+	sequence, err := backend.HighestCommittedSequence(slot)
+	if err != nil {
+		return nil, 0, fmt.Errorf("err in backend.HighestCommittedSequence: %w", err)
+	}
+	return cloneSnapshot(snap), sequence, nil
 }
 
 func (t *QueuedInMemoryReplicationTransport) FetchCommittedSequence(ctx context.Context, fromNodeID string, slot int) (uint64, error) {
-	if t.beforeFetchSequence != nil {
-		t.beforeFetchSequence(fromNodeID, slot)
+	t.mu.Lock()
+	hook := t.beforeFetchSequence
+	blockSequence := t.blockSequence
+	backend, ok := t.backends[fromNodeID]
+	node := t.nodes[fromNodeID]
+	t.mu.Unlock()
+	if hook != nil {
+		hook(fromNodeID, slot)
 	}
-	if t.blockSequence != nil {
+	if blockSequence != nil {
 		select {
 		case <-ctx.Done():
 			return 0, ctx.Err()
-		case <-t.blockSequence:
+		case <-blockSequence:
 		}
 	}
-	inline := InMemoryReplicationTransport{backends: t.backends}
-	return inline.FetchCommittedSequence(ctx, fromNodeID, slot)
+	if snapshotNode, ok := node.(replicationSnapshotHandler); ok {
+		sequence, err := snapshotNode.HighestCommittedSequence(slot)
+		if err != nil {
+			return 0, fmt.Errorf("err in node.HighestCommittedSequence: %w", err)
+		}
+		return sequence, nil
+	}
+	if !ok {
+		return 0, fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, fromNodeID)
+	}
+	return backend.HighestCommittedSequence(slot)
 }
 
 func (t *QueuedInMemoryReplicationTransport) ForwardWrite(_ context.Context, toNodeID string, req ForwardWriteRequest) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if _, ok := t.nodes[toNodeID]; !ok {
 		return fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, toNodeID)
 	}
@@ -523,6 +697,8 @@ func (t *QueuedInMemoryReplicationTransport) ForwardWrite(_ context.Context, toN
 }
 
 func (t *QueuedInMemoryReplicationTransport) CommitWrite(_ context.Context, toNodeID string, req CommitWriteRequest) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if _, ok := t.nodes[toNodeID]; !ok {
 		return fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, toNodeID)
 	}
@@ -556,10 +732,14 @@ func (t *QueuedInMemoryReplicationTransport) AwaitWriteCommit(ctx context.Contex
 }
 
 func (t *QueuedInMemoryReplicationTransport) Pending() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	return len(t.queue)
 }
 
 func (t *QueuedInMemoryReplicationTransport) PendingMessages() []QueuedReplicationMessage {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	cloned := make([]QueuedReplicationMessage, 0, len(t.queue))
 	for _, msg := range t.queue {
 		cloned = append(cloned, cloneQueuedReplicationMessage(msg))
@@ -568,10 +748,14 @@ func (t *QueuedInMemoryReplicationTransport) PendingMessages() []QueuedReplicati
 }
 
 func (t *QueuedInMemoryReplicationTransport) DropNext() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.dropNextWrite = true
 }
 
 func (t *QueuedInMemoryReplicationTransport) DropAt(index int) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if index < 0 || index >= len(t.queue) {
 		return fmt.Errorf("%w: queued message index %d", ErrStateMismatch, index)
 	}
@@ -580,6 +764,8 @@ func (t *QueuedInMemoryReplicationTransport) DropAt(index int) error {
 }
 
 func (t *QueuedInMemoryReplicationTransport) DuplicateAt(index int) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if index < 0 || index >= len(t.queue) {
 		return fmt.Errorf("%w: queued message index %d", ErrStateMismatch, index)
 	}
@@ -592,6 +778,8 @@ func (t *QueuedInMemoryReplicationTransport) MoveToFront(index int) error {
 }
 
 func (t *QueuedInMemoryReplicationTransport) MoveTo(index int, destination int) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if index < 0 || index >= len(t.queue) {
 		return fmt.Errorf("%w: queued message index %d", ErrStateMismatch, index)
 	}
@@ -614,22 +802,32 @@ func (t *QueuedInMemoryReplicationTransport) MoveTo(index int, destination int) 
 }
 
 func (t *QueuedInMemoryReplicationTransport) SetBeforeDeliver(hook func(QueuedReplicationMessage)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.beforeDeliver = hook
 }
 
 func (t *QueuedInMemoryReplicationTransport) SetBeforeFetchSnapshot(hook func(fromNodeID string, slot int)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.beforeFetchSnapshot = hook
 }
 
 func (t *QueuedInMemoryReplicationTransport) SetBeforeFetchCommittedSequence(hook func(fromNodeID string, slot int)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.beforeFetchSequence = hook
 }
 
 func (t *QueuedInMemoryReplicationTransport) BlockFetchSnapshot(ch <-chan struct{}) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.blockSnapshot = ch
 }
 
 func (t *QueuedInMemoryReplicationTransport) BlockFetchCommittedSequence(ch <-chan struct{}) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.blockSequence = ch
 }
 
@@ -638,18 +836,23 @@ func (t *QueuedInMemoryReplicationTransport) DeliverNext(ctx context.Context) er
 }
 
 func (t *QueuedInMemoryReplicationTransport) DeliverAt(ctx context.Context, index int) error {
+	t.mu.Lock()
 	if len(t.queue) == 0 {
+		t.mu.Unlock()
 		return nil
 	}
 	if index < 0 || index >= len(t.queue) {
+		t.mu.Unlock()
 		return fmt.Errorf("%w: queued message index %d", ErrStateMismatch, index)
 	}
 	msg := t.queue[index]
 	t.queue = append(t.queue[:index], t.queue[index+1:]...)
-	if t.beforeDeliver != nil {
-		t.beforeDeliver(msg)
-	}
+	hook := t.beforeDeliver
 	node, ok := t.nodes[msg.ToNodeID]
+	t.mu.Unlock()
+	if hook != nil {
+		hook(msg)
+	}
 	if !ok {
 		return fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, msg.ToNodeID)
 	}
@@ -677,10 +880,11 @@ func (t *QueuedInMemoryReplicationTransport) DeliverAll(ctx context.Context) err
 
 func clonePersistedReplica(replica PersistedReplica) PersistedReplica {
 	return PersistedReplica{
-		Assignment:               cloneAssignment(replica.Assignment),
-		LastKnownState:           replica.LastKnownState,
-		HighestCommittedSequence: replica.HighestCommittedSequence,
-		HasCommittedData:         replica.HasCommittedData,
+		Assignment:                       cloneAssignment(replica.Assignment),
+		LastKnownState:                   replica.LastKnownState,
+		HighestCommittedSequence:         replica.HighestCommittedSequence,
+		HighestUpstreamConfirmedSequence: replica.HighestUpstreamConfirmedSequence,
+		HasCommittedData:                 replica.HasCommittedData,
 	}
 }
 

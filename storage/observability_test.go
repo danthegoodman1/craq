@@ -1,178 +1,149 @@
 package storage
 
 import (
-	"bytes"
 	"context"
-	"errors"
-	"strings"
+	"reflect"
 	"testing"
-	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	dto "github.com/prometheus/client_model/go"
-	"github.com/rs/zerolog"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
-func TestNodeObservabilityRecordsAmbiguousWriteAndBackpressure(t *testing.T) {
+func TestPublishedResourceUsageAndNodeStatusStayAccurate(t *testing.T) {
 	ctx := context.Background()
-	var logBuf bytes.Buffer
-	logger := zerolog.New(&logBuf)
-	headRegistry := prometheus.NewRegistry()
-	tailRegistry := prometheus.NewRegistry()
+	node, err := NewNode(
+		ctx,
+		Config{NodeID: "node-a"},
+		NewInMemoryBackend(),
+		NewInMemoryCoordinatorClient(),
+		NewInMemoryReplicationTransport(),
+	)
+	if err != nil {
+		t.Fatalf("NewNode returned error: %v", err)
+	}
+	t.Cleanup(func() { _ = node.Close() })
 
-	repl := NewQueuedInMemoryReplicationTransport()
-	headBackend := NewInMemoryBackend()
-	head := mustNewNode(t, ctx, Config{
-		NodeID:             "head",
-		WriteCommitTimeout: 2 * time.Millisecond,
-		Logger:             &logger,
-		MetricsRegistry:    headRegistry,
-	}, headBackend, NewInMemoryCoordinatorClient(), repl)
-	tailBackend := NewInMemoryBackend()
-	tail := mustNewNode(t, ctx, Config{
-		NodeID:                            "tail",
-		MaxBufferedReplicaMessagesPerSlot: 1,
-		Logger:                            &logger,
-		MetricsRegistry:                   tailRegistry,
-	}, tailBackend, NewInMemoryCoordinatorClient(), repl)
-	repl.Register("head", headBackend)
-	repl.Register("tail", tailBackend)
-	repl.RegisterNode("head", head)
-	repl.RegisterNode("tail", tail)
-
-	if err := head.AddReplicaAsTail(ctx, AddReplicaAsTailCommand{
-		Assignment: ReplicaAssignment{
-			Slot:         1,
-			ChainVersion: 1,
-			Role:         ReplicaRoleHead,
-			Peers:        ChainPeers{SuccessorNodeID: "tail"},
+	mustActivateReplicaForObservability(t, node, ReplicaAssignment{
+		Slot:         1,
+		ChainVersion: 1,
+		Role:         ReplicaRoleSingle,
+		Peers: ChainPeers{
+			TailNodeID: "node-a",
+			TailTarget: "node-a",
 		},
-	}); err != nil {
-		t.Fatalf("head AddReplicaAsTail returned error: %v", err)
-	}
-	if err := head.ActivateReplica(ctx, ActivateReplicaCommand{Slot: 1}); err != nil {
-		t.Fatalf("head ActivateReplica returned error: %v", err)
-	}
-	if err := tail.AddReplicaAsTail(ctx, AddReplicaAsTailCommand{
+	})
+	if err := node.AddReplicaAsTail(ctx, AddReplicaAsTailCommand{
 		Assignment: ReplicaAssignment{
-			Slot:         1,
+			Slot:         2,
 			ChainVersion: 1,
 			Role:         ReplicaRoleTail,
-			Peers:        ChainPeers{PredecessorNodeID: "head"},
 		},
 	}); err != nil {
-		t.Fatalf("tail AddReplicaAsTail returned error: %v", err)
+		t.Fatalf("AddReplicaAsTail(slot 2) returned error: %v", err)
 	}
-	if err := tail.ActivateReplica(ctx, ActivateReplicaCommand{Slot: 1}); err != nil {
-		t.Fatalf("tail ActivateReplica returned error: %v", err)
-	}
-	head.repl = &blockingWriteTransport{}
-
-	_, err := head.HandleClientPut(ctx, ClientPutRequest{
-		Slot:                 1,
-		Key:                  "alpha",
-		Value:                "one",
-		ExpectedChainVersion: 1,
-	})
-	if err == nil || !errors.Is(err, ErrAmbiguousWrite) {
-		t.Fatalf("HandleClientPut error = %v, want ambiguous write", err)
-	}
-
-	err = tail.HandleForwardWrite(ctx, ForwardWriteRequest{
-		Operation: WriteOperation{
-			Slot:     1,
-			Sequence: 2,
-			Kind:     OperationKindPut,
-			Key:      "beta",
-			Value:    "two",
-			Metadata: testObjectMetadata(2),
+	mustActivateReplicaForObservability(t, node, ReplicaAssignment{
+		Slot:         3,
+		ChainVersion: 1,
+		Role:         ReplicaRoleSingle,
+		Peers: ChainPeers{
+			TailNodeID: "node-a",
+			TailTarget: "node-a",
 		},
-		FromNodeID: "head",
 	})
-	if err != nil {
-		t.Fatalf("first future HandleForwardWrite returned error: %v", err)
+	if err := node.MarkReplicaLeaving(ctx, MarkReplicaLeavingCommand{Slot: 3}); err != nil {
+		t.Fatalf("MarkReplicaLeaving returned error: %v", err)
 	}
-	err = tail.HandleForwardWrite(ctx, ForwardWriteRequest{
-		Operation: WriteOperation{
-			Slot:     1,
-			Sequence: 3,
-			Kind:     OperationKindPut,
-			Key:      "gamma",
-			Value:    "three",
-			Metadata: testObjectMetadata(3),
-		},
-		FromNodeID: "head",
+
+	mustMutateSlotRecord(t, node, 1, func(record replicaRecord) replicaRecord {
+		record.inFlightClientWrites = 2
+		record.bufferedForwards[11] = ForwardWriteRequest{
+			Operation: WriteOperation{Slot: 1, Sequence: 11, Kind: OperationKindPut, Key: "a", Value: "1"},
+		}
+		record.bufferedCommits[11] = CommitWriteRequest{Slot: 1, Sequence: 11}
+		record.dirtyByKey["a"] = []dirtyReadEntry{{
+			Sequence: 11,
+			Operation: WriteOperation{
+				Slot:     1,
+				Sequence: 11,
+				Kind:     OperationKindPut,
+				Key:      "a",
+				Value:    "1",
+			},
+		}}
+		return record
 	})
-	var pressure *BackpressureError
-	if !errors.As(err, &pressure) || !errors.Is(err, ErrReplicaBackpressure) {
-		t.Fatalf("second future HandleForwardWrite error = %v, want replica backpressure", err)
+	mustMutateSlotRecord(t, node, 2, func(record replicaRecord) replicaRecord {
+		record.bufferedForwards[21] = ForwardWriteRequest{
+			Operation: WriteOperation{Slot: 2, Sequence: 21, Kind: OperationKindPut, Key: "b", Value: "2"},
+		}
+		return record
+	})
+	node.mu.Lock()
+	node.inFlightClientWrites = 2
+	node.inFlightCatchups = 1
+	node.mu.Unlock()
+	node.refreshMetricGauges()
+
+	usage := node.ResourceUsage()
+	if got, want := usage.InFlightClientWritesPerNode, 2; got != want {
+		t.Fatalf("InFlightClientWritesPerNode = %d, want %d", got, want)
+	}
+	if got, want := usage.BufferedReplicaMessagesPerNode, 3; got != want {
+		t.Fatalf("BufferedReplicaMessagesPerNode = %d, want %d", got, want)
+	}
+	if got, want := usage.ActiveCatchups, 1; got != want {
+		t.Fatalf("ActiveCatchups = %d, want %d", got, want)
+	}
+	if got, want := usage.InFlightClientWritesPerSlot[1], 2; got != want {
+		t.Fatalf("InFlightClientWritesPerSlot[1] = %d, want %d", got, want)
+	}
+	if got, want := usage.BufferedReplicaMessagesPerSlot[1], 2; got != want {
+		t.Fatalf("BufferedReplicaMessagesPerSlot[1] = %d, want %d", got, want)
+	}
+	if got, want := usage.BufferedReplicaMessagesPerSlot[2], 1; got != want {
+		t.Fatalf("BufferedReplicaMessagesPerSlot[2] = %d, want %d", got, want)
+	}
+	if got, want := usage.DirtyKeysPerSlot[1], 1; got != want {
+		t.Fatalf("DirtyKeysPerSlot[1] = %d, want %d", got, want)
+	}
+	if got, want := node.CatchingUpSlots(), []int{2}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("CatchingUpSlots() = %v, want %v", got, want)
+	}
+	if got, want := node.LeavingSlots(), []int{3}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("LeavingSlots() = %v, want %v", got, want)
 	}
 
-	if got := metricCounterValue(t, headRegistry, "craq_storage_ambiguous_writes_total"); got != 1 {
-		t.Fatalf("ambiguous writes total = %v, want 1", got)
+	status := node.snapshotNodeStatus()
+	if got, want := status.ReplicaCount, 3; got != want {
+		t.Fatalf("ReplicaCount = %d, want %d", got, want)
 	}
-	if got := metricCounterValueWithLabels(t, tailRegistry, "craq_storage_backpressure_rejections_total", map[string]string{"resource": "replica_buffer"}); got != 1 {
-		t.Fatalf("replica backpressure total = %v, want 1", got)
+	if got, want := status.ActiveCount, 1; got != want {
+		t.Fatalf("ActiveCount = %d, want %d", got, want)
 	}
-	if got := metricCounterValueWithLabels(t, headRegistry, "craq_storage_client_writes_total", map[string]string{"kind": "put", "result": "ambiguous"}); got != 1 {
-		t.Fatalf("ambiguous put counter = %v, want 1", got)
+	if got, want := status.CatchingUpCount, 1; got != want {
+		t.Fatalf("CatchingUpCount = %d, want %d", got, want)
 	}
-	if !strings.Contains(logBuf.String(), "ambiguous_write") {
-		t.Fatalf("logs = %q, want ambiguous_write entry", logBuf.String())
+	if got, want := status.LeavingCount, 1; got != want {
+		t.Fatalf("LeavingCount = %d, want %d", got, want)
 	}
-	if !strings.Contains(logBuf.String(), "backpressure_rejected") {
-		t.Fatalf("logs = %q, want backpressure_rejected entry", logBuf.String())
+
+	if got, want := testutil.ToFloat64(node.metrics.inFlightWrites), float64(2); got != want {
+		t.Fatalf("inFlightWrites gauge = %v, want %v", got, want)
 	}
-	if len(head.RecentEvents()) == 0 {
-		t.Fatal("head recent events unexpectedly empty")
+	if got, want := testutil.ToFloat64(node.metrics.bufferedReplicaMsgs), float64(3); got != want {
+		t.Fatalf("bufferedReplicaMsgs gauge = %v, want %v", got, want)
 	}
-	if len(tail.RecentEvents()) == 0 {
-		t.Fatal("tail recent events unexpectedly empty")
+	if got, want := testutil.ToFloat64(node.metrics.catchups), float64(1); got != want {
+		t.Fatalf("catchups gauge = %v, want %v", got, want)
 	}
 }
 
-func metricCounterValue(t *testing.T, registry *prometheus.Registry, name string) float64 {
+func mustActivateReplicaForObservability(t *testing.T, node *Node, assignment ReplicaAssignment) {
 	t.Helper()
-	return metricCounterValueWithLabels(t, registry, name, nil)
-}
-
-func metricCounterValueWithLabels(t *testing.T, registry *prometheus.Registry, name string, labels map[string]string) float64 {
-	t.Helper()
-	families, err := registry.Gather()
-	if err != nil {
-		t.Fatalf("registry.Gather returned error: %v", err)
+	ctx := context.Background()
+	if err := node.AddReplicaAsTail(ctx, AddReplicaAsTailCommand{Assignment: assignment}); err != nil {
+		t.Fatalf("AddReplicaAsTail returned error: %v", err)
 	}
-	for _, family := range families {
-		if family.GetName() != name {
-			continue
-		}
-		for _, metric := range family.GetMetric() {
-			if metricLabelsMatch(metric, labels) {
-				if metric.Counter != nil {
-					return metric.Counter.GetValue()
-				}
-				if metric.Gauge != nil {
-					return metric.Gauge.GetValue()
-				}
-			}
-		}
+	if err := node.ActivateReplica(ctx, ActivateReplicaCommand{Slot: assignment.Slot}); err != nil {
+		t.Fatalf("ActivateReplica returned error: %v", err)
 	}
-	t.Fatalf("metric %q with labels %v not found", name, labels)
-	return 0
-}
-
-func metricLabelsMatch(metric *dto.Metric, labels map[string]string) bool {
-	if len(labels) == 0 {
-		return true
-	}
-	got := map[string]string{}
-	for _, label := range metric.GetLabel() {
-		got[label.GetName()] = label.GetValue()
-	}
-	for key, want := range labels {
-		if got[key] != want {
-			return false
-		}
-	}
-	return true
 }

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/danthegoodman1/craq/coordinator"
 	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
@@ -49,12 +50,20 @@ func (p *ConnPool) DialContext(ctx context.Context, target string) (*grpc.Client
 	}
 	p.mu.Unlock()
 
+	// Apply a default dial timeout if the caller didn't set a deadline.
+	dialCtx := ctx
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		dialCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+	}
+
 	dialer := func(ctx context.Context, address string) (net.Conn, error) {
 		var d net.Dialer
 		return d.DialContext(ctx, "tcp", address)
 	}
 	conn, err := grpc.DialContext(
-		ctx,
+		dialCtx,
 		target,
 		p.creds,
 		grpc.WithContextDialer(dialer),
@@ -74,6 +83,15 @@ func (p *ConnPool) DialContext(ctx context.Context, target string) (*grpc.Client
 	}
 	p.conns[target] = conn
 	return conn, nil
+}
+
+func (p *ConnPool) Remove(target string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if conn, ok := p.conns[target]; ok {
+		_ = conn.Close()
+		delete(p.conns, target)
+	}
 }
 
 func (p *ConnPool) Close() error {
@@ -486,7 +504,7 @@ func shouldFailoverCoordinator(err error) bool {
 	if errors.As(err, &authErr) {
 		return false
 	}
-	return true
+	return false
 }
 
 type DynamicNodeClientFactory struct {
@@ -508,24 +526,43 @@ func (f *DynamicNodeClientFactory) ClientForNode(node coordinator.Node) (coordse
 }
 
 type ReplicationTransport struct {
-	pool *ConnPool
+	pool     *ConnPool
+	mu       sync.Mutex
+	sessions map[string]*replicationPeerSession
+	nextID   uint64
+	observer storage.ReplicationTransportObserver
 }
 
 func NewReplicationTransport(pool *ConnPool) *ReplicationTransport {
 	if pool == nil {
 		pool = NewConnPool()
 	}
-	return &ReplicationTransport{pool: pool}
+	return &ReplicationTransport{
+		pool:     pool,
+		sessions: map[string]*replicationPeerSession{},
+	}
 }
 
-func (t *ReplicationTransport) FetchSnapshot(ctx context.Context, fromTarget string, slot int) (storage.Snapshot, error) {
+func (t *ReplicationTransport) SetReplicationTransportObserver(observer storage.ReplicationTransportObserver) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.observer = observer
+}
+
+func (t *ReplicationTransport) currentObserver() storage.ReplicationTransportObserver {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.observer
+}
+
+func (t *ReplicationTransport) FetchSnapshot(ctx context.Context, fromTarget string, slot int) (storage.Snapshot, uint64, error) {
 	conn, err := t.pool.DialContext(ctx, fromTarget)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	stream, err := grpcproto.NewStorageServiceClient(conn).FetchSnapshot(ctx, &grpcproto.FetchSnapshotRequest{Slot: int32(slot)})
 	if err != nil {
-		return nil, decodeError(err)
+		return nil, 0, decodeError(err)
 	}
 	var entries []*grpcproto.SnapshotEntry
 	for {
@@ -534,11 +571,20 @@ func (t *ReplicationTransport) FetchSnapshot(ctx context.Context, fromTarget str
 			break
 		}
 		if err != nil {
-			return nil, decodeError(err)
+			return nil, 0, decodeError(err)
 		}
 		entries = append(entries, entry)
 	}
-	return snapshotFromProtoEntries(entries)
+	snapshot, err := snapshotFromProtoEntries(entries)
+	if err != nil {
+		return nil, 0, err
+	}
+	trailer := stream.Trailer()
+	var committedSequence uint64
+	if values := trailer.Get("x-craq-committed-sequence"); len(values) > 0 {
+		fmt.Sscanf(values[0], "%d", &committedSequence)
+	}
+	return snapshot, committedSequence, nil
 }
 
 func (t *ReplicationTransport) FetchCommittedSequence(ctx context.Context, fromTarget string, slot int) (uint64, error) {
@@ -554,35 +600,11 @@ func (t *ReplicationTransport) FetchCommittedSequence(ctx context.Context, fromT
 }
 
 func (t *ReplicationTransport) ForwardWrite(ctx context.Context, toTarget string, req storage.ForwardWriteRequest) error {
-	conn, err := t.pool.DialContext(ctx, toTarget)
-	if err != nil {
-		return err
-	}
-	_, err = grpcproto.NewStorageServiceClient(conn).ForwardWrite(ctx, &grpcproto.ForwardWriteRequest{
-		Operation: &grpcproto.WriteOperation{
-			Slot:     int32(req.Operation.Slot),
-			Sequence: req.Operation.Sequence,
-			Kind:     string(req.Operation.Kind),
-			Key:      req.Operation.Key,
-			Value:    req.Operation.Value,
-			Metadata: protoObjectMetadata(&req.Operation.Metadata),
-		},
-		FromNodeId: req.FromNodeID,
-	})
-	return decodeError(err)
+	return t.submitReplicationRequest(ctx, toTarget, replicationForwardPayload{req: req})
 }
 
 func (t *ReplicationTransport) CommitWrite(ctx context.Context, toTarget string, req storage.CommitWriteRequest) error {
-	conn, err := t.pool.DialContext(ctx, toTarget)
-	if err != nil {
-		return err
-	}
-	_, err = grpcproto.NewStorageServiceClient(conn).CommitWrite(ctx, &grpcproto.CommitWriteRequest{
-		Slot:       int32(req.Slot),
-		Sequence:   req.Sequence,
-		FromNodeId: req.FromNodeID,
-	})
-	return decodeError(err)
+	return t.submitReplicationRequest(ctx, toTarget, replicationCommitPayload{req: req})
 }
 
 type ClientTransport struct {

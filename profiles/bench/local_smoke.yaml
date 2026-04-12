@@ -1,0 +1,44 @@
+name: local-smoke
+gcp:
+  project: CHANGEME_LOCAL_ONLY_PROFILE_DO_NOT_RUN
+  region: us-central1
+  operator_cidrs:
+    - 0.0.0.0/0
+  ssh_user: ubuntu
+  coordinator_machine_type: c4a-standard-8
+  client_machine_type: c4a-standard-16
+  storage_machine_type: c4a-standard-48-lssd
+  coordinator_boot_disk_gib: 100
+cluster:
+  slot_count: 256
+  replication_factor: 3
+  storage_node_count: 3
+  heartbeat_interval: 1s
+  liveness_interval: 1s
+  suspect_after: 3s
+  dead_after: 6s
+  activation_interval: 250ms
+  rpc_deadline: 5s
+  reconfiguration:
+    max_changed_chains: 32
+workload:
+  seed: 42
+  preload_keys: 32
+  value_bytes: 128
+  request_timeout: 3s
+  per_scenario_pause: 1s
+  interval: 500ms
+  scenarios:
+    - name: smoke-mixed
+      kind: mixed
+      concurrency: 8
+      warmup: 1s
+      duration: 2s
+      read_percent: 80
+      value_bytes: 128
+telemetry:
+  probe_interval: 1s
+  command_interval: 1s
+  extra_run_duration: 5s
+artifacts:
+  root_dir: artifacts/benchmarks

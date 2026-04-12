@@ -123,7 +123,7 @@ func runCoordinator(args []string) error {
 
 	adminClient := grpcx.NewCoordinatorAdminClient(cfg.Coordinator.RPCAddress, pool)
 	go runTicker(ctx, quickstartLivenessInterval, func() {
-		evalCtx, cancel := context.WithTimeout(context.Background(), quickstartRPCDeadline)
+		evalCtx, cancel := context.WithTimeout(ctx, quickstartRPCDeadline)
 		defer cancel()
 		_ = adminClient.EvaluateLiveness(evalCtx)
 	})
@@ -196,7 +196,7 @@ func runStorage(args []string) error {
 
 	registered := false
 	go runTicker(ctx, quickstartHeartbeatInterval, func() {
-		hbCtx, cancel := context.WithTimeout(context.Background(), quickstartRPCDeadline)
+		hbCtx, cancel := context.WithTimeout(ctx, quickstartRPCDeadline)
 		defer cancel()
 		if !registered {
 			if err := node.Register(hbCtx); err != nil {
@@ -207,7 +207,7 @@ func runStorage(args []string) error {
 		_ = reporter.ReportNodeHeartbeat(hbCtx, nodeStatusFromState(node.State()))
 	})
 	go runTicker(ctx, quickstartActivationLoop, func() {
-		actCtx, cancel := context.WithTimeout(context.Background(), quickstartRPCDeadline)
+		actCtx, cancel := context.WithTimeout(ctx, quickstartRPCDeadline)
 		defer cancel()
 		activateCatchingUpReplicas(actCtx, node)
 	})
@@ -252,13 +252,13 @@ func runCLI(args []string) error {
 }
 
 func runGet(cfg quickstart.Config, key string, timeout time.Duration) error {
-	router, pool, err := newQuickstartRouter(cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	router, pool, err := newQuickstartRouter(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = pool.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
 
 	result, err := router.Get(ctx, key)
 	if err != nil {
@@ -273,13 +273,13 @@ func runGet(cfg quickstart.Config, key string, timeout time.Duration) error {
 }
 
 func runSet(cfg quickstart.Config, key string, value string, timeout time.Duration) error {
-	router, pool, err := newQuickstartRouter(cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	router, pool, err := newQuickstartRouter(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = pool.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
 
 	result, err := router.Put(ctx, key, value)
 	if err != nil {
@@ -299,13 +299,13 @@ func runSet(cfg quickstart.Config, key string, value string, timeout time.Durati
 }
 
 func runDel(cfg quickstart.Config, key string, timeout time.Duration) error {
-	router, pool, err := newQuickstartRouter(cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	router, pool, err := newQuickstartRouter(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = pool.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
 
 	result, err := router.Delete(ctx, key)
 	if err != nil {
@@ -366,7 +366,7 @@ func printMetadata(metadata *storage.ObjectMetadata) {
 	fmt.Printf("metadata.updated_at=%s\n", metadata.UpdatedAt.UTC().Format(time.RFC3339Nano))
 }
 
-func newQuickstartRouter(cfg quickstart.Config) (*client.Router, *grpcx.ConnPool, error) {
+func newQuickstartRouter(ctx context.Context, cfg quickstart.Config) (*client.Router, *grpcx.ConnPool, error) {
 	pool := grpcx.NewConnPool()
 	admin := grpcx.NewCoordinatorAdminClient(cfg.Coordinator.RPCAddress, pool)
 	router, err := client.NewRouter(admin, grpcx.NewClientTransport(pool))
@@ -374,7 +374,7 @@ func newQuickstartRouter(cfg quickstart.Config) (*client.Router, *grpcx.ConnPool
 		_ = pool.Close()
 		return nil, nil, fmt.Errorf("create client router: %w", err)
 	}
-	if err := router.Refresh(context.Background()); err != nil {
+	if err := router.Refresh(ctx); err != nil {
 		_ = pool.Close()
 		return nil, nil, fmt.Errorf("refresh client router: %w", err)
 	}

@@ -69,7 +69,7 @@ func TestReportNodeRecoveredRetryAfterPartialFailureCompletesAndThenBecomesStabl
 	repl.RegisterNode("b", recoveredB.Node())
 	wrapper := newFaultInjectingNodeClient(recoveredB)
 	wrapper.dropTimeouts = 1
-	server.nodes["b"] = wrapper
+	server.setNodeClient("b", wrapper)
 	recoveredB.BindServer(server)
 
 	assignment, ok := currentAssignmentForNode(server.Current(), "b", 0)
@@ -437,7 +437,7 @@ func TestRecoveredHeadReplicaRebuildsFromTailWhenTailMayBeAhead(t *testing.T) {
 		t.Fatalf("Bootstrap returned error: %v", err)
 	}
 	seedServerBootstrap(t, server, map[string]*InMemoryNodeAdapter{"a": adapterA, "b": adapterB}, 1, 2, []string{"a", "b"})
-	if _, err := adapterA.Node().SubmitPut(ctx, 0, "alpha", "v1"); err != nil {
+	if _, err := submitPutWithQueuedDelivery(t, ctx, adapterA.Node(), repl, 0, "alpha", "v1"); err != nil {
 		t.Fatalf("SubmitPut(alpha) returned error: %v", err)
 	}
 
@@ -452,10 +452,10 @@ func TestRecoveredHeadReplicaRebuildsFromTailWhenTailMayBeAhead(t *testing.T) {
 		dropped = true
 		repl.DropNext()
 	})
-	if _, err := adapterA.Node().SubmitPut(ctx, 0, "beta", "v2"); err == nil {
+	if _, err := submitPutWithQueuedDelivery(t, ctx, adapterA.Node(), repl, 0, "beta", "v2"); err == nil {
 		t.Fatal("SubmitPut(beta) unexpectedly succeeded")
-	} else if !errors.Is(err, storage.ErrStateMismatch) {
-		t.Fatalf("SubmitPut(beta) error = %v, want ErrStateMismatch", err)
+	} else if !errors.Is(err, storage.ErrWriteTimeout) {
+		t.Fatalf("SubmitPut(beta) error = %v, want ErrWriteTimeout", err)
 	}
 	repl.SetBeforeDeliver(nil)
 
@@ -522,7 +522,7 @@ func TestRecoveredHeadReplicaRebuildsFromTailWhenTailMayBeAhead(t *testing.T) {
 	} else if !read.Found || read.Value != "v2" {
 		t.Fatalf("restarted head beta read = %#v, want found value v2", read)
 	}
-	if result, err := restartedA.Node().SubmitPut(ctx, 0, "gamma", "v3"); err != nil {
+	if result, err := submitPutWithQueuedDelivery(t, ctx, restartedA.Node(), repl, 0, "gamma", "v3"); err != nil {
 		t.Fatalf("SubmitPut(gamma) after recovery returned error: %v", err)
 	} else if got, want := result.Sequence, uint64(3); got != want {
 		t.Fatalf("post-recovery sequence = %d, want %d", got, want)

@@ -38,6 +38,8 @@ type nodeMetrics struct {
 	ambiguousWrites        prometheus.Counter
 	conditionFailures      prometheus.Counter
 	writeWaitDuration      prometheus.Histogram
+	writeStageTransitions  *prometheus.CounterVec
+	writeStageDuration     *prometheus.HistogramVec
 	tailResolutions        *prometheus.CounterVec
 	tailResolutionDuration prometheus.Histogram
 	readDependencyFailures prometheus.Counter
@@ -160,6 +162,15 @@ func newNodeMetrics(registry *prometheus.Registry) *nodeMetrics {
 			Help:    "Client write latency observed at storage nodes.",
 			Buckets: prometheus.DefBuckets,
 		}),
+		writeStageTransitions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "craq_storage_write_stage_total",
+			Help: "Completed write-path stages observed at storage nodes.",
+		}, []string{"stage", "role", "result"}),
+		writeStageDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "craq_storage_write_stage_seconds",
+			Help:    "Latency of fixed write-path stages observed at storage nodes.",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"stage", "role", "result"}),
 		tailResolutions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "craq_storage_tail_resolutions_total",
 			Help: "Tail committed-sequence queries performed for CRAQ linearizable reads.",
@@ -213,6 +224,8 @@ func newNodeMetrics(registry *prometheus.Registry) *nodeMetrics {
 		m.ambiguousWrites,
 		m.conditionFailures,
 		m.writeWaitDuration,
+		m.writeStageTransitions,
+		m.writeStageDuration,
 		m.tailResolutions,
 		m.tailResolutionDuration,
 		m.readDependencyFailures,
@@ -244,22 +257,78 @@ func (n *Node) RecentEvents() []ops.Event {
 }
 
 func (n *Node) ResourceUsage() ResourceUsage {
+	replicas := n.publishedReplicaMapSnapshot()
 	n.mu.RLock()
-	defer n.mu.RUnlock()
 	usage := ResourceUsage{
 		InFlightClientWritesPerNode:    n.inFlightClientWrites,
-		InFlightClientWritesPerSlot:    make(map[int]int, len(n.replicas)),
-		BufferedReplicaMessagesPerNode: n.bufferedReplicaMessagesForNodeLocked(),
-		BufferedReplicaMessagesPerSlot: make(map[int]int, len(n.replicas)),
-		DirtyKeysPerSlot:               make(map[int]int, len(n.replicas)),
+		InFlightClientWritesPerSlot:    make(map[int]int, len(replicas)),
+		BufferedReplicaMessagesPerNode: n.publishedBufferedReplicaMessages,
+		BufferedReplicaMessagesPerSlot: make(map[int]int, len(replicas)),
+		DirtyKeysPerSlot:               make(map[int]int, len(replicas)),
 		ActiveCatchups:                 n.inFlightCatchups,
 	}
-	for slot, record := range n.replicas {
+	n.mu.RUnlock()
+	for slot, record := range replicas {
 		usage.InFlightClientWritesPerSlot[slot] = record.inFlightClientWrites
-		usage.BufferedReplicaMessagesPerSlot[slot] = len(record.bufferedForwards) + len(record.bufferedCommits)
-		usage.DirtyKeysPerSlot[slot] = dirtyKeyCount(record)
+		usage.BufferedReplicaMessagesPerSlot[slot] = record.bufferedReplicaMessages()
+		usage.DirtyKeysPerSlot[slot] = record.dirtyKeyCount
 	}
 	return usage
+}
+
+type writeStage string
+
+const (
+	writeStageHeadGetCommitted      writeStage = "head_get_committed"
+	writeStageHeadStageOp           writeStage = "head_stage_operation"
+	writeStageForwardAcceptRPC      writeStage = "forward_accept_rpc"
+	writeStageHeadWaitForCommit     writeStage = "head_wait_for_commit"
+	writeStageTailApplyCommit       writeStage = "tail_apply_committed"
+	writeStageCommitUpstreamAcceptRPC writeStage = "commit_upstream_accept_rpc"
+	writeStageCommitBatchWait       writeStage = "commit_batch_wait"
+	writeStageSingleApplyCommit     writeStage = "single_apply_committed"
+
+	writeStageHeadForwardRPC    writeStage = "head_forward_rpc"
+	writeStageCommitUpstreamRPC writeStage = "commit_upstream_rpc"
+)
+
+const (
+	writeStageResultSuccess = "success"
+	writeStageResultError   = "error"
+)
+
+func (n *Node) observeWriteStage(stage writeStage, role ReplicaRole, result string, dur time.Duration) {
+	if n.metrics == nil {
+		return
+	}
+	stageLabel := string(stage)
+	roleLabel := string(role)
+	if roleLabel == "" {
+		roleLabel = "unknown"
+	}
+	if result == "" {
+		result = writeStageResultSuccess
+	}
+	n.metrics.writeStageTransitions.WithLabelValues(stageLabel, roleLabel, result).Inc()
+	n.metrics.writeStageDuration.WithLabelValues(stageLabel, roleLabel, result).Observe(dur.Seconds())
+}
+
+func writeStageResult(err error) string {
+	if err != nil {
+		return writeStageResultError
+	}
+	return writeStageResultSuccess
+}
+
+func writeCommitApplyStage(role ReplicaRole) (writeStage, bool) {
+	switch role {
+	case ReplicaRoleSingle:
+		return writeStageSingleApplyCommit, true
+	case ReplicaRoleHead, ReplicaRoleMiddle, ReplicaRoleTail:
+		return writeStageTailApplyCommit, true
+	default:
+		return "", false
+	}
 }
 
 func (n *Node) AdminState() AdminState {
@@ -285,7 +354,7 @@ func (n *Node) refreshMetricGaugesLocked() {
 		return
 	}
 	inFlightWrites := n.inFlightClientWrites
-	bufferedReplicaMessages := n.bufferedReplicaMessagesForNodeLocked()
+	bufferedReplicaMessages := n.publishedBufferedReplicaMessages
 	catchups := n.inFlightCatchups
 	n.metrics.inFlightWrites.Set(float64(inFlightWrites))
 	n.metrics.bufferedReplicaMsgs.Set(float64(bufferedReplicaMessages))

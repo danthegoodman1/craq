@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -79,8 +80,8 @@ func TestRetryAfterAmbiguousWriteIsANewWrite(t *testing.T) {
 		t.Fatalf("DeliverNextForward returned error: %v", err)
 	}
 
-	h.repl.blockAwait = false
-	result, err := h.router.Put(ctx, "k", "v1")
+	h.repl.SetBlockAwait(false)
+	result, err := routerPutWithDelivery(t, ctx, h.router, h.repl, "k", "v1")
 	if err != nil {
 		t.Fatalf("second Put returned error: %v", err)
 	}
@@ -216,6 +217,7 @@ type capturedForward struct {
 }
 
 type manualAmbiguousReplicationTransport struct {
+	mu         sync.Mutex
 	backends   map[string]storage.Backend
 	nodes      map[string]replicationTestNode
 	forwards   []capturedForward
@@ -230,28 +232,45 @@ func newManualAmbiguousReplicationTransport() *manualAmbiguousReplicationTranspo
 }
 
 func (t *manualAmbiguousReplicationTransport) Register(nodeID string, backend storage.Backend, node replicationTestNode) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.backends[nodeID] = backend
 	t.nodes[nodeID] = node
 }
 
-func (t *manualAmbiguousReplicationTransport) FetchSnapshot(_ context.Context, fromNodeID string, slot int) (storage.Snapshot, error) {
+func (t *manualAmbiguousReplicationTransport) SetBlockAwait(block bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.blockAwait = block
+}
+
+func (t *manualAmbiguousReplicationTransport) FetchSnapshot(_ context.Context, fromNodeID string, slot int) (storage.Snapshot, uint64, error) {
+	t.mu.Lock()
 	backend, ok := t.backends[fromNodeID]
+	t.mu.Unlock()
 	if !ok {
-		return nil, fmt.Errorf("%w: node %q", storage.ErrSnapshotSourceUnavailable, fromNodeID)
+		return nil, 0, fmt.Errorf("%w: node %q", storage.ErrSnapshotSourceUnavailable, fromNodeID)
 	}
-	return backend.CommittedSnapshot(slot)
+	snap, err := backend.CommittedSnapshot(slot)
+	return snap, 0, err
 }
 
 func (t *manualAmbiguousReplicationTransport) FetchCommittedSequence(_ context.Context, fromNodeID string, slot int) (uint64, error) {
+	t.mu.Lock()
 	backend, ok := t.backends[fromNodeID]
+	t.mu.Unlock()
 	if !ok {
 		return 0, fmt.Errorf("%w: node %q", storage.ErrSnapshotSourceUnavailable, fromNodeID)
 	}
 	return backend.HighestCommittedSequence(slot)
 }
 
-func (t *manualAmbiguousReplicationTransport) ForwardWrite(_ context.Context, toNodeID string, req storage.ForwardWriteRequest) error {
-	if _, ok := t.nodes[toNodeID]; !ok {
+func (t *manualAmbiguousReplicationTransport) ForwardWrite(ctx context.Context, toNodeID string, req storage.ForwardWriteRequest) error {
+	t.mu.Lock()
+	node, ok := t.nodes[toNodeID]
+	blockAwait := t.blockAwait
+	if !ok {
+		t.mu.Unlock()
 		return fmt.Errorf("%w: node %q", storage.ErrSnapshotSourceUnavailable, toNodeID)
 	}
 	cloned := req
@@ -262,12 +281,19 @@ func (t *manualAmbiguousReplicationTransport) ForwardWrite(_ context.Context, to
 		Key:      req.Operation.Key,
 		Value:    req.Operation.Value,
 	}
+	if !blockAwait {
+		t.mu.Unlock()
+		return node.HandleForwardWrite(ctx, cloned)
+	}
 	t.forwards = append(t.forwards, capturedForward{toNodeID: toNodeID, req: cloned})
+	t.mu.Unlock()
 	return nil
 }
 
 func (t *manualAmbiguousReplicationTransport) CommitWrite(ctx context.Context, toNodeID string, req storage.CommitWriteRequest) error {
+	t.mu.Lock()
 	node, ok := t.nodes[toNodeID]
+	t.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("%w: node %q", storage.ErrSnapshotSourceUnavailable, toNodeID)
 	}
@@ -278,12 +304,15 @@ func (t *manualAmbiguousReplicationTransport) AwaitWriteCommit(ctx context.Conte
 	if check() {
 		return nil
 	}
-	if t.blockAwait {
+	t.mu.Lock()
+	blockAwait := t.blockAwait
+	t.mu.Unlock()
+	if blockAwait {
 		<-ctx.Done()
 		return ctx.Err()
 	}
 	for !check() {
-		if len(t.forwards) == 0 {
+		if t.Pending() == 0 {
 			return fmt.Errorf("%w: no captured forwards available", storage.ErrStateMismatch)
 		}
 		if err := t.DeliverNextForward(ctx); err != nil {
@@ -293,13 +322,26 @@ func (t *manualAmbiguousReplicationTransport) AwaitWriteCommit(ctx context.Conte
 	return nil
 }
 
+func (t *manualAmbiguousReplicationTransport) Pending() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.forwards)
+}
+
+func (t *manualAmbiguousReplicationTransport) DeliverNext(ctx context.Context) error {
+	return t.DeliverNextForward(ctx)
+}
+
 func (t *manualAmbiguousReplicationTransport) DeliverNextForward(ctx context.Context) error {
+	t.mu.Lock()
 	if len(t.forwards) == 0 {
+		t.mu.Unlock()
 		return fmt.Errorf("%w: no captured forwards available", storage.ErrStateMismatch)
 	}
 	msg := t.forwards[0]
 	t.forwards = t.forwards[1:]
 	node, ok := t.nodes[msg.toNodeID]
+	t.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("%w: node %q", storage.ErrSnapshotSourceUnavailable, msg.toNodeID)
 	}

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	stdpprof "net/http/pprof"
 	"sync/atomic"
+	"time"
 
 	"github.com/danthegoodman1/craq/coordserver"
 	"github.com/danthegoodman1/craq/gologger"
@@ -39,6 +41,9 @@ type healthResponse struct {
 
 func NewCoordinator(server *coordserver.Server, cfg Config) *Server {
 	return newServer("coordserver", cfg, func(mux *http.ServeMux) {
+		mux.HandleFunc("/admin/v1/routing", func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusOK, server.RoutingStatus(r.Context()))
+		})
 		mux.HandleFunc("/admin/v1/state", func(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, server.AdminState(r.Context()))
 		})
@@ -80,9 +85,19 @@ func newServer(component string, cfg Config, registerState func(*http.ServeMux))
 		}
 		writeJSON(w, http.StatusOK, healthResponse{Component: component, Ready: true})
 	})
+	mux.HandleFunc("/debug/pprof/", stdpprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", stdpprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", stdpprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", stdpprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", stdpprof.Trace)
 	mux.Handle("/metrics", promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{}))
 	registerState(mux)
-	s.http = &http.Server{Handler: mux}
+	s.http = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      2 * time.Minute,
+		IdleTimeout:       60 * time.Second,
+	}
 	return s
 }
 

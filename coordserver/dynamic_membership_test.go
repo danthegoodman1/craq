@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/danthegoodman1/craq/coordinator"
 	coordruntime "github.com/danthegoodman1/craq/coordinator/runtime"
@@ -35,9 +37,16 @@ func TestDynamicNodeRegistrationAndReadyGatingBuildsCluster(t *testing.T) {
 		t.Fatalf("ready node set = %#v, want a/b/c ready", server.Current().Cluster.ReadyNodeIDs)
 	}
 
-	for _, nodeID := range []string{"a", "b", "c"} {
-		if err := h.adapters[nodeID].Node().ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: 0}); err != nil {
-			t.Fatalf("ActivateReplica(%q) returned error: %v", nodeID, err)
+	for expectedActives := 1; expectedActives <= 3; expectedActives++ {
+		pending, ok := server.Pending()[0]
+		if !ok {
+			t.Fatalf("pending slot 0 missing before activation %d", expectedActives)
+		}
+		if err := h.adapters[pending.NodeID].Node().ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: 0}); err != nil {
+			t.Fatalf("ActivateReplica(%q) returned error: %v", pending.NodeID, err)
+		}
+		if got := len(activeServingChain(server.Current().Cluster.Chains[0]).Replicas); got != expectedActives {
+			t.Fatalf("active replica count after activation %d = %d, want %d", expectedActives, got, expectedActives)
 		}
 	}
 	if got, want := replicaNodeStates(server.Current().Cluster.Chains[0]), []string{"a:active", "b:active", "c:active"}; !reflect.DeepEqual(got, want) {
@@ -201,6 +210,91 @@ func TestDynamicMembershipContinuityAfterReopen(t *testing.T) {
 			t.Fatalf("membership size after reopen = %d, want %d", got, want)
 		}
 	})
+}
+
+func TestConcurrentHeartbeatsAndRoutingSnapshotsDuringRepair(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	h := newInMemoryHarness(t, []string{"a", "b", "c", "d"})
+	server := h.server
+	for _, adapter := range h.adapters {
+		adapter.BindServer(server)
+	}
+
+	if _, err := server.Bootstrap(ctx, bootstrapCommand("bootstrap-1", 0, 16, 3, "a", "b", "c")); err != nil {
+		t.Fatalf("Bootstrap returned error: %v", err)
+	}
+	h.seedBootstrap(t, 16, 3, []string{"a", "b", "c"})
+
+	current := server.Current()
+	if _, err := server.AddNode(ctx, reconfigureCommand("add-d", current.Version, coordinator.Event{
+		Kind: coordinator.EventKindAddNode,
+		Node: uniqueNode("d"),
+	}, coordinator.ReconfigurationPolicy{MaxChangedChains: 1})); err != nil {
+		t.Fatalf("AddNode returned error: %v", err)
+	}
+
+	done := make(chan struct{})
+	errCh := make(chan error, 1)
+	var bg sync.WaitGroup
+	bg.Add(1)
+
+	go func() {
+		defer bg.Done()
+		ticker := time.NewTicker(2 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if _, err := server.RoutingSnapshot(ctx); err != nil {
+					errCh <- err
+					return
+				}
+				_ = server.Current()
+				_ = server.Pending()
+			}
+		}
+	}()
+
+	pendingReady := pendingSlotsForNode(t, server.Pending(), "d", pendingKindReady)
+	for _, slot := range pendingReady {
+		if err := h.adapters["d"].Node().ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: slot}); err != nil {
+			t.Fatalf("ActivateReplica(d, slot=%d) returned error: %v", slot, err)
+		}
+		removal, ok := server.Pending()[slot]
+		if !ok || removal.Kind != pendingKindRemoved {
+			t.Fatalf("pending removal for slot %d = %#v, want removed work item", slot, removal)
+		}
+		if err := h.adapters[removal.NodeID].Node().RemoveReplica(ctx, storage.RemoveReplicaCommand{Slot: slot}); err != nil {
+			t.Fatalf("RemoveReplica(%s, slot=%d) returned error: %v", removal.NodeID, slot, err)
+		}
+	}
+
+	close(done)
+	bg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("background concurrency returned error: %v", err)
+		}
+	}
+
+	snapshot, err := server.RoutingSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("RoutingSnapshot returned error: %v", err)
+	}
+	for _, slot := range pendingReady {
+		if _, exists := server.Pending()[slot]; exists {
+			t.Fatalf("pending work for repaired slot %d still present: %#v", slot, server.Pending()[slot])
+		}
+		route := snapshot.Slots[slot]
+		if !route.Readable || !route.Writable {
+			t.Fatalf("repaired route %#v is not fully readable+writable", route)
+		}
+	}
 }
 
 func TestNonHADurableOutboxResumesAfterRestart(t *testing.T) {

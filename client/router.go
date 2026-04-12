@@ -31,7 +31,8 @@ type Transport interface {
 }
 
 type Router struct {
-	mu              sync.RWMutex
+	snapshotMu      sync.RWMutex
+	roundRobinMu    sync.Mutex
 	source          SnapshotSource
 	transport       Transport
 	snapshot        *coordserver.RoutingSnapshot
@@ -58,19 +59,20 @@ func (r *Router) Refresh(ctx context.Context) error {
 		return fmt.Errorf("err in r.source.RoutingSnapshot: %w", err)
 	}
 	cloned := cloneSnapshot(snapshot)
-	r.mu.Lock()
+	r.snapshotMu.Lock()
 	r.snapshot = &cloned
-	r.mu.Unlock()
+	r.snapshotMu.Unlock()
 	return nil
 }
 
 func (r *Router) Snapshot() (coordserver.RoutingSnapshot, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.snapshot == nil {
+	r.snapshotMu.RLock()
+	snapshot := r.snapshot
+	r.snapshotMu.RUnlock()
+	if snapshot == nil {
 		return coordserver.RoutingSnapshot{}, false
 	}
-	return cloneSnapshot(*r.snapshot), true
+	return cloneSnapshot(*snapshot), true
 }
 
 func RouteForKey(snapshot coordserver.RoutingSnapshot, key string) (coordserver.SlotRoute, error) {
@@ -122,13 +124,13 @@ func (r *Router) DeleteIf(ctx context.Context, key string, conditions storage.Wr
 }
 
 func (r *Router) loadedSnapshot() (*coordserver.RoutingSnapshot, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.snapshot == nil {
+	r.snapshotMu.RLock()
+	snapshot := r.snapshot
+	r.snapshotMu.RUnlock()
+	if snapshot == nil {
 		return nil, ErrSnapshotNotLoaded
 	}
-	cloned := cloneSnapshot(*r.snapshot)
-	return &cloned, nil
+	return snapshot, nil
 }
 
 func (r *Router) getWithSnapshot(
@@ -142,14 +144,24 @@ func (r *Router) getWithSnapshot(
 	if err != nil {
 		return storage.ReadResult{}, err
 	}
-	readReplicas := routeReadReplicas(route)
-	if !route.Readable || len(readReplicas) == 0 {
+	readReplicaCount := routeReadReplicaCount(route)
+	if !route.Readable || readReplicaCount == 0 {
+		if allowRefresh {
+			if refreshErr := r.Refresh(ctx); refreshErr != nil {
+				return storage.ReadResult{}, refreshErr
+			}
+			refreshed, loadErr := r.loadedSnapshot()
+			if loadErr != nil {
+				return storage.ReadResult{}, loadErr
+			}
+			return r.getWithSnapshot(ctx, key, consistency, refreshed, false)
+		}
 		return storage.ReadResult{}, fmt.Errorf("%w: slot %d is not readable", ErrNoRoute, route.Slot)
 	}
-	start := r.nextReadStart(route.Slot, len(readReplicas))
-	ordered := orderedReadReplicas(readReplicas, start)
+	start := r.nextReadStart(route.Slot, readReplicaCount)
 	var lastErr error
-	for _, replica := range ordered {
+	for i := 0; i < readReplicaCount; i++ {
+		replica := routeReadReplicaAt(route, (start+i)%readReplicaCount)
 		req := storage.ClientGetRequest{
 			Slot:                 route.Slot,
 			Key:                  key,
@@ -174,8 +186,8 @@ func (r *Router) getWithSnapshot(
 			return storage.ReadResult{}, err
 		}
 		if isReadDependencyUnavailable(err) {
-			tail := tailReadReplica(route)
-			if tail != nil && tail.NodeID != replica.NodeID {
+			tail, ok := tailReadReplica(route)
+			if ok && tail.NodeID != replica.NodeID {
 				tailResult, tailErr := r.transport.Get(ctx, routeTarget(tail.Endpoint, tail.NodeID), req)
 				if tailErr == nil {
 					return tailResult, nil
@@ -237,6 +249,16 @@ func (r *Router) putWithSnapshot(
 		return storage.CommitResult{}, err
 	}
 	if !route.Writable || route.HeadNodeID == "" {
+		if allowRefresh {
+			if refreshErr := r.Refresh(ctx); refreshErr != nil {
+				return storage.CommitResult{}, refreshErr
+			}
+			refreshed, loadErr := r.loadedSnapshot()
+			if loadErr != nil {
+				return storage.CommitResult{}, loadErr
+			}
+			return r.putWithSnapshot(ctx, key, value, conditions, refreshed, false)
+		}
 		return storage.CommitResult{}, fmt.Errorf("%w: slot %d is not writable", ErrNoRoute, route.Slot)
 	}
 	result, err := r.transport.Put(ctx, routeTarget(route.HeadEndpoint, route.HeadNodeID), storage.ClientPutRequest{
@@ -274,6 +296,16 @@ func (r *Router) deleteWithSnapshot(
 		return storage.CommitResult{}, err
 	}
 	if !route.Writable || route.HeadNodeID == "" {
+		if allowRefresh {
+			if refreshErr := r.Refresh(ctx); refreshErr != nil {
+				return storage.CommitResult{}, refreshErr
+			}
+			refreshed, loadErr := r.loadedSnapshot()
+			if loadErr != nil {
+				return storage.CommitResult{}, loadErr
+			}
+			return r.deleteWithSnapshot(ctx, key, conditions, refreshed, false)
+		}
 		return storage.CommitResult{}, fmt.Errorf("%w: slot %d is not writable", ErrNoRoute, route.Slot)
 	}
 	result, err := r.transport.Delete(ctx, routeTarget(route.HeadEndpoint, route.HeadNodeID), storage.ClientDeleteRequest{
@@ -343,7 +375,7 @@ func routeTarget(endpoint string, fallbackNodeID string) string {
 
 func routeReadReplicas(route coordserver.SlotRoute) []coordserver.ReadReplicaRoute {
 	if len(route.ReadReplicas) > 0 {
-		return append([]coordserver.ReadReplicaRoute(nil), route.ReadReplicas...)
+		return route.ReadReplicas
 	}
 	if route.TailNodeID == "" {
 		return nil
@@ -359,32 +391,45 @@ func routeReadReplicas(route coordserver.SlotRoute) []coordserver.ReadReplicaRou
 	}}
 }
 
-func tailReadReplica(route coordserver.SlotRoute) *coordserver.ReadReplicaRoute {
-	readReplicas := routeReadReplicas(route)
-	if len(readReplicas) == 0 {
-		return nil
+func routeReadReplicaCount(route coordserver.SlotRoute) int {
+	if len(route.ReadReplicas) > 0 {
+		return len(route.ReadReplicas)
 	}
-	tail := readReplicas[len(readReplicas)-1]
-	return &tail
+	if route.TailNodeID == "" {
+		return 0
+	}
+	return 1
 }
 
-func orderedReadReplicas(readReplicas []coordserver.ReadReplicaRoute, start int) []coordserver.ReadReplicaRoute {
-	if len(readReplicas) == 0 {
-		return nil
+func routeReadReplicaAt(route coordserver.SlotRoute, idx int) coordserver.ReadReplicaRoute {
+	if len(route.ReadReplicas) > 0 {
+		return route.ReadReplicas[idx]
 	}
-	ordered := make([]coordserver.ReadReplicaRoute, 0, len(readReplicas))
-	for i := 0; i < len(readReplicas); i++ {
-		ordered = append(ordered, readReplicas[(start+i)%len(readReplicas)])
+	role := storage.ReplicaRoleTail
+	if route.HeadNodeID == route.TailNodeID {
+		role = storage.ReplicaRoleSingle
 	}
-	return ordered
+	return coordserver.ReadReplicaRoute{
+		NodeID:   route.TailNodeID,
+		Endpoint: route.TailEndpoint,
+		Role:     role,
+	}
+}
+
+func tailReadReplica(route coordserver.SlotRoute) (coordserver.ReadReplicaRoute, bool) {
+	count := routeReadReplicaCount(route)
+	if count == 0 {
+		return coordserver.ReadReplicaRoute{}, false
+	}
+	return routeReadReplicaAt(route, count-1), true
 }
 
 func (r *Router) nextReadStart(slot int, count int) int {
 	if count <= 0 {
 		return 0
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.roundRobinMu.Lock()
+	defer r.roundRobinMu.Unlock()
 	start := r.nextReadReplica[slot] % count
 	r.nextReadReplica[slot] = (start + 1) % count
 	return start

@@ -75,11 +75,8 @@ func runQueuedRouterFaultHistory(t *testing.T) queuedRouterFaultHistory {
 		t.Fatalf("Refresh returned error: %v", err)
 	}
 	key := keyForSlot(t, 1, 8, "fault")
-	if _, err := router.Put(ctx, key, "v1"); err != nil {
+	if _, err := routerPutWithDelivery(t, ctx, router, h.repl, key, "v1"); err != nil {
 		t.Fatalf("Put returned error: %v", err)
-	}
-	if err := h.repl.DeliverAll(ctx); err != nil {
-		t.Fatalf("DeliverAll returned error: %v", err)
 	}
 	if got, want := mustQueuedChainValue(t, h, 1, key), "v1"; got != want {
 		t.Fatalf("initial replicated value = %q, want %q", got, want)
@@ -136,8 +133,11 @@ func runQueuedRouterFaultHistory(t *testing.T) queuedRouterFaultHistory {
 	if err := router.Refresh(ctx); err != nil {
 		t.Fatalf("Refresh after repair returned error: %v", err)
 	}
+	if err := h.repl.DeliverAll(ctx); err != nil {
+		t.Fatalf("DeliverAll after repair returned error: %v", err)
+	}
 
-	if _, err := router.Put(ctx, key, "v2"); err != nil {
+	if _, err := routerPutWithDelivery(t, ctx, router, h.repl, key, "v2"); err != nil {
 		t.Fatalf("Put after repair returned error: %v", err)
 	}
 	read, err := router.Get(ctx, key)

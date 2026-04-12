@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -128,7 +129,7 @@ func TestQueuedTransportWaitsForExplicitCommitAndPreservesStaging(t *testing.T) 
 		}
 	})
 
-	result, err := nodes["head"].SubmitPut(ctx, 7, "k", "v")
+	result, err := submitPutWithQueuedDelivery(t, ctx, nodes["head"], transport, 7, "k", "v")
 	if err != nil {
 		t.Fatalf("SubmitPut returned error: %v", err)
 	}
@@ -167,7 +168,7 @@ func TestQueuedTransportDuplicateMessagesStillConverge(t *testing.T) {
 		}
 	})
 
-	result, err := nodes["head"].SubmitPut(ctx, 9, "k", "v")
+	result, err := submitPutWithQueuedDelivery(t, ctx, nodes["head"], transport, 9, "k", "v")
 	if err != nil {
 		t.Fatalf("SubmitPut returned error: %v", err)
 	}
@@ -190,10 +191,10 @@ func TestQueuedTransportDropLeavesWriteStagedAndUncommitted(t *testing.T) {
 	nodes, _, transport := setupActiveChainWithQueuedTransport(t, 6, []string{"head", "tail"})
 	transport.DropNext()
 
-	if _, err := nodes["head"].SubmitPut(ctx, 6, "k", "v"); err == nil {
+	if _, err := submitPutWithQueuedDelivery(t, ctx, nodes["head"], transport, 6, "k", "v"); err == nil {
 		t.Fatal("SubmitPut unexpectedly succeeded")
-	} else if !errors.Is(err, ErrStateMismatch) {
-		t.Fatalf("error = %v, want state mismatch", err)
+	} else if !errors.Is(err, ErrWriteTimeout) {
+		t.Fatalf("error = %v, want write timeout", err)
 	}
 	if got, want := mustNodeCommittedSnapshot(t, nodes["head"], 6), map[string]string{}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("committed snapshot = %v, want empty", got)
@@ -223,14 +224,16 @@ func TestPipelineStagesLaterWritesBeforeEarlierCommitAndCommitsInOrder(t *testin
 	})
 
 	if err := node.HandleForwardWrite(ctx, ForwardWriteRequest{
-		Operation:  WriteOperation{Slot: 5, Sequence: 1, Kind: OperationKindPut, Key: "k1", Value: "v1"},
-		FromNodeID: "head",
+		Operation:    WriteOperation{Slot: 5, Sequence: 1, Kind: OperationKindPut, Key: "k1", Value: "v1"},
+		FromNodeID:   "head",
+		ChainVersion: 1,
 	}); err != nil {
 		t.Fatalf("HandleForwardWrite(seq=1) returned error: %v", err)
 	}
 	if err := node.HandleForwardWrite(ctx, ForwardWriteRequest{
-		Operation:  WriteOperation{Slot: 5, Sequence: 2, Kind: OperationKindPut, Key: "k2", Value: "v2"},
-		FromNodeID: "head",
+		Operation:    WriteOperation{Slot: 5, Sequence: 2, Kind: OperationKindPut, Key: "k2", Value: "v2"},
+		FromNodeID:   "head",
+		ChainVersion: 1,
 	}); err != nil {
 		t.Fatalf("HandleForwardWrite(seq=2) returned error: %v", err)
 	}
@@ -238,14 +241,14 @@ func TestPipelineStagesLaterWritesBeforeEarlierCommitAndCommitsInOrder(t *testin
 		t.Fatalf("staged sequences = %v, want %v", got, want)
 	}
 
-	if err := node.HandleCommitWrite(ctx, CommitWriteRequest{Slot: 5, Sequence: 2, FromNodeID: "tail"}); err != nil {
+	if err := node.HandleCommitWrite(ctx, CommitWriteRequest{Slot: 5, Sequence: 2, FromNodeID: "tail", ChainVersion: 1}); err != nil {
 		t.Fatalf("HandleCommitWrite(seq=2) returned error: %v", err)
 	}
 	if got, want := mustBufferedCommitSequences(t, node, 5), []uint64{2}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("buffered commit sequences = %v, want %v", got, want)
 	}
 
-	if err := node.HandleCommitWrite(ctx, CommitWriteRequest{Slot: 5, Sequence: 1, FromNodeID: "tail"}); err != nil {
+	if err := node.HandleCommitWrite(ctx, CommitWriteRequest{Slot: 5, Sequence: 1, FromNodeID: "tail", ChainVersion: 1}); err != nil {
 		t.Fatalf("HandleCommitWrite(seq=1) returned error: %v", err)
 	}
 	if got, want := mustNodeCommittedSnapshot(t, node, 5), map[string]string{"k1": "v1", "k2": "v2"}; !reflect.DeepEqual(got, want) {
@@ -273,8 +276,9 @@ func TestOutOfOrderForwardAndCommitRequestsAreBufferedAndDrained(t *testing.T) {
 	})
 
 	if err := node.HandleForwardWrite(ctx, ForwardWriteRequest{
-		Operation:  WriteOperation{Slot: 5, Sequence: 2, Kind: OperationKindPut, Key: "k", Value: "v"},
-		FromNodeID: "head",
+		Operation:    WriteOperation{Slot: 5, Sequence: 2, Kind: OperationKindPut, Key: "k", Value: "v"},
+		FromNodeID:   "head",
+		ChainVersion: 1,
 	}); err != nil {
 		t.Fatalf("HandleForwardWrite(seq=2) returned error: %v", err)
 	}
@@ -283,8 +287,9 @@ func TestOutOfOrderForwardAndCommitRequestsAreBufferedAndDrained(t *testing.T) {
 	}
 
 	if err := node.HandleForwardWrite(ctx, ForwardWriteRequest{
-		Operation:  WriteOperation{Slot: 5, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v"},
-		FromNodeID: "head",
+		Operation:    WriteOperation{Slot: 5, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v"},
+		FromNodeID:   "head",
+		ChainVersion: 1,
 	}); err != nil {
 		t.Fatalf("HandleForwardWrite(seq=1) returned error: %v", err)
 	}
@@ -295,13 +300,13 @@ func TestOutOfOrderForwardAndCommitRequestsAreBufferedAndDrained(t *testing.T) {
 		t.Fatalf("buffered forward sequences after drain = %v, want empty", got)
 	}
 
-	if err := node.HandleCommitWrite(ctx, CommitWriteRequest{Slot: 5, Sequence: 2, FromNodeID: "tail"}); err != nil {
+	if err := node.HandleCommitWrite(ctx, CommitWriteRequest{Slot: 5, Sequence: 2, FromNodeID: "tail", ChainVersion: 1}); err != nil {
 		t.Fatalf("HandleCommitWrite(seq=2) returned error: %v", err)
 	}
 	if got, want := mustBufferedCommitSequences(t, node, 5), []uint64{2}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("buffered commit sequences = %v, want %v", got, want)
 	}
-	if err := node.HandleCommitWrite(ctx, CommitWriteRequest{Slot: 5, Sequence: 1, FromNodeID: "tail"}); err != nil {
+	if err := node.HandleCommitWrite(ctx, CommitWriteRequest{Slot: 5, Sequence: 1, FromNodeID: "tail", ChainVersion: 1}); err != nil {
 		t.Fatalf("HandleCommitWrite(seq=1) returned error: %v", err)
 	}
 	if got, want := mustNodeCommittedSnapshot(t, node, 5), map[string]string{"k": "v"}; !reflect.DeepEqual(got, want) {
@@ -323,8 +328,9 @@ func TestDuplicateAndConflictingReplicaMessages(t *testing.T) {
 			Peers:        ChainPeers{PredecessorNodeID: "head", SuccessorNodeID: "tail"},
 		})
 		req := ForwardWriteRequest{
-			Operation:  WriteOperation{Slot: 5, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v"},
-			FromNodeID: "head",
+			Operation:    WriteOperation{Slot: 5, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v"},
+			FromNodeID:   "head",
+			ChainVersion: 1,
 		}
 		if err := node.HandleForwardWrite(ctx, req); err != nil {
 			t.Fatalf("HandleForwardWrite returned error: %v", err)
@@ -351,8 +357,9 @@ func TestDuplicateAndConflictingReplicaMessages(t *testing.T) {
 			Peers:        ChainPeers{PredecessorNodeID: "head"},
 		})
 		req := ForwardWriteRequest{
-			Operation:  WriteOperation{Slot: 5, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v"},
-			FromNodeID: "head",
+			Operation:    WriteOperation{Slot: 5, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v"},
+			FromNodeID:   "head",
+			ChainVersion: 1,
 		}
 		if err := node.HandleForwardWrite(ctx, req); err != nil {
 			t.Fatalf("HandleForwardWrite returned error: %v", err)
@@ -376,8 +383,9 @@ func TestDuplicateAndConflictingReplicaMessages(t *testing.T) {
 			Peers:        ChainPeers{PredecessorNodeID: "head"},
 		})
 		first := ForwardWriteRequest{
-			Operation:  WriteOperation{Slot: 5, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v1"},
-			FromNodeID: "head",
+			Operation:    WriteOperation{Slot: 5, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v1"},
+			FromNodeID:   "head",
+			ChainVersion: 1,
 		}
 		if err := node.HandleForwardWrite(ctx, first); err != nil {
 			t.Fatalf("HandleForwardWrite returned error: %v", err)
@@ -396,7 +404,7 @@ func TestDuplicateAndConflictingReplicaMessages(t *testing.T) {
 		if _, err := nodes["head"].SubmitPut(ctx, 5, "k", "v"); err != nil {
 			t.Fatalf("SubmitPut returned error: %v", err)
 		}
-		req := CommitWriteRequest{Slot: 5, Sequence: 1, FromNodeID: "tail"}
+		req := CommitWriteRequest{Slot: 5, Sequence: 1, FromNodeID: "tail", ChainVersion: 1}
 		if err := nodes["head"].HandleCommitWrite(ctx, req); err != nil {
 			t.Fatalf("duplicate HandleCommitWrite returned error: %v", err)
 		}
@@ -410,10 +418,10 @@ func TestDuplicateAndConflictingReplicaMessages(t *testing.T) {
 		if _, err := nodes["head"].SubmitPut(ctx, 5, "k", "v"); err != nil {
 			t.Fatalf("SubmitPut returned error: %v", err)
 		}
-		if err := nodes["head"].HandleCommitWrite(ctx, CommitWriteRequest{Slot: 5, Sequence: 1, FromNodeID: "wrong"}); err == nil {
+		if err := nodes["head"].HandleCommitWrite(ctx, CommitWriteRequest{Slot: 5, Sequence: 1, FromNodeID: "wrong", ChainVersion: 1}); err == nil {
 			t.Fatal("conflicting duplicate commit unexpectedly succeeded")
-		} else if !errors.Is(err, ErrProtocolConflict) {
-			t.Fatalf("error = %v, want protocol conflict", err)
+		} else if !errors.Is(err, ErrPeerMismatch) {
+			t.Fatalf("error = %v, want peer mismatch", err)
 		}
 	})
 
@@ -431,13 +439,14 @@ func TestDuplicateAndConflictingReplicaMessages(t *testing.T) {
 			Peers:        ChainPeers{PredecessorNodeID: "head", SuccessorNodeID: "tail"},
 		})
 		if err := node.HandleForwardWrite(ctx, ForwardWriteRequest{
-			Operation:  WriteOperation{Slot: 5, Sequence: 2, Kind: OperationKindPut, Key: "k2", Value: "v2"},
-			FromNodeID: "head",
+			Operation:    WriteOperation{Slot: 5, Sequence: 2, Kind: OperationKindPut, Key: "k2", Value: "v2"},
+			FromNodeID:   "head",
+			ChainVersion: 1,
 		}); err != nil {
 			t.Fatalf("HandleForwardWrite(seq=2) returned error: %v", err)
 		}
 		if err := node.HandleCommitWrite(ctx, CommitWriteRequest{
-			Slot: 5, Sequence: 2, FromNodeID: "tail",
+			Slot: 5, Sequence: 2, FromNodeID: "tail", ChainVersion: 1,
 		}); err == nil {
 			t.Fatal("HandleCommitWrite(seq=2) unexpectedly succeeded with full buffer")
 		} else if !errors.Is(err, ErrBufferedMessageLimit) {
@@ -460,12 +469,14 @@ func TestDuplicateAndConflictingReplicaMessages(t *testing.T) {
 		})
 		for _, req := range []ForwardWriteRequest{
 			{
-				Operation:  WriteOperation{Slot: 5, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v1"},
-				FromNodeID: "head",
+				Operation:    WriteOperation{Slot: 5, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v1"},
+				FromNodeID:   "head",
+				ChainVersion: 1,
 			},
 			{
-				Operation:  WriteOperation{Slot: 5, Sequence: 2, Kind: OperationKindPut, Key: "k", Value: "v2"},
-				FromNodeID: "head",
+				Operation:    WriteOperation{Slot: 5, Sequence: 2, Kind: OperationKindPut, Key: "k", Value: "v2"},
+				FromNodeID:   "head",
+				ChainVersion: 1,
 			},
 		} {
 			if err := node.HandleForwardWrite(ctx, req); err != nil {
@@ -473,8 +484,9 @@ func TestDuplicateAndConflictingReplicaMessages(t *testing.T) {
 			}
 		}
 		if err := node.HandleForwardWrite(ctx, ForwardWriteRequest{
-			Operation:  WriteOperation{Slot: 5, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v1"},
-			FromNodeID: "head",
+			Operation:    WriteOperation{Slot: 5, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v1"},
+			FromNodeID:   "head",
+			ChainVersion: 1,
 		}); err == nil {
 			t.Fatal("old duplicate HandleForwardWrite unexpectedly succeeded")
 		} else if !errors.Is(err, ErrSequenceMismatch) {
@@ -524,12 +536,96 @@ func TestWriteValidationAndDownstreamFailure(t *testing.T) {
 			Peers:        ChainPeers{PredecessorNodeID: "head", SuccessorNodeID: "tail"},
 		})
 		if err := node.HandleForwardWrite(ctx, ForwardWriteRequest{
-			Operation:  WriteOperation{Slot: 4, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v"},
-			FromNodeID: "wrong",
+			Operation:    WriteOperation{Slot: 4, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v"},
+			FromNodeID:   "wrong",
+			ChainVersion: 1,
 		}); err == nil {
 			t.Fatal("HandleForwardWrite unexpectedly succeeded")
 		} else if !errors.Is(err, ErrPeerMismatch) {
 			t.Fatalf("error = %v, want peer mismatch", err)
+		}
+	})
+
+	t.Run("stale forward chain version rejected", func(t *testing.T) {
+		transport := &scriptedTransport{}
+		backend := NewInMemoryBackend()
+		coord := NewInMemoryCoordinatorClient()
+		node := mustNewNode(t, ctx, Config{NodeID: "mid"}, backend, coord, transport)
+		mustActivateReplica(t, node, 4, ReplicaAssignment{
+			Slot:         4,
+			ChainVersion: 2,
+			Role:         ReplicaRoleMiddle,
+			Peers:        ChainPeers{PredecessorNodeID: "head", SuccessorNodeID: "tail"},
+		})
+		if err := node.HandleForwardWrite(ctx, ForwardWriteRequest{
+			Operation:    WriteOperation{Slot: 4, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v"},
+			FromNodeID:   "head",
+			ChainVersion: 1,
+		}); err == nil {
+			t.Fatal("HandleForwardWrite unexpectedly succeeded")
+		} else if !errors.Is(err, ErrPeerMismatch) {
+			t.Fatalf("error = %v, want peer mismatch", err)
+		}
+	})
+
+	t.Run("stale commit chain version rejected", func(t *testing.T) {
+		nodes, _, _ := setupActiveChain(t, 5, []string{"head", "tail"})
+		if _, err := nodes["head"].SubmitPut(ctx, 5, "k", "v"); err != nil {
+			t.Fatalf("SubmitPut returned error: %v", err)
+		}
+		if err := nodes["head"].HandleCommitWrite(ctx, CommitWriteRequest{
+			Slot: 5, Sequence: 1, FromNodeID: "tail", ChainVersion: 99,
+		}); err == nil {
+			t.Fatal("HandleCommitWrite unexpectedly succeeded")
+		} else if !errors.Is(err, ErrPeerMismatch) {
+			t.Fatalf("error = %v, want peer mismatch", err)
+		}
+	})
+
+	t.Run("staged commit from previous chain version is still accepted after peer update", func(t *testing.T) {
+		node := mustNewNode(t, ctx, Config{NodeID: "head"}, NewInMemoryBackend(), NewInMemoryCoordinatorClient(), NewInMemoryReplicationTransport())
+		mustActivateReplica(t, node, 6, ReplicaAssignment{
+			Slot:         6,
+			ChainVersion: 4,
+			Role:         ReplicaRoleHead,
+			Peers:        ChainPeers{SuccessorNodeID: "mid"},
+		})
+		record := mustSlotRecord(t, node, 6)
+		op := WriteOperation{Slot: 6, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v", Metadata: testObjectMetadata(1)}
+		if err := node.stageOperation(op); err != nil {
+			t.Fatalf("stageOperation returned error: %v", err)
+		}
+		record.stagedForwards[1] = ForwardWriteRequest{
+			Operation:    op,
+			FromNodeID:   "client",
+			ChainVersion: 4,
+		}
+		record.pendingWrites[1] = pendingWrite{}
+		record.nextSequence = 2
+		mustMutateSlotRecord(t, node, 6, func(replicaRecord) replicaRecord {
+			return record
+		})
+		if err := node.UpdateChainPeers(ctx, UpdateChainPeersCommand{
+			Assignment: ReplicaAssignment{
+				Slot:         6,
+				ChainVersion: 5,
+				Role:         ReplicaRoleHead,
+				Peers:        ChainPeers{SuccessorNodeID: "mid"},
+			},
+		}); err != nil {
+			t.Fatalf("UpdateChainPeers returned error: %v", err)
+		}
+
+		if err := node.HandleCommitWrite(ctx, CommitWriteRequest{
+			Slot:         6,
+			Sequence:     1,
+			FromNodeID:   "mid",
+			ChainVersion: 4,
+		}); err != nil {
+			t.Fatalf("HandleCommitWrite returned error: %v", err)
+		}
+		if got, want := mustHighestCommitted(t, node, 6), uint64(1); got != want {
+			t.Fatalf("highest committed = %d, want %d", got, want)
 		}
 	})
 
@@ -646,14 +742,15 @@ func runReplicationHistory(t *testing.T) replicationHistory {
 }
 
 type scriptedTransport struct {
+	mu         sync.Mutex
 	forwardErr error
 	commitErr  error
 	forwards   []ForwardWriteRequest
 	commits    []CommitWriteRequest
 }
 
-func (t *scriptedTransport) FetchSnapshot(_ context.Context, _ string, _ int) (Snapshot, error) {
-	return Snapshot{}, nil
+func (t *scriptedTransport) FetchSnapshot(_ context.Context, _ string, _ int) (Snapshot, uint64, error) {
+	return Snapshot{}, 0, nil
 }
 
 func (t *scriptedTransport) FetchCommittedSequence(_ context.Context, _ string, _ int) (uint64, error) {
@@ -661,17 +758,23 @@ func (t *scriptedTransport) FetchCommittedSequence(_ context.Context, _ string, 
 }
 
 func (t *scriptedTransport) ForwardWrite(_ context.Context, _ string, req ForwardWriteRequest) error {
+	t.mu.Lock()
 	t.forwards = append(t.forwards, req)
-	if t.forwardErr != nil {
-		return t.forwardErr
+	err := t.forwardErr
+	t.mu.Unlock()
+	if err != nil {
+		return err
 	}
 	return nil
 }
 
 func (t *scriptedTransport) CommitWrite(_ context.Context, _ string, req CommitWriteRequest) error {
+	t.mu.Lock()
 	t.commits = append(t.commits, req)
-	if t.commitErr != nil {
-		return t.commitErr
+	err := t.commitErr
+	t.mu.Unlock()
+	if err != nil {
+		return err
 	}
 	return nil
 }

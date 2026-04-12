@@ -676,6 +676,177 @@ func TestRouterReadAndReplacementTailStayCorrectAcrossDeadTailReconfiguration(t 
 	assertReplicaValueOnNodes(t, h, 0, key, "v2", "a", "b", "d")
 }
 
+func TestRouterConcurrentRefreshAndOperationsStayCorrectAcrossDeadTailRepair(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	h := newRouterHarness(t, []string{"a", "b", "c", "d"})
+	bootstrapDynamicCluster(t, ctx, h, 1, 3, []string{"a", "b", "c"})
+
+	router := mustNewRouter(t, h.server, h.transport)
+	if err := router.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh returned error: %v", err)
+	}
+
+	retryTransient := func(fn func() error) error {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			err := fn()
+			if err == nil {
+				return nil
+			}
+			var mismatch *storage.RoutingMismatchError
+			if errors.Is(err, ErrNoRoute) ||
+				errors.Is(err, ErrSnapshotNotLoaded) ||
+				errors.Is(err, storage.ErrStateMismatch) ||
+				errors.As(err, &mismatch) {
+				if time.Now().After(deadline) {
+					return err
+				}
+				time.Sleep(250 * time.Microsecond)
+				continue
+			}
+			return err
+		}
+	}
+
+	done := make(chan struct{})
+	errCh := make(chan error, 8)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(250 * time.Microsecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if err := router.Refresh(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					errCh <- err
+					return
+				}
+			}
+		}
+	}()
+
+	keys := []string{
+		keyForSlot(t, 0, 1, "concurrent-router-a"),
+	}
+	for worker, key := range keys {
+		worker := worker
+		key := key
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for iteration := 0; iteration < 16; iteration++ {
+				value := fmt.Sprintf("worker-%d-%d", worker, iteration)
+				if err := retryTransient(func() error {
+					_, err := router.Put(ctx, key, value)
+					return err
+				}); err != nil {
+					errCh <- fmt.Errorf("put %q: %w", key, err)
+					return
+				}
+				if err := retryTransient(func() error {
+					result, err := router.Get(ctx, key)
+					if err != nil {
+						return err
+					}
+					if !result.Found || result.Value != value {
+						return fmt.Errorf("get %q = %#v, want value %q", key, result, value)
+					}
+					return nil
+				}); err != nil {
+					errCh <- err
+					return
+				}
+				if err := retryTransient(func() error {
+					_, err := router.Delete(ctx, key)
+					return err
+				}); err != nil {
+					errCh <- fmt.Errorf("delete %q: %w", key, err)
+					return
+				}
+				if err := retryTransient(func() error {
+					result, err := router.Get(ctx, key)
+					if err != nil {
+						return err
+					}
+					if result.Found {
+						return fmt.Errorf("get after delete %q = %#v, want not found", key, result)
+					}
+					return nil
+				}); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}()
+	}
+
+	time.Sleep(5 * time.Millisecond)
+	current := h.server.Current()
+	if _, err := h.server.MarkNodeDead(ctx, reconfigureCommand("dead-c", current.Version, coordinator.Event{
+		Kind:   coordinator.EventKindMarkNodeDead,
+		NodeID: "c",
+	}, coordinator.ReconfigurationPolicy{})); err != nil {
+		close(done)
+		wg.Wait()
+		t.Fatalf("MarkNodeDead returned error: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	if err := h.adapters["d"].Node().ReportHeartbeat(ctx); err != nil {
+		close(done)
+		wg.Wait()
+		t.Fatalf("ReportHeartbeat(d) returned error: %v", err)
+	}
+	if err := h.adapters["d"].Node().ActivateReplica(ctx, storage.ActivateReplicaCommand{Slot: 0}); err != nil {
+		close(done)
+		wg.Wait()
+		t.Fatalf("ActivateReplica(d) returned error: %v", err)
+	}
+
+	close(done)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent router workload returned error: %v", err)
+		}
+	}
+
+	if err := router.Refresh(ctx); err != nil {
+		t.Fatalf("final Refresh returned error: %v", err)
+	}
+	snapshot, ok := router.Snapshot()
+	if !ok {
+		t.Fatal("router snapshot missing after concurrent churn")
+	}
+	route := snapshot.Slots[0]
+	if !route.Readable || !route.Writable {
+		t.Fatalf("final route = %#v, want readable+writable", route)
+	}
+	if got, want := route.TailNodeID, "d"; got != want {
+		t.Fatalf("final tail node = %q, want %q", got, want)
+	}
+
+	verifyKey := keyForSlot(t, 0, 1, "concurrent-router-verify")
+	if _, err := router.Put(ctx, verifyKey, "final"); err != nil {
+		t.Fatalf("final Put returned error: %v", err)
+	}
+	readResult, err := router.Get(ctx, verifyKey)
+	if err != nil {
+		t.Fatalf("final Get returned error: %v", err)
+	}
+	if !readResult.Found || readResult.Value != "final" {
+		t.Fatalf("final Get result = %#v, want final value", readResult)
+	}
+	assertReplicaValueOnNodes(t, h, 0, verifyKey, "final", "a", "b", "d")
+}
+
 func TestRouterPutIfReturnsTypedConditionFailure(t *testing.T) {
 	ctx := context.Background()
 	h := newRouterHarness(t, []string{"a", "b", "c"})
@@ -734,7 +905,7 @@ func TestEndToEndRouterPutGetDeleteWithQueuedReplicationTransport(t *testing.T) 
 			t.Fatalf("head staged before first queued delivery = %v, want %v", got, want)
 		}
 	})
-	if _, err := router.Put(ctx, key, "v1"); err != nil {
+	if _, err := routerPutWithDelivery(t, ctx, router, h.repl, key, "v1"); err != nil {
 		t.Fatalf("Put returned error: %v", err)
 	}
 	if !observedHeadStaged {
@@ -747,7 +918,7 @@ func TestEndToEndRouterPutGetDeleteWithQueuedReplicationTransport(t *testing.T) 
 	if got, want := readResult.Value, "v1"; got != want {
 		t.Fatalf("read value = %q, want %q", got, want)
 	}
-	if _, err := router.Delete(ctx, key); err != nil {
+	if _, err := routerDeleteWithDelivery(t, ctx, router, h.repl, key); err != nil {
 		t.Fatalf("Delete returned error: %v", err)
 	}
 	readResult, err = router.Get(ctx, key)
@@ -803,7 +974,7 @@ func TestRouterCRAQLocalCommittedAndLinearizableReadsUseRealHarness(t *testing.T
 	}
 
 	key := keyForSlot(t, 0, 1, "craq-local-real")
-	if _, err := router.Put(ctx, key, "v1"); err != nil {
+	if _, err := routerPutWithDelivery(t, ctx, router, h.repl, key, "v1"); err != nil {
 		t.Fatalf("Put returned error: %v", err)
 	}
 	enqueueDirtyCommittedMiddleWrite(t, ctx, h, 0, key, "v2", 2)
@@ -852,7 +1023,7 @@ func TestRouterCRAQFallsBackDirectlyToTailWithRealHarness(t *testing.T) {
 	}
 
 	key := keyForSlot(t, 0, 1, "craq-tail-fallback-real")
-	if _, err := router.Put(ctx, key, "v1"); err != nil {
+	if _, err := routerPutWithDelivery(t, ctx, router, h.repl, key, "v1"); err != nil {
 		t.Fatalf("Put returned error: %v", err)
 	}
 	enqueueDirtyCommittedMiddleWrite(t, ctx, h, 0, key, "v2", 2)
@@ -1415,7 +1586,8 @@ func enqueueDirtyCommittedMiddleWrite(
 				UpdatedAt: ts,
 			},
 		},
-		FromNodeID: "a",
+		FromNodeID:   "a",
+		ChainVersion: 1,
 	}); err != nil {
 		t.Fatalf("HandleForwardWrite returned error: %v", err)
 	}
@@ -1440,7 +1612,7 @@ func misconfigureReadDependency(t *testing.T, node *storage.Node, slot int, tail
 }
 
 func setNextReadReplicaForSlot(router *Router, slot int, next int) {
-	router.mu.Lock()
-	defer router.mu.Unlock()
+	router.roundRobinMu.Lock()
+	defer router.roundRobinMu.Unlock()
 	router.nextReadReplica[slot] = next
 }

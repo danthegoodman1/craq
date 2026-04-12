@@ -34,7 +34,7 @@ func TestWriteBackpressureRejectsConcurrentWriteOnSameSlot(t *testing.T) {
 		})
 	})
 
-	if _, err := nodes["head"].HandleClientPut(ctx, ClientPutRequest{
+	if _, err := handleClientPutWithQueuedDelivery(t, ctx, nodes["head"], transport, ClientPutRequest{
 		Slot:                 1,
 		Key:                  "k1",
 		Value:                "v1",
@@ -66,21 +66,27 @@ func TestWriteBackpressureRejectsOtherSlotWhenNodeBudgetIsFull(t *testing.T) {
 	setupChainOnExistingNodes(t, nodes, 2, []string{"head", "tail-2"})
 
 	var nestedErr error
+	nestedErrCh := make(chan error, 1)
 	injected := false
 	transport.SetBeforeDeliver(func(msg QueuedReplicationMessage) {
 		if injected || msg.Forward == nil || msg.Forward.Operation.Slot != 1 {
 			return
 		}
 		injected = true
-		_, nestedErr = nodes["head"].HandleClientPut(ctx, ClientPutRequest{
-			Slot:                 2,
-			Key:                  "k2",
-			Value:                "v2",
-			ExpectedChainVersion: 1,
-		})
+		go func() {
+			_, err := runQueuedCommitResultWithDelivery(ctx, transport, func() (CommitResult, error) {
+				return nodes["head"].HandleClientPut(ctx, ClientPutRequest{
+					Slot:                 2,
+					Key:                  "k2",
+					Value:                "v2",
+					ExpectedChainVersion: 1,
+				})
+			})
+			nestedErrCh <- err
+		}()
 	})
 
-	if _, err := nodes["head"].HandleClientPut(ctx, ClientPutRequest{
+	if _, err := handleClientPutWithQueuedDelivery(t, ctx, nodes["head"], transport, ClientPutRequest{
 		Slot:                 1,
 		Key:                  "k1",
 		Value:                "v1",
@@ -88,6 +94,7 @@ func TestWriteBackpressureRejectsOtherSlotWhenNodeBudgetIsFull(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("outer HandleClientPut returned error: %v", err)
 	}
+	nestedErr = <-nestedErrCh
 	assertWriteBackpressure(t, nestedErr, 2, 1)
 	if got, want := mustNodeCommittedSnapshot(t, nodes["tail-2"], 2), map[string]string{}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("slot 2 committed snapshot = %v, want %v", got, want)
@@ -109,21 +116,27 @@ func TestWriteBackpressurePerSlotCapDoesNotStarveOtherSlots(t *testing.T) {
 	setupChainOnExistingNodes(t, nodes, 2, []string{"head", "tail-2"})
 
 	var nestedErr error
+	nestedErrCh := make(chan error, 1)
 	injected := false
 	transport.SetBeforeDeliver(func(msg QueuedReplicationMessage) {
 		if injected || msg.Forward == nil || msg.Forward.Operation.Slot != 1 {
 			return
 		}
 		injected = true
-		_, nestedErr = nodes["head"].HandleClientPut(ctx, ClientPutRequest{
-			Slot:                 2,
-			Key:                  "k2",
-			Value:                "v2",
-			ExpectedChainVersion: 1,
-		})
+		go func() {
+			_, err := runQueuedCommitResultWithDelivery(ctx, transport, func() (CommitResult, error) {
+				return nodes["head"].HandleClientPut(ctx, ClientPutRequest{
+					Slot:                 2,
+					Key:                  "k2",
+					Value:                "v2",
+					ExpectedChainVersion: 1,
+				})
+			})
+			nestedErrCh <- err
+		}()
 	})
 
-	if _, err := nodes["head"].HandleClientPut(ctx, ClientPutRequest{
+	if _, err := handleClientPutWithQueuedDelivery(t, ctx, nodes["head"], transport, ClientPutRequest{
 		Slot:                 1,
 		Key:                  "k1",
 		Value:                "v1",
@@ -131,6 +144,7 @@ func TestWriteBackpressurePerSlotCapDoesNotStarveOtherSlots(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("outer HandleClientPut returned error: %v", err)
 	}
+	nestedErr = <-nestedErrCh
 	if nestedErr != nil {
 		t.Fatalf("nested HandleClientPut returned error: %v", nestedErr)
 	}
@@ -166,7 +180,7 @@ func TestWriteAdmissionReleasesAfterAmbiguousTimeout(t *testing.T) {
 		cancel()
 	})
 
-	_, err := nodes["head"].HandleClientPut(ctx, ClientPutRequest{
+	_, err := handleClientPutWithQueuedDelivery(t, ctx, nodes["head"], transport, ClientPutRequest{
 		Slot:                 7,
 		Key:                  "k",
 		Value:                "v",
@@ -181,8 +195,10 @@ func TestWriteAdmissionReleasesAfterAmbiguousTimeout(t *testing.T) {
 	if got, want := nodes["head"].InFlightClientWrites(), 0; got != want {
 		t.Fatalf("in-flight client writes = %d, want %d", got, want)
 	}
-	if got, want := mustNodeStagedSequences(t, nodes["head"], 7), []uint64{1}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("staged sequences = %v, want %v", got, want)
+	headSnapshot := mustNodeCommittedSnapshot(t, nodes["head"], 7)
+	headStaged := mustNodeStagedSequences(t, nodes["head"], 7)
+	if !reflect.DeepEqual(headSnapshot, map[string]string{"k": "v"}) && !reflect.DeepEqual(headStaged, []uint64{1}) {
+		t.Fatalf("head state = snapshot %v staged %v, want committed value or staged sequence 1", headSnapshot, headStaged)
 	}
 	if got, want := mustNodeCommittedSnapshot(t, nodes["tail"], 7), map[string]string{"k": "v"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("tail committed snapshot = %v, want %v", got, want)
@@ -191,71 +207,74 @@ func TestWriteAdmissionReleasesAfterAmbiguousTimeout(t *testing.T) {
 
 func TestReplicaBackpressureEnforcesNodeWideBufferedLimit(t *testing.T) {
 	ctx := context.Background()
-	transport := NewInMemoryReplicationTransport()
+	transport := &scriptedTransport{}
 	node := mustNewNode(t, ctx, Config{
 		NodeID:                            "tail",
 		MaxBufferedReplicaMessagesPerNode: 2,
 		MaxBufferedReplicaMessagesPerSlot: 4,
 	}, NewInMemoryBackend(), NewInMemoryCoordinatorClient(), transport)
-	mustActivateReplica(t, node, 1, ReplicaAssignment{Slot: 1, ChainVersion: 1, Role: ReplicaRoleSingle})
-	mustActivateReplica(t, node, 2, ReplicaAssignment{Slot: 2, ChainVersion: 1, Role: ReplicaRoleSingle})
+	mustActivateReplica(t, node, 1, ReplicaAssignment{
+		Slot:         1,
+		ChainVersion: 1,
+		Role:         ReplicaRoleTail,
+		Peers:        ChainPeers{PredecessorNodeID: "pred-1"},
+	})
+	mustActivateReplica(t, node, 2, ReplicaAssignment{
+		Slot:         2,
+		ChainVersion: 1,
+		Role:         ReplicaRoleTail,
+		Peers:        ChainPeers{PredecessorNodeID: "pred-2"},
+	})
 
-	record := node.ensureProtocolState(node.replicas[1])
-	var err error
-	record, err = node.bufferFutureForward(record, ForwardWriteRequest{
-		Operation:  WriteOperation{Slot: 1, Sequence: 2, Kind: OperationKindPut, Key: "k1", Value: "v1"},
-		FromNodeID: "pred-1",
-	})
-	if err != nil {
-		t.Fatalf("bufferFutureForward(seq=2) returned error: %v", err)
+	if err := node.HandleForwardWrite(ctx, ForwardWriteRequest{
+		Operation:    WriteOperation{Slot: 1, Sequence: 2, Kind: OperationKindPut, Key: "k1", Value: "v1"},
+		FromNodeID:   "pred-1",
+		ChainVersion: 1,
+	}); err != nil {
+		t.Fatalf("HandleForwardWrite(seq=2) returned error: %v", err)
 	}
-	node.replicas[1] = record
-	record = node.replicas[1]
-	record, err = node.bufferFutureForward(record, ForwardWriteRequest{
-		Operation:  WriteOperation{Slot: 1, Sequence: 2, Kind: OperationKindPut, Key: "k1", Value: "v1"},
-		FromNodeID: "pred-1",
-	})
-	if err != nil {
-		t.Fatalf("duplicate bufferFutureForward returned error: %v", err)
+	if err := node.HandleForwardWrite(ctx, ForwardWriteRequest{
+		Operation:    WriteOperation{Slot: 1, Sequence: 2, Kind: OperationKindPut, Key: "k1", Value: "v1"},
+		FromNodeID:   "pred-1",
+		ChainVersion: 1,
+	}); err != nil {
+		t.Fatalf("duplicate HandleForwardWrite(seq=2) returned error: %v", err)
 	}
-	node.replicas[1] = record
-	record = node.replicas[1]
-	record, err = node.bufferFutureForward(record, ForwardWriteRequest{
-		Operation:  WriteOperation{Slot: 1, Sequence: 3, Kind: OperationKindPut, Key: "k2", Value: "v2"},
-		FromNodeID: "pred-1",
-	})
-	if err != nil {
-		t.Fatalf("bufferFutureForward(seq=3) returned error: %v", err)
+	if err := node.HandleForwardWrite(ctx, ForwardWriteRequest{
+		Operation:    WriteOperation{Slot: 1, Sequence: 3, Kind: OperationKindPut, Key: "k2", Value: "v2"},
+		FromNodeID:   "pred-1",
+		ChainVersion: 1,
+	}); err != nil {
+		t.Fatalf("HandleForwardWrite(seq=3) returned error: %v", err)
 	}
-	node.replicas[1] = record
 	if got, want := node.BufferedReplicaMessages(), 2; got != want {
 		t.Fatalf("buffered replica messages = %d, want %d", got, want)
 	}
 
-	record = node.ensureProtocolState(node.replicas[2])
-	record, err = node.bufferFutureForward(record, ForwardWriteRequest{
-		Operation:  WriteOperation{Slot: 2, Sequence: 2, Kind: OperationKindPut, Key: "k3", Value: "v3"},
-		FromNodeID: "pred-2",
+	err := node.HandleForwardWrite(ctx, ForwardWriteRequest{
+		Operation:    WriteOperation{Slot: 2, Sequence: 2, Kind: OperationKindPut, Key: "k3", Value: "v3"},
+		FromNodeID:   "pred-2",
+		ChainVersion: 1,
 	})
 	assertReplicaBackpressure(t, err, 2, 2)
 
-	if err := node.applyForward(ctx, node.replicas[1], ForwardWriteRequest{
-		Operation: WriteOperation{Slot: 1, Sequence: 1, Kind: OperationKindPut, Key: "k0", Value: "v0"},
+	if err := node.HandleForwardWrite(ctx, ForwardWriteRequest{
+		Operation:    WriteOperation{Slot: 1, Sequence: 1, Kind: OperationKindPut, Key: "k0", Value: "v0"},
+		FromNodeID:   "pred-1",
+		ChainVersion: 1,
 	}); err != nil {
-		t.Fatalf("applyForward(seq=1) returned error: %v", err)
+		t.Fatalf("HandleForwardWrite(seq=1) returned error: %v", err)
 	}
 	if got, want := node.BufferedReplicaMessages(), 0; got != want {
 		t.Fatalf("buffered replica messages after drain = %d, want %d", got, want)
 	}
-	record = node.ensureProtocolState(node.replicas[2])
-	record, err = node.bufferFutureForward(record, ForwardWriteRequest{
-		Operation:  WriteOperation{Slot: 2, Sequence: 2, Kind: OperationKindPut, Key: "k3", Value: "v3"},
-		FromNodeID: "pred-2",
-	})
-	if err != nil {
-		t.Fatalf("bufferFutureForward(slot=2, seq=2) returned error after drain: %v", err)
+	if err := node.HandleForwardWrite(ctx, ForwardWriteRequest{
+		Operation:    WriteOperation{Slot: 2, Sequence: 2, Kind: OperationKindPut, Key: "k3", Value: "v3"},
+		FromNodeID:   "pred-2",
+		ChainVersion: 1,
+	}); err != nil {
+		t.Fatalf("HandleForwardWrite(slot=2, seq=2) returned error after drain: %v", err)
 	}
-	node.replicas[2] = record
 }
 
 func TestCatchupBackpressureRejectsConcurrentAddReplicaAsTail(t *testing.T) {

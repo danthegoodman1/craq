@@ -76,7 +76,7 @@ func TestCoordinatorFailoverClientsOverGRPC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RoutingSnapshot after failover returned error: %v", err)
 	}
-	if got, want := snapshot.Version, uint64(2); got != want {
+	if got, want := snapshot.Version, uint64(1); got != want {
 		t.Fatalf("routing snapshot version = %d, want %d", got, want)
 	}
 

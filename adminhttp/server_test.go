@@ -100,6 +100,10 @@ func TestCoordinatorAdminHTTPExposesHealthMetricsAndState(t *testing.T) {
 	if resp.RoutingSnapshot.SlotCount != 1 {
 		t.Fatalf("routing snapshot slot count = %d, want 1", resp.RoutingSnapshot.SlotCount)
 	}
+	routing := mustGETJSON[coordserver.RoutingStatus](t, baseURL+"/admin/v1/routing")
+	if routing.RoutingSnapshot.SlotCount != 1 {
+		t.Fatalf("routing status slot count = %d, want 1", routing.RoutingSnapshot.SlotCount)
+	}
 	if len(resp.Recent) == 0 {
 		t.Fatal("admin state recent events unexpectedly empty")
 	}

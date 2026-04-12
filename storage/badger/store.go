@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"sync"
 
@@ -15,11 +16,12 @@ import (
 )
 
 const (
-	keyReplicaMeta   byte = 'm'
-	keyCommittedData byte = 'c'
-	keyStagedOp      byte = 's'
-	keyLocalReplica  byte = 'l'
-	keyLocalNodeMeta byte = 'n'
+	keyReplicaMeta         byte = 'm'
+	keyReplicaUpstreamMeta byte = 'u'
+	keyCommittedData       byte = 'c'
+	keyStagedOp            byte = 's'
+	keyLocalReplica        byte = 'l'
+	keyLocalNodeMeta       byte = 'n'
 )
 
 const (
@@ -29,6 +31,7 @@ const (
 	opSetHighestCommittedSequence = "set_highest_committed_sequence"
 	opCommitSequence              = "commit_sequence"
 	opApplyCommitted              = "apply_committed"
+	opApplyCommittedBatch         = "apply_committed_batch"
 	opUpsertLocalReplica          = "upsert_local_replica"
 	opDeleteLocalReplica          = "delete_local_replica"
 	opSetLocalNodeMeta            = "set_local_node_meta"
@@ -41,6 +44,7 @@ type Store struct {
 
 type owner struct {
 	db        *badgerdb.DB
+	path      string
 	closeErr  error
 	closeOnce sync.Once
 }
@@ -78,7 +82,7 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("err in badger.Open: %w", err)
 	}
-	owner := &owner{db: db}
+	owner := &owner{db: db, path: path}
 	if err := owner.cleanupStagedOperationsOnOpen(); err != nil {
 		closeErr := owner.Close()
 		if closeErr != nil {
@@ -119,6 +123,19 @@ func (l *LocalStore) Close() error {
 	return l.owner.Close()
 }
 
+func (l *LocalStore) CommitJournal(nodeID string) (storage.CommitJournalStore, error) {
+	return l.CommitJournalShard(nodeID, 0)
+}
+
+func (l *LocalStore) CommitJournalShard(nodeID string, shard int) (storage.CommitJournalStore, error) {
+	journalPath := filepath.Join(l.owner.path, fmt.Sprintf("commit-journal-%s-%02d.log", nodeID, shard))
+	journal, err := storage.OpenFileCommitJournalForLocalState(journalPath)
+	if err != nil {
+		return nil, err
+	}
+	return journal, nil
+}
+
 func (b *Backend) CreateReplica(slot int) error {
 	if _, err := b.HighestCommittedSequence(slot); err == nil {
 		return fmt.Errorf("%w: slot %d", storage.ErrReplicaExists, slot)
@@ -126,7 +143,10 @@ func (b *Backend) CreateReplica(slot int) error {
 		return err
 	}
 	if err := b.owner.writeSync(opCreateReplica, func(txn *badgerdb.Txn) error {
-		return txn.Set(replicaMetaKey(slot), encodeUint64(0))
+		if err := txn.Set(replicaMetaKey(slot), encodeUint64(0)); err != nil {
+			return err
+		}
+		return txn.Set(replicaUpstreamMetaKey(slot), encodeUint64(0))
 	}); err != nil {
 		return fmt.Errorf("err in owner.writeSync(create replica): %w", err)
 	}
@@ -146,6 +166,9 @@ func (b *Backend) DeleteReplica(slot int) error {
 		}
 		if err := txn.Delete(replicaMetaKey(slot)); err != nil {
 			return fmt.Errorf("err in txn.Delete(replica meta): %w", err)
+		}
+		if err := txn.Delete(replicaUpstreamMetaKey(slot)); err != nil {
+			return fmt.Errorf("err in txn.Delete(replica upstream meta): %w", err)
 		}
 		return nil
 	}); err != nil {
@@ -197,6 +220,9 @@ func (b *Backend) SetHighestCommittedSequence(slot int, sequence uint64) error {
 		if err := txn.Set(replicaMetaKey(slot), encodeUint64(sequence)); err != nil {
 			return fmt.Errorf("err in txn.Set(replica meta): %w", err)
 		}
+		if err := txn.Set(replicaUpstreamMetaKey(slot), encodeUint64(sequence)); err != nil {
+			return fmt.Errorf("err in txn.Set(replica upstream meta): %w", err)
+		}
 		return nil
 	}); err != nil {
 		return fmt.Errorf("err in owner.writeSync(set highest committed sequence): %w", err)
@@ -204,7 +230,117 @@ func (b *Backend) SetHighestCommittedSequence(slot int, sequence uint64) error {
 	return nil
 }
 
-func (b *Backend) ApplyCommitted(_ context.Context, nodeID string, operation storage.WriteOperation, persisted *storage.PersistedReplica) error {
+func (b *Backend) ApplyCommitted(ctx context.Context, nodeID string, operation storage.WriteOperation, persisted *storage.PersistedReplica) error {
+	upstreamConfirmed := operation.Sequence
+	if persisted != nil {
+		upstreamConfirmed = persisted.HighestUpstreamConfirmedSequence
+	}
+	if err := runBeforeDurableWrite(opApplyCommitted); err != nil {
+		return err
+	}
+	return b.ApplyCommittedBatch(ctx, nodeID, []storage.DurableCommit{{
+		Operation:                 operation,
+		UpstreamConfirmedSequence: upstreamConfirmed,
+	}})
+}
+
+func (b *Backend) ApplyCommittedBatch(_ context.Context, _ string, commits []storage.DurableCommit) error {
+	if len(commits) == 0 {
+		return nil
+	}
+	expected := make(map[int]uint64)
+	for _, commit := range commits {
+		highestCommitted, ok := expected[commit.Operation.Slot]
+		if !ok {
+			current, err := b.HighestCommittedSequence(commit.Operation.Slot)
+			if err != nil {
+				return err
+			}
+			highestCommitted = current
+		}
+		if commit.Operation.Sequence != highestCommitted+1 {
+			return fmt.Errorf(
+				"%w: slot %d expected commit sequence %d, got %d",
+				storage.ErrSequenceMismatch,
+				commit.Operation.Slot,
+				highestCommitted+1,
+				commit.Operation.Sequence,
+			)
+		}
+		expected[commit.Operation.Slot] = commit.Operation.Sequence
+	}
+	if err := runBeforeDurableWrite(opApplyCommittedBatch); err != nil {
+		return err
+	}
+	wb := b.owner.db.NewWriteBatch()
+	defer wb.Cancel()
+	for _, commit := range commits {
+		operation := commit.Operation
+		switch operation.Kind {
+		case storage.OperationKindPut:
+			encoded, err := json.Marshal(storage.CommittedObject{
+				Value:    operation.Value,
+				Metadata: operation.Metadata,
+			})
+			if err != nil {
+				return fmt.Errorf("err in json.Marshal(committed put): %w", err)
+			}
+			if err := wb.Set(committedKey(operation.Slot, operation.Key), encoded); err != nil {
+				return fmt.Errorf("err in wb.Set(committed put): %w", err)
+			}
+		case storage.OperationKindDelete:
+			if err := wb.Delete(committedKey(operation.Slot, operation.Key)); err != nil {
+				return fmt.Errorf("err in wb.Delete(committed delete): %w", err)
+			}
+		default:
+			return fmt.Errorf("%w: unsupported operation kind %q", storage.ErrInvalidConfig, operation.Kind)
+		}
+		if err := wb.Delete(stagedKey(operation.Slot, operation.Sequence)); err != nil {
+			return fmt.Errorf("err in wb.Delete(staged op): %w", err)
+		}
+		if err := wb.Set(replicaMetaKey(operation.Slot), encodeUint64(operation.Sequence)); err != nil {
+			return fmt.Errorf("err in wb.Set(replica meta): %w", err)
+		}
+		if err := wb.Set(replicaUpstreamMetaKey(operation.Slot), encodeUint64(commit.UpstreamConfirmedSequence)); err != nil {
+			return fmt.Errorf("err in wb.Set(replica upstream meta): %w", err)
+		}
+	}
+	if err := wb.Flush(); err != nil {
+		return fmt.Errorf("err in wb.Flush(apply committed batch): %w", err)
+	}
+	return nil
+}
+
+func (b *Backend) HighestUpstreamConfirmedSequence(slot int) (uint64, error) {
+	if _, err := b.HighestCommittedSequence(slot); err != nil {
+		return 0, err
+	}
+	value, found, err := b.owner.get(replicaUpstreamMetaKey(slot))
+	if err != nil {
+		return 0, fmt.Errorf("err in db.Get(replica upstream meta): %w", err)
+	}
+	if !found {
+		return 0, nil
+	}
+	return decodeUint64(value)
+}
+
+func (b *Backend) SetHighestUpstreamConfirmedSequence(slot int, sequence uint64) error {
+	if _, err := b.HighestCommittedSequence(slot); err != nil {
+		return err
+	}
+	if err := b.owner.writeSync(opSetHighestCommittedSequence, func(txn *badgerdb.Txn) error {
+		if err := txn.Set(replicaUpstreamMetaKey(slot), encodeUint64(sequence)); err != nil {
+			return fmt.Errorf("err in txn.Set(replica upstream meta): %w", err)
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("err in owner.writeSync(set highest upstream confirmed sequence): %w", err)
+	}
+	return nil
+}
+
+func (b *Backend) legacyApplyCommitted(_ context.Context, nodeID string, operation storage.WriteOperation, persisted *storage.PersistedReplica) error {
 	highestCommitted, err := b.HighestCommittedSequence(operation.Slot)
 	if err != nil {
 		return err
@@ -244,15 +380,6 @@ func (b *Backend) ApplyCommitted(_ context.Context, nodeID string, operation sto
 		}
 		if err := txn.Set(replicaMetaKey(operation.Slot), encodeUint64(operation.Sequence)); err != nil {
 			return fmt.Errorf("err in txn.Set(replica meta): %w", err)
-		}
-		if persisted != nil {
-			encoded, err := json.Marshal(*persisted)
-			if err != nil {
-				return fmt.Errorf("err in json.Marshal(local replica): %w", err)
-			}
-			if err := txn.Set(localReplicaKey(nodeID, persisted.Assignment.Slot), encoded); err != nil {
-				return fmt.Errorf("err in txn.Set(local replica): %w", err)
-			}
 		}
 		return nil
 	}); err != nil {
@@ -322,6 +449,9 @@ func (b *Backend) CommitSequence(slot int, sequence uint64) error {
 		}
 		if err := txn.Set(replicaMetaKey(slot), encodeUint64(sequence)); err != nil {
 			return fmt.Errorf("err in txn.Set(replica meta): %w", err)
+		}
+		if err := txn.Set(replicaUpstreamMetaKey(slot), encodeUint64(sequence)); err != nil {
+			return fmt.Errorf("err in txn.Set(replica upstream meta): %w", err)
 		}
 		return nil
 	}); err != nil {
@@ -625,6 +755,10 @@ func setBeforeDurableWriteForTest(hook func(op string) error) func() {
 
 func replicaMetaKey(slot int) []byte {
 	return append([]byte{keyReplicaMeta}, encodeSlot(slot)...)
+}
+
+func replicaUpstreamMetaKey(slot int) []byte {
+	return append([]byte{keyReplicaUpstreamMeta}, encodeSlot(slot)...)
 }
 
 func committedPrefix(slot int) []byte {

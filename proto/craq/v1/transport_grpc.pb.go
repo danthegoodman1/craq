@@ -514,6 +514,7 @@ const (
 	StorageService_DropRecoveredReplica_FullMethodName   = "/craq.v1.StorageService/DropRecoveredReplica"
 	StorageService_ForwardWrite_FullMethodName           = "/craq.v1.StorageService/ForwardWrite"
 	StorageService_CommitWrite_FullMethodName            = "/craq.v1.StorageService/CommitWrite"
+	StorageService_Replicate_FullMethodName              = "/craq.v1.StorageService/Replicate"
 	StorageService_FetchSnapshot_FullMethodName          = "/craq.v1.StorageService/FetchSnapshot"
 	StorageService_FetchCommittedSequence_FullMethodName = "/craq.v1.StorageService/FetchCommittedSequence"
 )
@@ -535,6 +536,7 @@ type StorageServiceClient interface {
 	DropRecoveredReplica(ctx context.Context, in *DropRecoveredReplicaCommand, opts ...grpc.CallOption) (*Empty, error)
 	ForwardWrite(ctx context.Context, in *ForwardWriteRequest, opts ...grpc.CallOption) (*Empty, error)
 	CommitWrite(ctx context.Context, in *CommitWriteRequest, opts ...grpc.CallOption) (*Empty, error)
+	Replicate(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ReplicationFrame, ReplicationFrame], error)
 	FetchSnapshot(ctx context.Context, in *FetchSnapshotRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SnapshotEntry], error)
 	FetchCommittedSequence(ctx context.Context, in *FetchCommittedSequenceRequest, opts ...grpc.CallOption) (*FetchCommittedSequenceResponse, error)
 }
@@ -677,9 +679,22 @@ func (c *storageServiceClient) CommitWrite(ctx context.Context, in *CommitWriteR
 	return out, nil
 }
 
+func (c *storageServiceClient) Replicate(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ReplicationFrame, ReplicationFrame], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &StorageService_ServiceDesc.Streams[0], StorageService_Replicate_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ReplicationFrame, ReplicationFrame]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type StorageService_ReplicateClient = grpc.BidiStreamingClient[ReplicationFrame, ReplicationFrame]
+
 func (c *storageServiceClient) FetchSnapshot(ctx context.Context, in *FetchSnapshotRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SnapshotEntry], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &StorageService_ServiceDesc.Streams[0], StorageService_FetchSnapshot_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &StorageService_ServiceDesc.Streams[1], StorageService_FetchSnapshot_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -723,6 +738,7 @@ type StorageServiceServer interface {
 	DropRecoveredReplica(context.Context, *DropRecoveredReplicaCommand) (*Empty, error)
 	ForwardWrite(context.Context, *ForwardWriteRequest) (*Empty, error)
 	CommitWrite(context.Context, *CommitWriteRequest) (*Empty, error)
+	Replicate(grpc.BidiStreamingServer[ReplicationFrame, ReplicationFrame]) error
 	FetchSnapshot(*FetchSnapshotRequest, grpc.ServerStreamingServer[SnapshotEntry]) error
 	FetchCommittedSequence(context.Context, *FetchCommittedSequenceRequest) (*FetchCommittedSequenceResponse, error)
 	mustEmbedUnimplementedStorageServiceServer()
@@ -773,6 +789,9 @@ func (UnimplementedStorageServiceServer) ForwardWrite(context.Context, *ForwardW
 }
 func (UnimplementedStorageServiceServer) CommitWrite(context.Context, *CommitWriteRequest) (*Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method CommitWrite not implemented")
+}
+func (UnimplementedStorageServiceServer) Replicate(grpc.BidiStreamingServer[ReplicationFrame, ReplicationFrame]) error {
+	return status.Error(codes.Unimplemented, "method Replicate not implemented")
 }
 func (UnimplementedStorageServiceServer) FetchSnapshot(*FetchSnapshotRequest, grpc.ServerStreamingServer[SnapshotEntry]) error {
 	return status.Error(codes.Unimplemented, "method FetchSnapshot not implemented")
@@ -1035,6 +1054,13 @@ func _StorageService_CommitWrite_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _StorageService_Replicate_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(StorageServiceServer).Replicate(&grpc.GenericServerStream[ReplicationFrame, ReplicationFrame]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type StorageService_ReplicateServer = grpc.BidiStreamingServer[ReplicationFrame, ReplicationFrame]
+
 func _StorageService_FetchSnapshot_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(FetchSnapshotRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -1129,6 +1155,12 @@ var StorageService_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "Replicate",
+			Handler:       _StorageService_Replicate_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
 		{
 			StreamName:    "FetchSnapshot",
 			Handler:       _StorageService_FetchSnapshot_Handler,
