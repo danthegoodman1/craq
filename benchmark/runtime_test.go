@@ -232,6 +232,21 @@ func TestLocalRuntimeAndLoadGen(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(outputDir, "loadgen-report.json")); err != nil {
 		t.Fatalf("loadgen-report.json stat error: %v", err)
 	}
+	for _, path := range []string{
+		filepath.Join(outputDir, "metric-snapshots", "preload-end", "coordinator.prom"),
+		filepath.Join(outputDir, "metric-snapshots", "preload-end", "storage-a.prom"),
+		filepath.Join(outputDir, "metric-snapshots", "get-start", "coordinator.prom"),
+		filepath.Join(outputDir, "metric-snapshots", "get-end", "storage-a.prom"),
+		filepath.Join(outputDir, "metric-snapshots", "mixed-start", "storage-b.prom"),
+		filepath.Join(outputDir, "metric-snapshots", "mixed-end", "storage-c.prom"),
+	} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("metric snapshot %q stat error: %v", path, err)
+		}
+	}
+	if putSummary, ok := scenarioOperationSummary(report.Scenarios[1], "put"); !ok || putSummary.TotalOps == 0 {
+		t.Fatalf("mixed scenario put summary = %#v, want non-zero", putSummary)
+	}
 }
 
 func TestBenchmarkStartupMaxChangedChainsUsesStartupFloor(t *testing.T) {

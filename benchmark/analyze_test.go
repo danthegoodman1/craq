@@ -1,11 +1,15 @@
 package benchmark
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/expfmt"
 )
 
 func TestAnalyzeRunGeneratesSummaryAndHTML(t *testing.T) {
@@ -35,13 +39,15 @@ func TestAnalyzeRunGeneratesSummaryAndHTML(t *testing.T) {
 	report := LoadGenReport{
 		RunID: "run-123",
 		Scenarios: []ScenarioReport{{
-			Name:        "get-only-c64",
-			Kind:        "get",
-			Concurrency: 64,
-			P50Millis:   1.2,
-			P95Millis:   2.4,
-			P99Millis:   3.9,
-			Throughput:  1234.5,
+			Name:        "put-only-c32",
+			Kind:        "put",
+			Concurrency: 32,
+			P50Millis:   12.5,
+			P95Millis:   20.4,
+			P99Millis:   27.9,
+			Throughput:  321.5,
+			TotalOps:    10,
+			SuccessOps:  10,
 		}},
 	}
 	if err := SaveJSON(filepath.Join(artifactsDir, "client", "loadgen-report.json"), report); err != nil {
@@ -65,6 +71,14 @@ func TestAnalyzeRunGeneratesSummaryAndHTML(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	writeStart := filepath.Join(artifactsDir, "client", "metric-snapshots", "put-only-c32-start", "storage-a.prom")
+	writeEnd := filepath.Join(artifactsDir, "client", "metric-snapshots", "put-only-c32-end", "storage-a.prom")
+	if err := writeMetricSnapshot(t, writeStart, 0, 0, 0, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeMetricSnapshot(t, writeEnd, 2, 0.02, 5, 0.11, 5, 0.09); err != nil {
+		t.Fatal(err)
+	}
 
 	summary, err := AnalyzeRun(runDir)
 	if err != nil {
@@ -77,7 +91,7 @@ func TestAnalyzeRunGeneratesSummaryAndHTML(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(htmlData), "get-only-c64") {
+	if !strings.Contains(string(htmlData), "put-only-c32") {
 		t.Fatalf("analysis html missing scenario name: %s", string(htmlData))
 	}
 	jsonData, err := os.ReadFile(filepath.Join(runDir, "analysis", "summary.json"))
@@ -90,4 +104,59 @@ func TestAnalyzeRunGeneratesSummaryAndHTML(t *testing.T) {
 	if got := summary.System["client"].CPUUtilization[0].Timestamp; got != (time.Date(2026, 1, 1, 0, 0, 1, 0, time.UTC)) {
 		t.Fatalf("first client cpu timestamp = %s", got)
 	}
+	if summary.WriteBudget["put-only-c32"].DominantStage != "head_wait_for_commit" {
+		t.Fatalf("dominant stage = %q, want head_wait_for_commit", summary.WriteBudget["put-only-c32"].DominantStage)
+	}
+	budgetData, err := os.ReadFile(filepath.Join(runDir, "analysis", "write_latency_budget.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(budgetData), `"stage": "head_wait_for_commit"`) {
+		t.Fatalf("write latency budget missing dominant stage: %s", string(budgetData))
+	}
+}
+
+func writeMetricSnapshot(t *testing.T, path string, headCount uint64, headSum float64, waitCount uint64, waitSum float64, putCount uint64, putSum float64) error {
+	t.Helper()
+	registry := prometheus.NewRegistry()
+	stageHist := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "craq_storage_write_stage_seconds",
+		Help: "stage metrics",
+	}, []string{"stage", "role", "result"})
+	grpcHist := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "craq_grpc_request_duration_seconds",
+		Help: "grpc metrics",
+	}, []string{"component", "method"})
+	registry.MustRegister(stageHist, grpcHist)
+	observeHistogram(stageHist.WithLabelValues("head_get_committed", "head", "success"), headCount, headSum)
+	observeHistogram(stageHist.WithLabelValues("head_wait_for_commit", "head", "success"), waitCount, waitSum)
+	observeHistogram(grpcHist.WithLabelValues("storage", "/craq.v1.StorageService/Put"), putCount, putSum)
+	return writeRegistryMetrics(path, registry)
+}
+
+func observeHistogram(observer prometheus.Observer, count uint64, sum float64) {
+	if count == 0 {
+		return
+	}
+	value := sum / float64(count)
+	for i := uint64(0); i < count; i++ {
+		observer.Observe(value)
+	}
+}
+
+func writeRegistryMetrics(path string, registry *prometheus.Registry) error {
+	families, err := registry.Gather()
+	if err != nil {
+		return err
+	}
+	var buf bytes.Buffer
+	for _, family := range families {
+		if _, err := expfmt.MetricFamilyToText(&buf, family); err != nil {
+			return err
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, buf.Bytes(), 0o644)
 }

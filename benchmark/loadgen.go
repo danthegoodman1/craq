@@ -63,6 +63,7 @@ func RunLoadGen(ctx context.Context, cfg LoadGenProcessConfig) (LoadGenReport, e
 	if err := router.Refresh(ctx); err != nil {
 		return LoadGenReport{}, fmt.Errorf("refresh benchmark client router: %w", err)
 	}
+	metricTargets := loadgenMetricSnapshotTargets(manifest)
 	profileTargets := loadgenProfileTargets(manifest)
 	rng := rand.New(rand.NewSource(cfg.Workload.Seed))
 
@@ -82,6 +83,9 @@ func RunLoadGen(ctx context.Context, cfg LoadGenProcessConfig) (LoadGenReport, e
 		Keys:     cfg.Workload.PreloadKeys,
 		Duration: time.Since(preloadStarted),
 	}
+	if err := collectMetricSnapshot(ctx, cfg.OutputDir, "preload-end", metricTargets); err != nil {
+		return report, err
+	}
 
 	for _, scenario := range cfg.Workload.Scenarios {
 		select {
@@ -89,7 +93,7 @@ func RunLoadGen(ctx context.Context, cfg LoadGenProcessConfig) (LoadGenReport, e
 			return report, ctx.Err()
 		default:
 		}
-		result, err := runScenario(ctx, router, cfg.OutputDir, cfg.Workload, scenario, rng, cfg.Telemetry, profileTargets)
+		result, err := runScenario(ctx, router, cfg.OutputDir, cfg.Workload, scenario, rng, cfg.Telemetry, profileTargets, metricTargets)
 		if err != nil {
 			report.Errors = append(report.Errors, err.Error())
 			return report, err
@@ -122,6 +126,7 @@ func runScenario(
 	rng *rand.Rand,
 	telemetry TelemetryProfile,
 	profileTargets []loadgenProfileTarget,
+	metricTargets []metricSnapshotTarget,
 ) (ScenarioReport, error) {
 	report := ScenarioReport{
 		Name:        scenario.Name,
@@ -139,6 +144,28 @@ func runScenario(
 	defer file.Close()
 
 	profiler := startScenarioProfiler(ctx, outputDir, scenario, telemetry, profileTargets)
+	snapshotErrs := make(chan error, 2)
+	var snapshotWG sync.WaitGroup
+	scheduleSnapshot := func(delay time.Duration, suffix string) {
+		snapshotWG.Add(1)
+		go func() {
+			defer snapshotWG.Done()
+			if err := waitForScenarioProfileStart(ctx, delay); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				snapshotErrs <- err
+				return
+			}
+			snapCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			if err := collectMetricSnapshot(snapCtx, outputDir, sanitizeScenarioName(scenario.Name)+"-"+suffix, metricTargets); err != nil {
+				snapshotErrs <- err
+			}
+		}()
+	}
+	scheduleSnapshot(scenario.Warmup, "start")
+	scheduleSnapshot(scenario.Warmup+scenario.Duration, "end")
 
 	type opResult struct {
 		at        time.Time
@@ -227,6 +254,7 @@ func runScenario(
 	}()
 
 	var samples []float64
+	var measuredSamples []latencySample
 	var intervalSamples []latencySample
 	intervalStarted := time.Now()
 	flushInterval := func(now time.Time) {
@@ -276,6 +304,7 @@ loop:
 				report.WriteOps++
 			}
 			samples = append(samples, sample.Millis)
+			measuredSamples = append(measuredSamples, sample)
 			intervalSamples = append(intervalSamples, sample)
 			if sample.At.Sub(intervalStarted) >= workload.Interval {
 				flushInterval(sample.At)
@@ -295,8 +324,57 @@ loop:
 	if measuredDuration > 0 {
 		report.Throughput = float64(report.TotalOps) / measuredDuration.Seconds()
 	}
+	report.Operations = buildOperationSummaries(measuredSamples, measuredDuration)
 	report.Histogram = histogram(samples)
+	snapshotWG.Wait()
+	close(snapshotErrs)
+	for err := range snapshotErrs {
+		if err != nil {
+			return report, err
+		}
+	}
 	return report, nil
+}
+
+func buildOperationSummaries(samples []latencySample, measuredDuration time.Duration) []OperationSummary {
+	if len(samples) == 0 {
+		return nil
+	}
+	latenciesByOperation := map[string][]float64{}
+	summariesByOperation := map[string]*OperationSummary{}
+	for _, sample := range samples {
+		latenciesByOperation[sample.Operation] = append(latenciesByOperation[sample.Operation], sample.Millis)
+		summary, ok := summariesByOperation[sample.Operation]
+		if !ok {
+			summary = &OperationSummary{Operation: sample.Operation}
+			summariesByOperation[sample.Operation] = summary
+		}
+		summary.TotalOps++
+		if sample.Successful {
+			summary.SuccessOps++
+		} else {
+			summary.ErrorOps++
+		}
+	}
+	names := make([]string, 0, len(summariesByOperation))
+	for name := range summariesByOperation {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	summaries := make([]OperationSummary, 0, len(names))
+	for _, name := range names {
+		latencies := latenciesByOperation[name]
+		summary := *summariesByOperation[name]
+		summary.P50Millis = percentile(latencies, 50)
+		summary.P95Millis = percentile(latencies, 95)
+		summary.P99Millis = percentile(latencies, 99)
+		summary.MaxMillis = percentile(latencies, 100)
+		if measuredDuration > 0 {
+			summary.Throughput = float64(summary.TotalOps) / measuredDuration.Seconds()
+		}
+		summaries = append(summaries, summary)
+	}
+	return summaries
 }
 
 func buildIntervalSummary(at time.Time, samples []latencySample) IntervalSample {

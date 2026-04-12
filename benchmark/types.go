@@ -93,25 +93,38 @@ type PreloadReport struct {
 }
 
 type ScenarioReport struct {
-	Name        string            `json:"name"`
-	Kind        string            `json:"kind"`
-	Concurrency int               `json:"concurrency"`
-	Warmup      time.Duration     `json:"warmup"`
-	Duration    time.Duration     `json:"duration"`
-	StartedAt   time.Time         `json:"started_at"`
-	FinishedAt  time.Time         `json:"finished_at"`
-	TotalOps    int64             `json:"total_ops"`
-	SuccessOps  int64             `json:"success_ops"`
-	ErrorOps    int64             `json:"error_ops"`
-	ReadOps     int64             `json:"read_ops"`
-	WriteOps    int64             `json:"write_ops"`
-	P50Millis   float64           `json:"p50_ms"`
-	P95Millis   float64           `json:"p95_ms"`
-	P99Millis   float64           `json:"p99_ms"`
-	MaxMillis   float64           `json:"max_ms"`
-	Throughput  float64           `json:"throughput_ops_per_sec"`
-	Histogram   []HistogramBucket `json:"histogram"`
-	Intervals   []IntervalSample  `json:"intervals"`
+	Name        string             `json:"name"`
+	Kind        string             `json:"kind"`
+	Concurrency int                `json:"concurrency"`
+	Warmup      time.Duration      `json:"warmup"`
+	Duration    time.Duration      `json:"duration"`
+	StartedAt   time.Time          `json:"started_at"`
+	FinishedAt  time.Time          `json:"finished_at"`
+	TotalOps    int64              `json:"total_ops"`
+	SuccessOps  int64              `json:"success_ops"`
+	ErrorOps    int64              `json:"error_ops"`
+	ReadOps     int64              `json:"read_ops"`
+	WriteOps    int64              `json:"write_ops"`
+	P50Millis   float64            `json:"p50_ms"`
+	P95Millis   float64            `json:"p95_ms"`
+	P99Millis   float64            `json:"p99_ms"`
+	MaxMillis   float64            `json:"max_ms"`
+	Throughput  float64            `json:"throughput_ops_per_sec"`
+	Operations  []OperationSummary `json:"operations,omitempty"`
+	Histogram   []HistogramBucket  `json:"histogram"`
+	Intervals   []IntervalSample   `json:"intervals"`
+}
+
+type OperationSummary struct {
+	Operation  string  `json:"operation"`
+	TotalOps   int64   `json:"total_ops"`
+	SuccessOps int64   `json:"success_ops"`
+	ErrorOps   int64   `json:"error_ops"`
+	P50Millis  float64 `json:"p50_ms"`
+	P95Millis  float64 `json:"p95_ms"`
+	P99Millis  float64 `json:"p99_ms"`
+	MaxMillis  float64 `json:"max_ms"`
+	Throughput float64 `json:"throughput_ops_per_sec"`
 }
 
 type HistogramBucket struct {

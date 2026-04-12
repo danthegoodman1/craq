@@ -86,8 +86,16 @@ func CollectArtifacts(ctx context.Context, cfg CollectConfig) (ArtifactManifest,
 }
 
 func collectHTTP(url string, outputPath string) error {
+	return collectHTTPContext(context.Background(), url, outputPath)
+}
+
+func collectHTTPContext(ctx context.Context, url string, outputPath string) error {
 	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("build request for %s: %w", url, err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("get %s: %w", url, err)
 	}

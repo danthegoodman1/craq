@@ -23,9 +23,65 @@ type AnalysisSummary struct {
 	ClientPlacement string                        `json:"client_placement"`
 	GitSHA          string                        `json:"git_sha"`
 	Scenarios       []ScenarioReport              `json:"scenarios"`
+	WriteBudget     map[string]WriteBudgetSummary `json:"write_budget,omitempty"`
 	Coordinator     map[string]float64            `json:"coordinator_metrics"`
 	Storage         map[string]map[string]float64 `json:"storage_metrics"`
 	System          map[string]SystemSeries       `json:"system"`
+}
+
+type WriteLatencyBudgetReport struct {
+	RunID       string                `json:"run_id"`
+	GeneratedAt time.Time             `json:"generated_at"`
+	Scenarios   []ScenarioWriteBudget `json:"scenarios"`
+}
+
+type ScenarioWriteBudget struct {
+	Scenario      string                 `json:"scenario"`
+	ClientPUT     OperationSummary       `json:"client_put"`
+	Stages        []WriteStageBudget     `json:"stages"`
+	StageDetails  []WriteStageBudgetPart `json:"stage_details,omitempty"`
+	GRPCMethods   []GRPCMethodBudget     `json:"grpc_methods,omitempty"`
+	DominantStage DominantStageSummary   `json:"dominant_stage"`
+}
+
+type WriteStageBudget struct {
+	Stage        string  `json:"stage"`
+	Count        uint64  `json:"count"`
+	SumSeconds   float64 `json:"sum_seconds"`
+	MeanMillis   float64 `json:"mean_ms"`
+	SharePercent float64 `json:"share_percent"`
+}
+
+type WriteStageBudgetPart struct {
+	Stage      string  `json:"stage"`
+	Role       string  `json:"role"`
+	Result     string  `json:"result"`
+	Count      uint64  `json:"count"`
+	SumSeconds float64 `json:"sum_seconds"`
+	MeanMillis float64 `json:"mean_ms"`
+}
+
+type GRPCMethodBudget struct {
+	Method     string  `json:"method"`
+	Count      uint64  `json:"count"`
+	SumSeconds float64 `json:"sum_seconds"`
+	MeanMillis float64 `json:"mean_ms"`
+}
+
+type DominantStageSummary struct {
+	Stage           string  `json:"stage"`
+	Count           uint64  `json:"count"`
+	SumSeconds      float64 `json:"sum_seconds"`
+	MeanMillis      float64 `json:"mean_ms"`
+	SharePercent    float64 `json:"share_percent"`
+	ClearlyDominant bool    `json:"clearly_dominant"`
+}
+
+type WriteBudgetSummary struct {
+	ClientPUTP50Millis float64 `json:"client_put_p50_ms"`
+	DominantStage      string  `json:"dominant_stage"`
+	DominantMeanMillis float64 `json:"dominant_mean_ms"`
+	DominantShare      float64 `json:"dominant_share_percent"`
 }
 
 type SystemSeries struct {
@@ -57,6 +113,7 @@ func AnalyzeRun(runDir string) (AnalysisSummary, error) {
 		ClientPlacement: state.ClientPlacement,
 		GitSHA:          state.GitSHA,
 		Scenarios:       report.Scenarios,
+		WriteBudget:     map[string]WriteBudgetSummary{},
 		Coordinator:     map[string]float64{},
 		Storage:         map[string]map[string]float64{},
 		System:          map[string]SystemSeries{},
@@ -82,6 +139,20 @@ func AnalyzeRun(runDir string) (AnalysisSummary, error) {
 	analysisDir := filepath.Join(runDir, "analysis")
 	if err := os.MkdirAll(analysisDir, 0o755); err != nil {
 		return AnalysisSummary{}, fmt.Errorf("mkdir analysis dir: %w", err)
+	}
+	writeBudget, err := buildWriteLatencyBudget(runDir, report)
+	if err == nil {
+		for _, scenario := range writeBudget.Scenarios {
+			summary.WriteBudget[scenario.Scenario] = WriteBudgetSummary{
+				ClientPUTP50Millis: scenario.ClientPUT.P50Millis,
+				DominantStage:      scenario.DominantStage.Stage,
+				DominantMeanMillis: scenario.DominantStage.MeanMillis,
+				DominantShare:      scenario.DominantStage.SharePercent,
+			}
+		}
+		if err := SaveJSON(filepath.Join(analysisDir, "write_latency_budget.json"), writeBudget); err != nil {
+			return AnalysisSummary{}, err
+		}
 	}
 	if err := SaveJSON(filepath.Join(analysisDir, "summary.json"), summary); err != nil {
 		return AnalysisSummary{}, err
@@ -135,6 +206,367 @@ func metricValue(metric *dto.Metric) float64 {
 		return metric.Histogram.GetSampleSum()
 	default:
 		return 0
+	}
+}
+
+type histogramCountSum struct {
+	Count uint64
+	Sum   float64
+}
+
+type labeledHistogram struct {
+	Labels map[string]string
+	Sample histogramCountSum
+}
+
+type writeStageMetricKey struct {
+	Stage  string
+	Role   string
+	Result string
+}
+
+func buildWriteLatencyBudget(runDir string, report LoadGenReport) (WriteLatencyBudgetReport, error) {
+	metricRoot := filepath.Join(runDir, "artifacts", "client", "metric-snapshots")
+	if _, err := os.Stat(metricRoot); err != nil {
+		return WriteLatencyBudgetReport{}, err
+	}
+	out := WriteLatencyBudgetReport{
+		RunID:       report.RunID,
+		GeneratedAt: time.Now().UTC(),
+	}
+	for _, scenario := range report.Scenarios {
+		clientPUT, ok := scenarioOperationSummary(scenario, "put")
+		if !ok || clientPUT.TotalOps == 0 {
+			continue
+		}
+		startName := sanitizeScenarioName(scenario.Name) + "-start"
+		endName := sanitizeScenarioName(scenario.Name) + "-end"
+		startStages, err := loadWriteStageSnapshot(metricRoot, startName)
+		if err != nil {
+			return WriteLatencyBudgetReport{}, err
+		}
+		endStages, err := loadWriteStageSnapshot(metricRoot, endName)
+		if err != nil {
+			return WriteLatencyBudgetReport{}, err
+		}
+		startGRPC, err := loadStorageGRPCSnapshot(metricRoot, startName)
+		if err != nil {
+			return WriteLatencyBudgetReport{}, err
+		}
+		endGRPC, err := loadStorageGRPCSnapshot(metricRoot, endName)
+		if err != nil {
+			return WriteLatencyBudgetReport{}, err
+		}
+
+		stageDetails := diffWriteStageBudgets(startStages, endStages)
+		stages, dominant := summarizeWriteStages(stageDetails)
+		grpcMethods := diffGRPCMethodBudgets(startGRPC, endGRPC)
+		out.Scenarios = append(out.Scenarios, ScenarioWriteBudget{
+			Scenario:      scenario.Name,
+			ClientPUT:     clientPUT,
+			Stages:        stages,
+			StageDetails:  stageDetails,
+			GRPCMethods:   grpcMethods,
+			DominantStage: dominant,
+		})
+	}
+	return out, nil
+}
+
+func scenarioOperationSummary(scenario ScenarioReport, operation string) (OperationSummary, bool) {
+	for _, summary := range scenario.Operations {
+		if summary.Operation == operation {
+			return summary, true
+		}
+	}
+	if scenario.Kind != operation {
+		return OperationSummary{}, false
+	}
+	return OperationSummary{
+		Operation:  operation,
+		TotalOps:   scenario.TotalOps,
+		SuccessOps: scenario.SuccessOps,
+		ErrorOps:   scenario.ErrorOps,
+		P50Millis:  scenario.P50Millis,
+		P95Millis:  scenario.P95Millis,
+		P99Millis:  scenario.P99Millis,
+		MaxMillis:  scenario.MaxMillis,
+		Throughput: scenario.Throughput,
+	}, true
+}
+
+func loadWriteStageSnapshot(metricRoot string, snapshotName string) (map[writeStageMetricKey]histogramCountSum, error) {
+	paths, err := snapshotTargetPaths(metricRoot, snapshotName, "storage-")
+	if err != nil {
+		return nil, err
+	}
+	aggregated := map[writeStageMetricKey]histogramCountSum{}
+	for _, path := range paths {
+		series, err := parseHistogramFamily(path, "craq_storage_write_stage_seconds")
+		if err != nil {
+			return nil, err
+		}
+		for _, series := range series {
+			key := writeStageMetricKey{
+				Stage:  series.Labels["stage"],
+				Role:   series.Labels["role"],
+				Result: series.Labels["result"],
+			}
+			current := aggregated[key]
+			current.Count += series.Sample.Count
+			current.Sum += series.Sample.Sum
+			aggregated[key] = current
+		}
+	}
+	return aggregated, nil
+}
+
+func loadStorageGRPCSnapshot(metricRoot string, snapshotName string) (map[string]histogramCountSum, error) {
+	paths, err := snapshotTargetPaths(metricRoot, snapshotName, "storage-")
+	if err != nil {
+		return nil, err
+	}
+	aggregated := map[string]histogramCountSum{}
+	for _, path := range paths {
+		series, err := parseHistogramFamily(path, "craq_grpc_request_duration_seconds")
+		if err != nil {
+			return nil, err
+		}
+		for _, series := range series {
+			if series.Labels["component"] != "storage" {
+				continue
+			}
+			method := series.Labels["method"]
+			switch method {
+			case "/craq.v1.StorageService/Put", "/craq.v1.StorageService/ForwardWrite", "/craq.v1.StorageService/CommitWrite":
+			default:
+				continue
+			}
+			current := aggregated[method]
+			current.Count += series.Sample.Count
+			current.Sum += series.Sample.Sum
+			aggregated[method] = current
+		}
+	}
+	return aggregated, nil
+}
+
+func snapshotTargetPaths(metricRoot string, snapshotName string, prefix string) ([]string, error) {
+	dir := filepath.Join(metricRoot, snapshotName)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read metric snapshot %q: %w", dir, err)
+	}
+	var paths []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".prom") {
+			continue
+		}
+		paths = append(paths, filepath.Join(dir, name))
+	}
+	sort.Strings(paths)
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("no metric snapshots with prefix %q in %q", prefix, dir)
+	}
+	return paths, nil
+}
+
+func parseHistogramFamily(path string, familyName string) ([]labeledHistogram, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	parser := expfmt.TextParser{}
+	families, err := parser.TextToMetricFamilies(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("parse prometheus metrics %q: %w", path, err)
+	}
+	family, ok := families[familyName]
+	if !ok {
+		return nil, nil
+	}
+	out := make([]labeledHistogram, 0, len(family.GetMetric()))
+	for _, metric := range family.GetMetric() {
+		hist := metric.GetHistogram()
+		if hist == nil {
+			continue
+		}
+		labels := map[string]string{}
+		for _, label := range metric.GetLabel() {
+			labels[label.GetName()] = label.GetValue()
+		}
+		out = append(out, labeledHistogram{
+			Labels: labels,
+			Sample: histogramCountSum{
+				Count: hist.GetSampleCount(),
+				Sum:   hist.GetSampleSum(),
+			},
+		})
+	}
+	return out, nil
+}
+
+func diffWriteStageBudgets(start map[writeStageMetricKey]histogramCountSum, end map[writeStageMetricKey]histogramCountSum) []WriteStageBudgetPart {
+	keys := make([]writeStageMetricKey, 0, len(end))
+	for key := range end {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].Stage != keys[j].Stage {
+			return keys[i].Stage < keys[j].Stage
+		}
+		if keys[i].Role != keys[j].Role {
+			return keys[i].Role < keys[j].Role
+		}
+		return keys[i].Result < keys[j].Result
+	})
+	parts := make([]WriteStageBudgetPart, 0, len(keys))
+	for _, key := range keys {
+		delta := diffHistogramCountSum(start[key], end[key])
+		if delta.Count == 0 && delta.Sum == 0 {
+			continue
+		}
+		meanMillis := 0.0
+		if delta.Count > 0 {
+			meanMillis = (delta.Sum / float64(delta.Count)) * 1000
+		}
+		parts = append(parts, WriteStageBudgetPart{
+			Stage:      key.Stage,
+			Role:       key.Role,
+			Result:     key.Result,
+			Count:      delta.Count,
+			SumSeconds: delta.Sum,
+			MeanMillis: meanMillis,
+		})
+	}
+	sort.Slice(parts, func(i, j int) bool {
+		if parts[i].SumSeconds == parts[j].SumSeconds {
+			if parts[i].Stage != parts[j].Stage {
+				return parts[i].Stage < parts[j].Stage
+			}
+			if parts[i].Role != parts[j].Role {
+				return parts[i].Role < parts[j].Role
+			}
+			return parts[i].Result < parts[j].Result
+		}
+		return parts[i].SumSeconds > parts[j].SumSeconds
+	})
+	return parts
+}
+
+func summarizeWriteStages(parts []WriteStageBudgetPart) ([]WriteStageBudget, DominantStageSummary) {
+	aggregated := map[string]histogramCountSum{}
+	for _, part := range parts {
+		if part.Result != "success" {
+			continue
+		}
+		current := aggregated[part.Stage]
+		current.Count += part.Count
+		current.Sum += part.SumSeconds
+		aggregated[part.Stage] = current
+	}
+	stageNames := make([]string, 0, len(aggregated))
+	totalSum := 0.0
+	for stage, sample := range aggregated {
+		stageNames = append(stageNames, stage)
+		totalSum += sample.Sum
+	}
+	sort.Slice(stageNames, func(i, j int) bool {
+		left := aggregated[stageNames[i]]
+		right := aggregated[stageNames[j]]
+		if left.Sum == right.Sum {
+			return stageNames[i] < stageNames[j]
+		}
+		return left.Sum > right.Sum
+	})
+	stages := make([]WriteStageBudget, 0, len(stageNames))
+	for _, stage := range stageNames {
+		sample := aggregated[stage]
+		meanMillis := 0.0
+		if sample.Count > 0 {
+			meanMillis = (sample.Sum / float64(sample.Count)) * 1000
+		}
+		share := 0.0
+		if totalSum > 0 {
+			share = (sample.Sum / totalSum) * 100
+		}
+		stages = append(stages, WriteStageBudget{
+			Stage:        stage,
+			Count:        sample.Count,
+			SumSeconds:   sample.Sum,
+			MeanMillis:   meanMillis,
+			SharePercent: share,
+		})
+	}
+	if len(stages) == 0 {
+		return nil, DominantStageSummary{}
+	}
+	dominant := DominantStageSummary{
+		Stage:        stages[0].Stage,
+		Count:        stages[0].Count,
+		SumSeconds:   stages[0].SumSeconds,
+		MeanMillis:   stages[0].MeanMillis,
+		SharePercent: stages[0].SharePercent,
+	}
+	nextSum := 0.0
+	if len(stages) > 1 {
+		nextSum = stages[1].SumSeconds
+	}
+	dominant.ClearlyDominant = dominant.SharePercent >= 35 && (nextSum == 0 || dominant.SumSeconds >= nextSum*1.5)
+	return stages, dominant
+}
+
+func diffGRPCMethodBudgets(start map[string]histogramCountSum, end map[string]histogramCountSum) []GRPCMethodBudget {
+	methods := make([]string, 0, len(end))
+	for method := range end {
+		methods = append(methods, method)
+	}
+	sort.Slice(methods, func(i, j int) bool {
+		left := diffHistogramCountSum(start[methods[i]], end[methods[i]])
+		right := diffHistogramCountSum(start[methods[j]], end[methods[j]])
+		if left.Sum == right.Sum {
+			return methods[i] < methods[j]
+		}
+		return left.Sum > right.Sum
+	})
+	out := make([]GRPCMethodBudget, 0, len(methods))
+	for _, method := range methods {
+		delta := diffHistogramCountSum(start[method], end[method])
+		if delta.Count == 0 && delta.Sum == 0 {
+			continue
+		}
+		meanMillis := 0.0
+		if delta.Count > 0 {
+			meanMillis = (delta.Sum / float64(delta.Count)) * 1000
+		}
+		out = append(out, GRPCMethodBudget{
+			Method:     method,
+			Count:      delta.Count,
+			SumSeconds: delta.Sum,
+			MeanMillis: meanMillis,
+		})
+	}
+	return out
+}
+
+func diffHistogramCountSum(start histogramCountSum, end histogramCountSum) histogramCountSum {
+	count := end.Count
+	if end.Count >= start.Count {
+		count = end.Count - start.Count
+	} else {
+		count = 0
+	}
+	sum := end.Sum - start.Sum
+	if sum < 0 {
+		sum = 0
+	}
+	return histogramCountSum{
+		Count: count,
+		Sum:   sum,
 	}
 }
 

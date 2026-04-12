@@ -42,6 +42,7 @@ type slotWriteWaiter struct {
 type slotSubmitWriteResponse struct {
 	result CommitResult
 	waiter *slotWriteWaiter
+	role   ReplicaRole
 	err    error
 }
 
@@ -267,7 +268,9 @@ func (rt *slotRuntime) handleSubmitWrite(
 		)}
 		return
 	}
+	getCommittedStarted := time.Now()
 	current, found, err := rt.node.backend.GetCommitted(rt.slot, key)
+	rt.node.observeWriteStage(writeStageHeadGetCommitted, record.assignment.Role, writeStageResult(err), time.Since(getCommittedStarted))
 	if err != nil {
 		resp <- slotSubmitWriteResponse{err: fmt.Errorf("err in n.backend.GetCommitted: %w", err)}
 		return
@@ -284,6 +287,7 @@ func (rt *slotRuntime) handleSubmitWrite(
 		resp <- slotSubmitWriteResponse{err: err}
 		return
 	}
+	stageStarted := time.Now()
 	record.inFlightClientWrites++
 	operation := WriteOperation{
 		Slot:     rt.slot,
@@ -300,6 +304,7 @@ func (rt *slotRuntime) handleSubmitWrite(
 	reduction.Record.pendingWrites[operation.Sequence] = pending
 	reduction.Record.inFlightClientWrites = record.inFlightClientWrites
 	rt.setRecord(reduction.Record)
+	rt.node.observeWriteStage(writeStageHeadStageOp, reduction.Record.assignment.Role, writeStageResultSuccess, time.Since(stageStarted))
 	rt.node.refreshMetricGauges()
 
 	role := reduction.Record.assignment.Role
@@ -314,6 +319,7 @@ func (rt *slotRuntime) handleSubmitWrite(
 				resp <- slotSubmitWriteResponse{
 					result: reduction.Result,
 					waiter: waiter,
+					role:   role,
 				}
 			}
 		}()
@@ -326,6 +332,7 @@ func (rt *slotRuntime) handleSubmitWrite(
 			resp <- slotSubmitWriteResponse{
 				result: reduction.Result,
 				waiter: waiter,
+				role:   role,
 			}
 			return
 		}
@@ -335,11 +342,14 @@ func (rt *slotRuntime) handleSubmitWrite(
 			ChainVersion: reduction.Record.assignment.ChainVersion,
 		}
 		rt.runAsync(func() error {
-			return rt.node.repl.ForwardWrite(
+			forwardStarted := time.Now()
+			err := rt.node.repl.ForwardWrite(
 				ctx,
 				peerTransportTarget(successorTarget, successorNodeID),
 				req,
 			)
+			rt.node.observeWriteStage(writeStageHeadForwardRPC, role, writeStageResult(err), time.Since(forwardStarted))
+			return err
 		}, func(runtime *slotRuntime, err error) {
 			if err != nil {
 				waiter.complete(fmt.Errorf("err in n.repl.ForwardWrite: %w", err))
@@ -347,6 +357,7 @@ func (rt *slotRuntime) handleSubmitWrite(
 			resp <- slotSubmitWriteResponse{
 				result: reduction.Result,
 				waiter: waiter,
+				role:   role,
 			}
 		})
 		return
@@ -354,6 +365,7 @@ func (rt *slotRuntime) handleSubmitWrite(
 		resp <- slotSubmitWriteResponse{
 			result: reduction.Result,
 			waiter: waiter,
+			role:   role,
 		}
 	}
 }
@@ -380,9 +392,15 @@ func (rt *slotRuntime) startCommitEffect(ctx context.Context, sequence uint64, r
 		applied.lastKnownState = applied.state
 	}
 	persisted := persistedReplica(applied)
+	role := record.assignment.Role
+	stage, recordStage := writeCommitApplyStage(role)
 	rt.commitEffectInFlight = true
 	rt.runAsync(func() error {
+		applyStarted := time.Now()
 		committed, err := rt.node.applyCommittedOperation(ctx, operation, persisted)
+		if recordStage {
+			rt.node.observeWriteStage(stage, role, writeStageResult(err), time.Since(applyStarted))
+		}
 		if committed && err != nil {
 			return err
 		}
@@ -450,12 +468,16 @@ func (rt *slotRuntime) handleCommitEffectResult(
 		FromNodeID:   rt.node.nodeID,
 		ChainVersion: record.assignment.ChainVersion,
 	}
+	role := record.assignment.Role
 	rt.runAsync(func() error {
-			return rt.node.repl.CommitWrite(
-				ctx,
-				peerTransportTarget(predecessorTarget, predecessorNodeID),
-				upstreamCommitReq,
-			)
+		commitStarted := time.Now()
+		err := rt.node.repl.CommitWrite(
+			ctx,
+			peerTransportTarget(predecessorTarget, predecessorNodeID),
+			upstreamCommitReq,
+		)
+		rt.node.observeWriteStage(writeStageCommitUpstreamRPC, role, writeStageResult(err), time.Since(commitStarted))
+		return err
 	}, func(runtime *slotRuntime, commitErr error) {
 		if commitErr != nil {
 			if resp != nil {
@@ -533,6 +555,7 @@ func (rt *slotRuntime) applyForward(
 		rt.startCommitEffect(ctx, req.Operation.Sequence, resp)
 		return
 	}
+	role := record.assignment.Role
 	successorNodeID := record.assignment.Peers.SuccessorNodeID
 	successorTarget := record.assignment.Peers.SuccessorTarget
 	forwardReq := ForwardWriteRequest{
@@ -541,11 +564,14 @@ func (rt *slotRuntime) applyForward(
 		ChainVersion: record.assignment.ChainVersion,
 	}
 	rt.runAsync(func() error {
-		return rt.node.repl.ForwardWrite(
+		forwardStarted := time.Now()
+		err := rt.node.repl.ForwardWrite(
 			ctx,
 			peerTransportTarget(successorTarget, successorNodeID),
 			forwardReq,
 		)
+		rt.node.observeWriteStage(writeStageHeadForwardRPC, role, writeStageResult(err), time.Since(forwardStarted))
+		return err
 	}, func(runtime *slotRuntime, err error) {
 		if err != nil {
 			if resp != nil {
@@ -635,9 +661,15 @@ func (rt *slotRuntime) applyCommit(
 	}
 	persisted := persistedReplica(applied)
 	reqCopy := req
+	role := record.assignment.Role
+	stage, recordStage := writeCommitApplyStage(role)
 	rt.commitEffectInFlight = true
 	rt.runAsync(func() error {
+		applyStarted := time.Now()
 		committed, err := rt.node.applyCommittedOperation(ctx, operation, persisted)
+		if recordStage {
+			rt.node.observeWriteStage(stage, role, writeStageResult(err), time.Since(applyStarted))
+		}
 		if committed && err != nil {
 			return err
 		}
@@ -1182,7 +1214,9 @@ func (n *Node) submitWriteOwned(
 	}
 	waitCtx, cancel := withDefaultTimeout(ctx, n.writeCommitTimeout)
 	defer cancel()
+	waitStarted := time.Now()
 	err := response.waiter.wait(waitCtx, n.done)
+	n.observeWriteStage(writeStageHeadWaitForCommit, response.role, writeStageResult(err), time.Since(waitStarted))
 	n.releaseClientWriteOwned(owner)
 	if err != nil {
 		return CommitResult{}, err
