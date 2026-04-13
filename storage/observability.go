@@ -297,14 +297,19 @@ func (n *Node) ResourceUsage() ResourceUsage {
 type writeStage string
 
 const (
-	writeStageHeadGetCommitted        writeStage = "head_get_committed"
-	writeStageHeadStageOp             writeStage = "head_stage_operation"
-	writeStageForwardAcceptRPC        writeStage = "forward_accept_rpc"
-	writeStageHeadWaitForCommit       writeStage = "head_wait_for_commit"
-	writeStageTailApplyCommit         writeStage = "tail_apply_committed"
-	writeStageCommitUpstreamAcceptRPC writeStage = "commit_upstream_accept_rpc"
-	writeStageCommitBatchWait         writeStage = "commit_batch_wait"
-	writeStageSingleApplyCommit       writeStage = "single_apply_committed"
+	writeStageHeadGetCommitted           writeStage = "head_get_committed"
+	writeStageHeadStageOp                writeStage = "head_stage_operation"
+	writeStagePrepareQueueWait           writeStage = "prepare_queue_wait"
+	writeStagePrepareFlush               writeStage = "prepare_flush"
+	writeStageForwardAcceptRPC           writeStage = "forward_accept_rpc"
+	writeStageHeadWaitForCommit          writeStage = "head_wait_for_commit"
+	writeStageHeadWaitForCommitWatermark writeStage = "head_wait_for_commit_watermark"
+	writeStageTailApplyCommit            writeStage = "tail_apply_committed"
+	writeStageCommitUpstreamAcceptRPC    writeStage = "commit_upstream_accept_rpc"
+	writeStageCommitTokenQueueWait       writeStage = "commit_token_queue_wait"
+	writeStageCommitWatermarkFlush       writeStage = "commit_watermark_flush"
+	writeStageCommitBatchWait            writeStage = "commit_batch_wait"
+	writeStageSingleApplyCommit          writeStage = "single_apply_committed"
 
 	writeStageHeadForwardRPC    writeStage = "head_forward_rpc"
 	writeStageCommitUpstreamRPC writeStage = "commit_upstream_rpc"

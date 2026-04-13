@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
@@ -698,6 +700,7 @@ func TestRouterConcurrentRefreshAndOperationsStayCorrectAcrossDeadTailRepair(t *
 			var mismatch *storage.RoutingMismatchError
 			if errors.Is(err, ErrNoRoute) ||
 				errors.Is(err, ErrSnapshotNotLoaded) ||
+				errors.Is(err, storage.ErrPeerMismatch) ||
 				errors.Is(err, storage.ErrStateMismatch) ||
 				errors.As(err, &mismatch) {
 				if time.Now().After(deadline) {
@@ -1535,9 +1538,20 @@ func mustNewStorageNodeForRouter(
 	repl *storage.InMemoryReplicationTransport,
 ) *storage.Node {
 	t.Helper()
+	cfg := storage.Config{NodeID: nodeID}
+	if os.Getenv("CRAQ_TEST_DEBUG_TIMEOUTS") != "" {
+		debugDir, err := os.MkdirTemp("/tmp", "craq-router-debug-"+nodeID+"-")
+		if err != nil {
+			t.Fatalf("MkdirTemp returned error: %v", err)
+		}
+		cfg.WriteTraceOutputPath = filepath.Join(debugDir, "write-trace.jsonl")
+		cfg.WriteTraceSampleRate = 1
+		cfg.WriteTimeoutArtifactOutputPath = filepath.Join(debugDir, "write-timeout-artifacts.jsonl")
+		t.Logf("router debug artifacts for %s: %s", nodeID, debugDir)
+	}
 	node, err := storage.OpenNode(
 		ctx,
-		storage.Config{NodeID: nodeID},
+		cfg,
 		backend,
 		storage.NewInMemoryLocalStateStore(),
 		storage.NewInMemoryCoordinatorClient(),

@@ -3,6 +3,8 @@ package coordserver
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/danthegoodman1/craq/storage"
 )
@@ -50,9 +52,19 @@ func OpenInMemoryNodeAdapter(
 	repl storage.ReplicationTransport,
 ) (*InMemoryNodeAdapter, error) {
 	adapter := &InMemoryNodeAdapter{nodeID: nodeID, local: local}
+	cfg := storage.Config{NodeID: nodeID}
+	if os.Getenv("CRAQ_TEST_DEBUG_TIMEOUTS") != "" {
+		debugDir, err := os.MkdirTemp("/tmp", "craq-router-debug-"+nodeID+"-")
+		if err != nil {
+			return nil, fmt.Errorf("mkdir temp debug dir: %w", err)
+		}
+		cfg.WriteTraceOutputPath = filepath.Join(debugDir, "write-trace.jsonl")
+		cfg.WriteTraceSampleRate = 1
+		cfg.WriteTimeoutArtifactOutputPath = filepath.Join(debugDir, "write-timeout-artifacts.jsonl")
+	}
 	node, err := storage.OpenNode(
 		ctx,
-		storage.Config{NodeID: nodeID},
+		cfg,
 		backend,
 		local,
 		adapter,

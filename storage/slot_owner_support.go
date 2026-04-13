@@ -21,6 +21,12 @@ func cloneReplicaRecord(record replicaRecord) replicaRecord {
 			cloned.pendingWrites[sequence] = clonePendingWrite(write)
 		}
 	}
+	if record.preparedEntries != nil {
+		cloned.preparedEntries = make(map[uint64]WriteOperation, len(record.preparedEntries))
+		for sequence, operation := range record.preparedEntries {
+			cloned.preparedEntries[sequence] = cloneWriteOperation(operation)
+		}
+	}
 	if record.stagedForwards != nil {
 		cloned.stagedForwards = make(map[uint64]ForwardWriteRequest, len(record.stagedForwards))
 		for sequence, req := range record.stagedForwards {
@@ -127,6 +133,11 @@ func recordPruneMaterializedOverlay(record replicaRecord, highestMaterialized ui
 	if highestMaterialized > record.materializedCommittedSequence {
 		record.materializedCommittedSequence = highestMaterialized
 	}
+	for sequence := range record.preparedEntries {
+		if sequence <= highestMaterialized {
+			delete(record.preparedEntries, sequence)
+		}
+	}
 	for key, entry := range record.committedOverlay {
 		if entry.Sequence <= highestMaterialized {
 			delete(record.committedOverlay, key)
@@ -195,23 +206,42 @@ func upstreamConfirmedSequenceForLocalCommit(record replicaRecord, sequence uint
 	return confirmed
 }
 
+func (n *Node) submitPreparedOperation(
+	ctx context.Context,
+	owner *slotOwner,
+	prepare DurableCommit,
+	onComplete journalCompletionHandler,
+) error {
+	if n.commitJournal == nil {
+		return fmt.Errorf("%w: commit journal unavailable", ErrInvalidConfig)
+	}
+	if err := n.commitJournal.submitPrepare(ctx, owner, prepare, onComplete); err != nil {
+		return fmt.Errorf("err in n.commitJournal.submitPrepare: %w", err)
+	}
+	return nil
+}
+
 func (n *Node) submitCommittedOperation(
 	ctx context.Context,
 	owner *slotOwner,
 	commit DurableCommit,
 	onComplete journalCompletionHandler,
 ) error {
-	if commit.UpstreamConfirmedSequence > commit.Operation.Sequence {
-		commit.UpstreamConfirmedSequence = commit.Operation.Sequence
-	}
-	if commit.UpstreamConfirmedSequence == 0 && (commit.Persisted.Assignment.Role == ReplicaRoleHead || commit.Persisted.Assignment.Role == ReplicaRoleSingle || commit.Persisted.Assignment.Peers.PredecessorNodeID == "") {
-		commit.UpstreamConfirmedSequence = commit.Operation.Sequence
-	}
+	return n.submitPreparedOperation(ctx, owner, commit, onComplete)
+}
+
+func (n *Node) submitCommitWatermark(
+	ctx context.Context,
+	owner *slotOwner,
+	assignment ReplicaAssignment,
+	sequence uint64,
+	onComplete journalCompletionHandler,
+) error {
 	if n.commitJournal == nil {
 		return fmt.Errorf("%w: commit journal unavailable", ErrInvalidConfig)
 	}
-	if err := n.commitJournal.submitCommit(ctx, owner, commit, onComplete); err != nil {
-		return fmt.Errorf("err in n.commitJournal.submitCommit: %w", err)
+	if err := n.commitJournal.submitCommitWatermark(ctx, owner, assignment, sequence, onComplete); err != nil {
+		return fmt.Errorf("err in n.commitJournal.submitCommitWatermark: %w", err)
 	}
 	return nil
 }
@@ -237,6 +267,13 @@ func (n *Node) writeActuallyCommitted(slot int, sequence uint64) bool {
 		return true
 	}
 	return false
+}
+
+func (n *Node) durablePreparedSequence(slot int) uint64 {
+	if n.commitJournal != nil {
+		return n.commitJournal.preparedSequence(slot)
+	}
+	return n.durableCommittedSequence(slot)
 }
 
 func (n *Node) durableCommittedSequence(slot int) uint64 {

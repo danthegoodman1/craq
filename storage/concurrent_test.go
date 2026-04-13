@@ -175,6 +175,12 @@ func TestConcurrentForwardsOnSameSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	wantSnapshot := map[string]string{}
+	for seq := 1; seq <= numForwards; seq++ {
+		wantSnapshot[fmt.Sprintf("fwd-%d", seq)] = fmt.Sprintf("val-%d", seq)
+	}
+	assertCommittedStateEqualEventually(t, map[string]*Node{"tail": nodes["tail"]}, slot, wantSnapshot, uint64(numForwards))
+
 	tailSnapshot := mustNodeCommittedSnapshot(t, nodes["tail"], slot)
 	if got, want := len(tailSnapshot), numForwards; got != want {
 		t.Fatalf("tail committed %d keys, want %d", got, want)

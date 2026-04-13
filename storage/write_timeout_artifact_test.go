@@ -37,7 +37,7 @@ func TestWriteTimeoutArtifactCapturesSlotAndJournalState(t *testing.T) {
 			Sequence:     2,
 			FromNodeID:   "mid",
 			ChainVersion: 3,
-		})
+		}).stage = acceptedCommitDurableInFlight
 		runtime.parkAcceptedCommitWaiter(2, make(chan error, 1), context.Background())
 		runtime.markBreadcrumb(&runtime.lastAcceptCommitReceived, 2)
 		runtime.markBreadcrumb(&runtime.lastDuplicateCommitParked, 2)
@@ -45,6 +45,7 @@ func TestWriteTimeoutArtifactCapturesSlotAndJournalState(t *testing.T) {
 		runtime.markBreadcrumb(&runtime.lastAppliedLocally, 1)
 		runtime.markBreadcrumb(&runtime.lastWaiterReleased, 1)
 		record := ensureProtocolReplicaState(runtime.record)
+		record.highestCommitTokenReceived = 2
 		record.bufferedCommits[3] = CommitWriteRequest{
 			Slot:         17,
 			Sequence:     3,

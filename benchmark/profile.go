@@ -20,7 +20,9 @@ const (
 type Profile struct {
 	Name      string           `yaml:"name" json:"name"`
 	GCP       GCPProfile       `yaml:"gcp" json:"gcp"`
+	Local     LocalProfile     `yaml:"local" json:"local"`
 	Cluster   ClusterProfile   `yaml:"cluster" json:"cluster"`
+	Storage   StorageProfile   `yaml:"storage" json:"storage"`
 	Workload  WorkloadProfile  `yaml:"workload" json:"workload"`
 	Telemetry TelemetryProfile `yaml:"telemetry" json:"telemetry"`
 	Artifacts ArtifactProfile  `yaml:"artifacts" json:"artifacts"`
@@ -38,6 +40,12 @@ type GCPProfile struct {
 	StorageLayout          string   `yaml:"storage_layout" json:"storage_layout"`
 }
 
+type LocalProfile struct {
+	StorageLayout  string `yaml:"storage_layout" json:"storage_layout"`
+	RamdiskPath    string `yaml:"ramdisk_path,omitempty" json:"ramdisk_path,omitempty"`
+	RamdiskSizeMiB int    `yaml:"ramdisk_size_mib,omitempty" json:"ramdisk_size_mib,omitempty"`
+}
+
 type ClusterProfile struct {
 	SlotCount          int             `yaml:"slot_count" json:"slot_count"`
 	ReplicationFactor  int             `yaml:"replication_factor" json:"replication_factor"`
@@ -53,6 +61,14 @@ type ClusterProfile struct {
 
 type ReconfigProfile struct {
 	MaxChangedChains int `yaml:"max_changed_chains" json:"max_changed_chains"`
+}
+
+type StorageProfile struct {
+	JournalShards              int           `yaml:"journal_shards" json:"journal_shards"`
+	JournalBatchDelayLow       time.Duration `yaml:"journal_batch_delay_low" json:"journal_batch_delay_low"`
+	JournalBatchDelayHigh      time.Duration `yaml:"journal_batch_delay_high" json:"journal_batch_delay_high"`
+	JournalBatchDepthThreshold int           `yaml:"journal_batch_depth_threshold" json:"journal_batch_depth_threshold"`
+	JournalBatchMaxOps         int           `yaml:"journal_batch_max_ops" json:"journal_batch_max_ops"`
 }
 
 type WorkloadProfile struct {
@@ -131,6 +147,12 @@ func (p *Profile) ApplyDefaults() {
 	if p.GCP.StorageLayout == "" {
 		p.GCP.StorageLayout = DefaultStorageLayout
 	}
+	if p.Local.StorageLayout == "" {
+		p.Local.StorageLayout = "repo_disk"
+	}
+	if p.Local.RamdiskSizeMiB == 0 {
+		p.Local.RamdiskSizeMiB = 8192
+	}
 
 	if p.Cluster.SlotCount == 0 {
 		p.Cluster.SlotCount = 1024
@@ -161,6 +183,22 @@ func (p *Profile) ApplyDefaults() {
 	}
 	if p.Cluster.Reconfiguration.MaxChangedChains == 0 {
 		p.Cluster.Reconfiguration.MaxChangedChains = 32
+	}
+
+	if p.Storage.JournalShards == 0 {
+		p.Storage.JournalShards = 16
+	}
+	if p.Storage.JournalBatchDelayLow == 0 {
+		p.Storage.JournalBatchDelayLow = 50 * time.Microsecond
+	}
+	if p.Storage.JournalBatchDelayHigh == 0 {
+		p.Storage.JournalBatchDelayHigh = 250 * time.Microsecond
+	}
+	if p.Storage.JournalBatchDepthThreshold == 0 {
+		p.Storage.JournalBatchDepthThreshold = 8
+	}
+	if p.Storage.JournalBatchMaxOps == 0 {
+		p.Storage.JournalBatchMaxOps = 64
 	}
 
 	if p.Workload.Seed == 0 {
@@ -233,6 +271,12 @@ func (p Profile) Validate() error {
 	if !slices.Contains([]string{"raid0_ext4", "single_nvme_ext4", "single_nvme_xfs"}, p.GCP.StorageLayout) {
 		return fmt.Errorf("gcp.storage_layout must be one of raid0_ext4, single_nvme_ext4, or single_nvme_xfs")
 	}
+	if !slices.Contains([]string{"repo_disk", "ramdisk"}, p.Local.StorageLayout) {
+		return fmt.Errorf("local.storage_layout must be one of repo_disk or ramdisk")
+	}
+	if p.Local.StorageLayout == "ramdisk" && p.Local.RamdiskSizeMiB <= 0 {
+		return fmt.Errorf("local.ramdisk_size_mib must be > 0")
+	}
 	if p.Cluster.SlotCount <= 0 {
 		return fmt.Errorf("cluster.slot_count must be > 0")
 	}
@@ -241,6 +285,24 @@ func (p Profile) Validate() error {
 	}
 	if p.Cluster.StorageNodeCount != 3 {
 		return fmt.Errorf("cluster.storage_node_count must be 3 in v1, got %d", p.Cluster.StorageNodeCount)
+	}
+	if p.Storage.JournalShards <= 0 {
+		return fmt.Errorf("storage.journal_shards must be > 0")
+	}
+	if p.Storage.JournalBatchDelayLow <= 0 {
+		return fmt.Errorf("storage.journal_batch_delay_low must be > 0")
+	}
+	if p.Storage.JournalBatchDelayHigh <= 0 {
+		return fmt.Errorf("storage.journal_batch_delay_high must be > 0")
+	}
+	if p.Storage.JournalBatchDelayLow > p.Storage.JournalBatchDelayHigh {
+		return fmt.Errorf("storage.journal_batch_delay_low must be <= storage.journal_batch_delay_high")
+	}
+	if p.Storage.JournalBatchDepthThreshold <= 0 {
+		return fmt.Errorf("storage.journal_batch_depth_threshold must be > 0")
+	}
+	if p.Storage.JournalBatchMaxOps <= 0 {
+		return fmt.Errorf("storage.journal_batch_max_ops must be > 0")
 	}
 	if p.Cluster.HeartbeatInterval <= 0 || p.Cluster.LivenessInterval <= 0 || p.Cluster.SuspectAfter <= 0 || p.Cluster.DeadAfter <= 0 {
 		return fmt.Errorf("cluster timing values must be > 0")
@@ -281,15 +343,15 @@ func (p Profile) Validate() error {
 		if scenario.Kind == "mixed" && (scenario.ReadPercent < 0 || scenario.ReadPercent > 100) {
 			return fmt.Errorf("scenario %q read_percent must be between 0 and 100", scenario.Name)
 		}
-			if scenario.ValueBytes <= 0 {
-				return fmt.Errorf("scenario %q value_bytes must be > 0", scenario.Name)
-			}
-			for _, slot := range scenario.FixedSlots {
-				if slot < 0 || slot >= p.Cluster.SlotCount {
-					return fmt.Errorf("scenario %q fixed slot %d is outside [0,%d)", scenario.Name, slot, p.Cluster.SlotCount)
-				}
+		if scenario.ValueBytes <= 0 {
+			return fmt.Errorf("scenario %q value_bytes must be > 0", scenario.Name)
+		}
+		for _, slot := range scenario.FixedSlots {
+			if slot < 0 || slot >= p.Cluster.SlotCount {
+				return fmt.Errorf("scenario %q fixed slot %d is outside [0,%d)", scenario.Name, slot, p.Cluster.SlotCount)
 			}
 		}
+	}
 	return nil
 }
 

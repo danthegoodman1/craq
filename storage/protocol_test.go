@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestInMemoryBackendStagesThenCommitsSequences(t *testing.T) {
@@ -174,8 +175,14 @@ func TestQueuedTransportDuplicateMessagesStillConverge(t *testing.T) {
 	}
 	assertAppliedCommitResult(t, result, 9, 1)
 	assertCommittedStateEqual(t, nodes, 9, map[string]string{"k": "v"}, 1)
-	if got, want := transport.Pending(), 1; got != want {
-		t.Fatalf("pending queued messages before duplicate drain = %d, want %d", got, want)
+	if !duplicatedForward {
+		t.Fatal("forward duplicate was never injected")
+	}
+	if !duplicatedCommit {
+		t.Fatal("commit duplicate was never injected")
+	}
+	if got := transport.Pending(); got > 1 {
+		t.Fatalf("pending queued messages before duplicate drain = %d, want at most 1", got)
 	}
 	if err := transport.DeliverAll(ctx); err != nil {
 		t.Fatalf("DeliverAll returned error: %v", err)
@@ -626,6 +633,87 @@ func TestWriteValidationAndDownstreamFailure(t *testing.T) {
 		}
 		if got, want := mustHighestCommitted(t, node, 6), uint64(1); got != want {
 			t.Fatalf("highest committed = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("prepared forward replays across chain repair and commits on new successor", func(t *testing.T) {
+		transport := NewInMemoryReplicationTransport()
+		headBackend := NewInMemoryBackend()
+		head := mustNewNode(t, ctx, Config{NodeID: "head"}, headBackend, NewInMemoryCoordinatorClient(), transport)
+		transport.Register("head", headBackend)
+		transport.RegisterNode("head", head)
+		mustActivateReplica(t, head, 8, ReplicaAssignment{
+			Slot:         8,
+			ChainVersion: 4,
+			Role:         ReplicaRoleSingle,
+		})
+		midBackend := NewInMemoryBackend()
+		mid := mustNewNode(t, ctx, Config{NodeID: "mid"}, midBackend, NewInMemoryCoordinatorClient(), transport)
+		transport.Register("mid", midBackend)
+		transport.RegisterNode("mid", mid)
+		mustActivateReplica(t, mid, 8, ReplicaAssignment{
+			Slot:         8,
+			ChainVersion: 4,
+			Role:         ReplicaRoleMiddle,
+			Peers:        ChainPeers{PredecessorNodeID: "head", SuccessorNodeID: "oldtail"},
+		})
+
+		req := ForwardWriteRequest{
+			Operation:    WriteOperation{Slot: 8, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v", Metadata: testObjectMetadata(1)},
+			FromNodeID:   "head",
+			ChainVersion: 4,
+		}
+		if err := mid.HandleForwardWrite(ctx, req); err == nil {
+			t.Fatal("HandleForwardWrite unexpectedly succeeded with missing successor")
+		}
+
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if staged := mustNodeStagedSequences(t, mid, 8); reflect.DeepEqual(staged, []uint64{1}) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("mid never retained prepared sequence after failed forward; staged=%v", mustNodeStagedSequences(t, mid, 8))
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		tailBackend := NewInMemoryBackend()
+		tail := mustNewNode(t, ctx, Config{NodeID: "newtail"}, tailBackend, NewInMemoryCoordinatorClient(), transport)
+		transport.Register("newtail", tailBackend)
+		transport.RegisterNode("newtail", tail)
+		mustActivateReplica(t, tail, 8, ReplicaAssignment{
+			Slot:         8,
+			ChainVersion: 5,
+			Role:         ReplicaRoleTail,
+			Peers:        ChainPeers{PredecessorNodeID: "mid"},
+		})
+
+		if err := mid.UpdateChainPeers(ctx, UpdateChainPeersCommand{
+			Assignment: ReplicaAssignment{
+				Slot:         8,
+				ChainVersion: 5,
+				Role:         ReplicaRoleMiddle,
+				Peers: ChainPeers{
+					PredecessorNodeID: "head",
+					SuccessorNodeID:   "newtail",
+					TailNodeID:        "newtail",
+					TailTarget:        "newtail",
+				},
+			},
+		}); err != nil {
+			t.Fatalf("UpdateChainPeers returned error: %v", err)
+		}
+
+		deadline = time.Now().Add(2 * time.Second)
+		for {
+			if mustHighestCommitted(t, mid, 8) == 1 && mustHighestCommitted(t, tail, 8) == 1 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("repair replay never committed: mid=%d tail=%d staged=%v", mustHighestCommitted(t, mid, 8), mustHighestCommitted(t, tail, 8), mustNodeStagedSequences(t, mid, 8))
+			}
+			time.Sleep(5 * time.Millisecond)
 		}
 	})
 

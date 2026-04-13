@@ -201,6 +201,11 @@ func runLocalSmoke(ctx context.Context, runDir string, state RunState, manifest 
 	if err := os.MkdirAll(filepath.Join(runDir, "rendered", "local"), 0o755); err != nil {
 		return LocalSmokeReport{}, fmt.Errorf("mkdir local rendered dir: %w", err)
 	}
+	storageRoot, cleanupStorageRoot, err := prepareLocalStorageRoot(ctx, runDir, state.RunID, state.Profile.Local)
+	if err != nil {
+		return LocalSmokeReport{}, err
+	}
+	defer cleanupStorageRoot()
 
 	coordCfg := CoordinatorProcessConfig{
 		ManifestPath: state.ManifestPath,
@@ -218,13 +223,18 @@ func runLocalSmoke(ctx context.Context, runDir string, state RunState, manifest 
 
 	for _, nodeID := range []string{"a", "b", "c"} {
 		cfg := StorageProcessConfig{
-			ManifestPath:         state.ManifestPath,
-			NodeID:               nodeID,
-			DataDir:              filepath.Join(runDir, "local", "storage-"+nodeID),
-			HeartbeatInterval:    state.Profile.Cluster.HeartbeatInterval,
-			ActivationInterval:   state.Profile.Cluster.ActivationInterval,
-			RPCDeadline:          state.Profile.Cluster.RPCDeadline,
-			WriteTimeoutArtifacts: filepath.Join(runDir, "local", "storage-"+nodeID, "write-timeout-artifacts.jsonl"),
+			ManifestPath:               state.ManifestPath,
+			NodeID:                     nodeID,
+			DataDir:                    filepath.Join(storageRoot, "storage-"+nodeID),
+			HeartbeatInterval:          state.Profile.Cluster.HeartbeatInterval,
+			ActivationInterval:         state.Profile.Cluster.ActivationInterval,
+			RPCDeadline:                state.Profile.Cluster.RPCDeadline,
+			WriteTimeoutArtifacts:      filepath.Join(runDir, "local", "storage-"+nodeID, "write-timeout-artifacts.jsonl"),
+			JournalShards:              state.Profile.Storage.JournalShards,
+			JournalBatchDelayLow:       state.Profile.Storage.JournalBatchDelayLow,
+			JournalBatchDelayHigh:      state.Profile.Storage.JournalBatchDelayHigh,
+			JournalBatchDepthThreshold: state.Profile.Storage.JournalBatchDepthThreshold,
+			JournalBatchMaxOps:         state.Profile.Storage.JournalBatchMaxOps,
 		}
 		if err := SaveJSON(filepath.Join(runDir, "rendered", "local", "storage-"+nodeID+".json"), cfg); err != nil {
 			return LocalSmokeReport{}, err

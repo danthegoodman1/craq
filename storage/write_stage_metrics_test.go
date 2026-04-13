@@ -33,10 +33,11 @@ func TestSingleReplicaWriteStageMetrics(t *testing.T) {
 
 	assertWriteStageCount(t, registry, string(writeStageHeadGetCommitted), string(ReplicaRoleSingle), writeStageResultSuccess, 1)
 	assertWriteStageCount(t, registry, string(writeStageHeadStageOp), string(ReplicaRoleSingle), writeStageResultSuccess, 1)
-	assertWriteStageCount(t, registry, string(writeStageSingleApplyCommit), string(ReplicaRoleSingle), writeStageResultSuccess, 1)
-	assertWriteStageCount(t, registry, string(writeStageHeadWaitForCommit), string(ReplicaRoleSingle), writeStageResultSuccess, 1)
+	assertWriteStageCountAtLeast(t, registry, string(writeStagePrepareFlush), string(ReplicaRoleSingle), writeStageResultSuccess, 1)
+	assertWriteStageCountAtLeast(t, registry, string(writeStageCommitWatermarkFlush), string(ReplicaRoleSingle), writeStageResultSuccess, 1)
+	assertWriteStageCountAtLeast(t, registry, string(writeStageHeadWaitForCommitWatermark), string(ReplicaRoleSingle), writeStageResultSuccess, 1)
 	assertWriteStageCount(t, registry, string(writeStageHeadForwardRPC), string(ReplicaRoleSingle), writeStageResultSuccess, 0)
-	assertWriteStageCount(t, registry, string(writeStageCommitUpstreamRPC), string(ReplicaRoleSingle), writeStageResultSuccess, 0)
+	assertWriteStageCount(t, registry, string(writeStageCommitTokenQueueWait), string(ReplicaRoleSingle), writeStageResultSuccess, 0)
 	assertCounterValue(t, registry, "craq_storage_head_committed_metadata_lookups_total", map[string]string{"source": "miss"}, 1)
 	assertCounterValue(t, registry, "craq_storage_head_committed_metadata_lookups_total", map[string]string{"source": "hit"}, 0)
 }
@@ -115,12 +116,16 @@ func TestThreeReplicaWriteStageMetricsRecordOncePerLogicalWrite(t *testing.T) {
 
 	assertWriteStageCount(t, headRegistry, string(writeStageHeadGetCommitted), string(ReplicaRoleHead), writeStageResultSuccess, 1)
 	assertWriteStageCount(t, headRegistry, string(writeStageHeadForwardRPC), string(ReplicaRoleHead), writeStageResultSuccess, 1)
-	assertWriteStageCount(t, headRegistry, string(writeStageHeadWaitForCommit), string(ReplicaRoleHead), writeStageResultSuccess, 1)
+	assertWriteStageCountAtLeast(t, headRegistry, string(writeStagePrepareFlush), string(ReplicaRoleHead), writeStageResultSuccess, 1)
+	assertWriteStageCountAtLeast(t, headRegistry, string(writeStageCommitWatermarkFlush), string(ReplicaRoleHead), writeStageResultSuccess, 1)
+	assertWriteStageCountAtLeast(t, headRegistry, string(writeStageHeadWaitForCommitWatermark), string(ReplicaRoleHead), writeStageResultSuccess, 1)
 	assertWriteStageCount(t, midRegistry, string(writeStageHeadForwardRPC), string(ReplicaRoleMiddle), writeStageResultSuccess, 1)
-	assertWriteStageCount(t, midRegistry, string(writeStageTailApplyCommit), string(ReplicaRoleMiddle), writeStageResultSuccess, 1)
-	assertWriteStageCount(t, midRegistry, string(writeStageCommitUpstreamAcceptRPC), string(ReplicaRoleMiddle), writeStageResultSuccess, 1)
-	assertWriteStageCount(t, tailRegistry, string(writeStageTailApplyCommit), string(ReplicaRoleTail), writeStageResultSuccess, 1)
-	assertWriteStageCount(t, tailRegistry, string(writeStageCommitUpstreamAcceptRPC), string(ReplicaRoleTail), writeStageResultSuccess, 1)
+	assertWriteStageCountAtLeast(t, midRegistry, string(writeStagePrepareFlush), string(ReplicaRoleMiddle), writeStageResultSuccess, 1)
+	assertWriteStageCountAtLeast(t, midRegistry, string(writeStageCommitWatermarkFlush), string(ReplicaRoleMiddle), writeStageResultSuccess, 1)
+	assertWriteStageCountAtLeast(t, midRegistry, string(writeStageCommitTokenQueueWait), string(ReplicaRoleMiddle), writeStageResultSuccess, 1)
+	assertWriteStageCountAtLeast(t, tailRegistry, string(writeStagePrepareFlush), string(ReplicaRoleTail), writeStageResultSuccess, 1)
+	assertWriteStageCountAtLeast(t, tailRegistry, string(writeStageCommitWatermarkFlush), string(ReplicaRoleTail), writeStageResultSuccess, 1)
+	assertWriteStageCountAtLeast(t, tailRegistry, string(writeStageCommitTokenQueueWait), string(ReplicaRoleTail), writeStageResultSuccess, 1)
 
 	before := histogramCountValue(t, headRegistry, "craq_storage_write_stage_seconds", map[string]string{
 		"stage":  string(writeStageTailApplyCommit),
@@ -170,8 +175,8 @@ func TestWriteStageMetricsRecordCommitWaitErrors(t *testing.T) {
 	}
 
 	assertWriteStageCount(t, registry, string(writeStageHeadForwardRPC), string(ReplicaRoleHead), writeStageResultSuccess, 1)
-	assertWriteStageCount(t, registry, string(writeStageHeadWaitForCommit), string(ReplicaRoleHead), writeStageResultSuccess, 0)
-	assertWriteStageCount(t, registry, string(writeStageHeadWaitForCommit), string(ReplicaRoleHead), writeStageResultError, 1)
+	assertWriteStageCount(t, registry, string(writeStageHeadWaitForCommitWatermark), string(ReplicaRoleHead), writeStageResultSuccess, 0)
+	assertWriteStageCount(t, registry, string(writeStageHeadWaitForCommitWatermark), string(ReplicaRoleHead), writeStageResultError, 1)
 }
 
 func TestWriteTraceRecorderWritesJSONL(t *testing.T) {
@@ -225,6 +230,18 @@ func assertWriteStageCount(t *testing.T, registry *prometheus.Registry, stage st
 	})
 	if got != want {
 		t.Fatalf("write stage count stage=%s role=%s result=%s got=%d want=%d", stage, role, result, got, want)
+	}
+}
+
+func assertWriteStageCountAtLeast(t *testing.T, registry *prometheus.Registry, stage string, role string, result string, want uint64) {
+	t.Helper()
+	got := histogramCountValue(t, registry, "craq_storage_write_stage_seconds", map[string]string{
+		"stage":  stage,
+		"role":   role,
+		"result": result,
+	})
+	if got < want {
+		t.Fatalf("write stage count stage=%s role=%s result=%s got=%d want-at-least=%d", stage, role, result, got, want)
 	}
 }
 

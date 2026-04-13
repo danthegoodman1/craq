@@ -890,7 +890,7 @@ func (t *QueuedInMemoryReplicationTransport) DeliverAt(ctx context.Context, inde
 }
 
 func (t *QueuedInMemoryReplicationTransport) DeliverAll(ctx context.Context) error {
-	for len(t.queue) > 0 {
+	for t.Pending() > 0 {
 		if err := t.DeliverNext(ctx); err != nil {
 			return err
 		}

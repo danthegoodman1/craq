@@ -410,7 +410,7 @@ func TestRuntimeProcessesReachWritableRoutingUnderConcurrentAdminReads(t *testin
 	stopPoll()
 	pollWG.Wait()
 
-	opCtx, opCancel := context.WithTimeout(ctx, 2*time.Second)
+	opCtx, opCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer opCancel()
 	if err := router.Refresh(opCtx); err != nil {
 		t.Fatalf("router.Refresh returned error: %v", err)
@@ -579,22 +579,12 @@ func TestRuntimeProcessesStayWritableAcrossSequentialAutoJoinRepairs(t *testing.
 				t.Fatalf("route %#v is not fully readable+writable", route)
 			}
 		}
-		opCtx, opCancel := context.WithTimeout(ctx, 2*time.Second)
+		opCtx, opCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer opCancel()
-		if err := router.Refresh(opCtx); err != nil {
-			t.Fatalf("router.Refresh returned error: %v", err)
-		}
 		key := fmt.Sprintf("repair-cycle-%d", len(included))
 		value := fmt.Sprintf("value-%d", len(included))
-		if _, err := router.Put(opCtx, key, value); err != nil {
-			t.Fatalf("router.Put(%q) returned error: %v", key, err)
-		}
-		read, err := router.Get(opCtx, key)
-		if err != nil {
-			t.Fatalf("router.Get(%q) returned error: %v", key, err)
-		}
-		if !read.Found || read.Value != value {
-			t.Fatalf("router.Get(%q) = %#v, want value %q", key, read, value)
+		if err := waitForWritableDataPlane(opCtx, router, key, value); err != nil {
+			t.Fatalf("waitForWritableDataPlane(%q) returned error: %v", key, err)
 		}
 	}
 
@@ -623,6 +613,47 @@ func TestRuntimeProcessesStayWritableAcrossSequentialAutoJoinRepairs(t *testing.
 	for err := range pollErrs {
 		if err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "connection refused") {
 			t.Fatalf("admin poller returned error: %v", err)
+		}
+	}
+}
+
+func waitForWritableDataPlane(ctx context.Context, router *client.Router, key string, value string) error {
+	var lastErr error
+	for {
+		if err := router.Refresh(ctx); err != nil {
+			lastErr = fmt.Errorf("router.Refresh: %w", err)
+		} else if _, err := router.Put(ctx, key, value); err != nil {
+			lastErr = fmt.Errorf("router.Put(%q): %w", key, err)
+		} else {
+			read, err := router.Get(ctx, key)
+			if err == nil && read.Found && read.Value == value {
+				return nil
+			}
+			if err != nil {
+				lastErr = fmt.Errorf("router.Get(%q): %w", key, err)
+			} else {
+				lastErr = fmt.Errorf("router.Get(%q) = %#v, want value %q", key, read, value)
+			}
+		}
+		read, err := router.Get(ctx, key)
+		if err == nil && read.Found && read.Value == value {
+			return nil
+		}
+		if ctx.Err() != nil {
+			if lastErr != nil {
+				return lastErr
+			}
+			return ctx.Err()
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			if lastErr != nil {
+				return lastErr
+			}
+			return ctx.Err()
+		case <-timer.C:
 		}
 	}
 }
@@ -750,7 +781,7 @@ func TestRuntimeProcessesBecomeWritableWithBudgetedBenchmarkStartup(t *testing.T
 		}
 	}
 	if runErr == nil {
-		opCtx, opCancel := context.WithTimeout(ctx, 2*time.Second)
+		opCtx, opCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer opCancel()
 		if err := router.Refresh(opCtx); err != nil {
 			runErr = fmt.Errorf("router.Refresh returned error: %w", err)

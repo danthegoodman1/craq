@@ -128,6 +128,55 @@ func (ReadConsistency) EnumDescriptor() ([]byte, []int) {
 	return file_craq_v1_transport_proto_rawDescGZIP(), []int{1}
 }
 
+type ReplicationCreditKind int32
+
+const (
+	ReplicationCreditKind_REPLICATION_CREDIT_KIND_UNSPECIFIED ReplicationCreditKind = 0
+	ReplicationCreditKind_REPLICATION_CREDIT_KIND_FORWARD     ReplicationCreditKind = 1
+	ReplicationCreditKind_REPLICATION_CREDIT_KIND_COMMIT      ReplicationCreditKind = 2
+)
+
+// Enum value maps for ReplicationCreditKind.
+var (
+	ReplicationCreditKind_name = map[int32]string{
+		0: "REPLICATION_CREDIT_KIND_UNSPECIFIED",
+		1: "REPLICATION_CREDIT_KIND_FORWARD",
+		2: "REPLICATION_CREDIT_KIND_COMMIT",
+	}
+	ReplicationCreditKind_value = map[string]int32{
+		"REPLICATION_CREDIT_KIND_UNSPECIFIED": 0,
+		"REPLICATION_CREDIT_KIND_FORWARD":     1,
+		"REPLICATION_CREDIT_KIND_COMMIT":      2,
+	}
+)
+
+func (x ReplicationCreditKind) Enum() *ReplicationCreditKind {
+	p := new(ReplicationCreditKind)
+	*p = x
+	return p
+}
+
+func (x ReplicationCreditKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ReplicationCreditKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_craq_v1_transport_proto_enumTypes[2].Descriptor()
+}
+
+func (ReplicationCreditKind) Type() protoreflect.EnumType {
+	return &file_craq_v1_transport_proto_enumTypes[2]
+}
+
+func (x ReplicationCreditKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ReplicationCreditKind.Descriptor instead.
+func (ReplicationCreditKind) EnumDescriptor() ([]byte, []int) {
+	return file_craq_v1_transport_proto_rawDescGZIP(), []int{2}
+}
+
 type Empty struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -2580,6 +2629,7 @@ type ReplicationSlotCredit struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Slot          int32                  `protobuf:"varint,1,opt,name=slot,proto3" json:"slot,omitempty"`
 	Available     int32                  `protobuf:"varint,2,opt,name=available,proto3" json:"available,omitempty"`
+	Kind          ReplicationCreditKind  `protobuf:"varint,3,opt,name=kind,proto3,enum=craq.v1.ReplicationCreditKind" json:"kind,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2626,6 +2676,13 @@ func (x *ReplicationSlotCredit) GetAvailable() int32 {
 		return x.Available
 	}
 	return 0
+}
+
+func (x *ReplicationSlotCredit) GetKind() ReplicationCreditKind {
+	if x != nil {
+		return x.Kind
+	}
+	return ReplicationCreditKind_REPLICATION_CREDIT_KIND_UNSPECIFIED
 }
 
 type ReplicationFrame struct {
@@ -3627,10 +3684,11 @@ const file_craq_v1_transport_proto_rawDesc = "" +
 	"\rchain_version\x18\x04 \x01(\x04R\fchainVersion\"O\n" +
 	"\x0eReplicationAck\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12#\n" +
-	"\rencoded_error\x18\x02 \x01(\fR\fencodedError\"I\n" +
+	"\rencoded_error\x18\x02 \x01(\fR\fencodedError\"}\n" +
 	"\x15ReplicationSlotCredit\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\x05R\x04slot\x12\x1c\n" +
-	"\tavailable\x18\x02 \x01(\x05R\tavailable\"\xb3\x02\n" +
+	"\tavailable\x18\x02 \x01(\x05R\tavailable\x122\n" +
+	"\x04kind\x18\x03 \x01(\x0e2\x1e.craq.v1.ReplicationCreditKindR\x04kind\"\xb3\x02\n" +
 	"\x10ReplicationFrame\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12C\n" +
@@ -3697,7 +3755,11 @@ const file_craq_v1_transport_proto_rawDesc = "" +
 	"\x0fReadConsistency\x12 \n" +
 	"\x1cREAD_CONSISTENCY_UNSPECIFIED\x10\x00\x12!\n" +
 	"\x1dREAD_CONSISTENCY_LINEARIZABLE\x10\x01\x12$\n" +
-	" READ_CONSISTENCY_LOCAL_COMMITTED\x10\x022\x97\x06\n" +
+	" READ_CONSISTENCY_LOCAL_COMMITTED\x10\x02*\x89\x01\n" +
+	"\x15ReplicationCreditKind\x12'\n" +
+	"#REPLICATION_CREDIT_KIND_UNSPECIFIED\x10\x00\x12#\n" +
+	"\x1fREPLICATION_CREDIT_KIND_FORWARD\x10\x01\x12\"\n" +
+	"\x1eREPLICATION_CREDIT_KIND_COMMIT\x10\x022\x97\x06\n" +
 	"\x12CoordinatorService\x12<\n" +
 	"\tBootstrap\x12\x19.craq.v1.BootstrapRequest\x1a\x14.craq.v1.ServerState\x12B\n" +
 	"\fRegisterNode\x12\x1c.craq.v1.RegisterNodeRequest\x1a\x14.craq.v1.ServerState\x12C\n" +
@@ -3740,156 +3802,158 @@ func file_craq_v1_transport_proto_rawDescGZIP() []byte {
 	return file_craq_v1_transport_proto_rawDescData
 }
 
-var file_craq_v1_transport_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_craq_v1_transport_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
 var file_craq_v1_transport_proto_msgTypes = make([]protoimpl.MessageInfo, 53)
 var file_craq_v1_transport_proto_goTypes = []any{
 	(ComparisonOperator)(0),                // 0: craq.v1.ComparisonOperator
 	(ReadConsistency)(0),                   // 1: craq.v1.ReadConsistency
-	(*Empty)(nil),                          // 2: craq.v1.Empty
-	(*ObjectMetadata)(nil),                 // 3: craq.v1.ObjectMetadata
-	(*BoolCondition)(nil),                  // 4: craq.v1.BoolCondition
-	(*VersionComparison)(nil),              // 5: craq.v1.VersionComparison
-	(*TimeComparison)(nil),                 // 6: craq.v1.TimeComparison
-	(*WriteConditions)(nil),                // 7: craq.v1.WriteConditions
-	(*FailureDomain)(nil),                  // 8: craq.v1.FailureDomain
-	(*Node)(nil),                           // 9: craq.v1.Node
-	(*BootstrapRequest)(nil),               // 10: craq.v1.BootstrapRequest
-	(*MembershipMutationRequest)(nil),      // 11: craq.v1.MembershipMutationRequest
-	(*RegisterNodeRequest)(nil),            // 12: craq.v1.RegisterNodeRequest
-	(*ServerState)(nil),                    // 13: craq.v1.ServerState
-	(*RoutingSnapshotRequest)(nil),         // 14: craq.v1.RoutingSnapshotRequest
-	(*ReadReplicaRoute)(nil),               // 15: craq.v1.ReadReplicaRoute
-	(*SlotRoute)(nil),                      // 16: craq.v1.SlotRoute
-	(*RoutingSnapshotResponse)(nil),        // 17: craq.v1.RoutingSnapshotResponse
-	(*ReplicaReadyReport)(nil),             // 18: craq.v1.ReplicaReadyReport
-	(*ReplicaRemovedReport)(nil),           // 19: craq.v1.ReplicaRemovedReport
-	(*NodeStatus)(nil),                     // 20: craq.v1.NodeStatus
-	(*ChainPeers)(nil),                     // 21: craq.v1.ChainPeers
-	(*ReplicaAssignment)(nil),              // 22: craq.v1.ReplicaAssignment
-	(*RecoveredReplica)(nil),               // 23: craq.v1.RecoveredReplica
-	(*NodeRecoveryReport)(nil),             // 24: craq.v1.NodeRecoveryReport
-	(*AddReplicaAsTailCommand)(nil),        // 25: craq.v1.AddReplicaAsTailCommand
-	(*ActivateReplicaCommand)(nil),         // 26: craq.v1.ActivateReplicaCommand
-	(*MarkReplicaLeavingCommand)(nil),      // 27: craq.v1.MarkReplicaLeavingCommand
-	(*RemoveReplicaCommand)(nil),           // 28: craq.v1.RemoveReplicaCommand
-	(*UpdateChainPeersCommand)(nil),        // 29: craq.v1.UpdateChainPeersCommand
-	(*ResumeRecoveredReplicaCommand)(nil),  // 30: craq.v1.ResumeRecoveredReplicaCommand
-	(*RecoverReplicaCommand)(nil),          // 31: craq.v1.RecoverReplicaCommand
-	(*DropRecoveredReplicaCommand)(nil),    // 32: craq.v1.DropRecoveredReplicaCommand
-	(*ClientGetRequest)(nil),               // 33: craq.v1.ClientGetRequest
-	(*ClientPutRequest)(nil),               // 34: craq.v1.ClientPutRequest
-	(*ClientDeleteRequest)(nil),            // 35: craq.v1.ClientDeleteRequest
-	(*CommitResult)(nil),                   // 36: craq.v1.CommitResult
-	(*ReadResult)(nil),                     // 37: craq.v1.ReadResult
-	(*WriteOperation)(nil),                 // 38: craq.v1.WriteOperation
-	(*ForwardWriteRequest)(nil),            // 39: craq.v1.ForwardWriteRequest
-	(*CommitWriteRequest)(nil),             // 40: craq.v1.CommitWriteRequest
-	(*ReplicationAck)(nil),                 // 41: craq.v1.ReplicationAck
-	(*ReplicationSlotCredit)(nil),          // 42: craq.v1.ReplicationSlotCredit
-	(*ReplicationFrame)(nil),               // 43: craq.v1.ReplicationFrame
-	(*FetchSnapshotRequest)(nil),           // 44: craq.v1.FetchSnapshotRequest
-	(*SnapshotEntry)(nil),                  // 45: craq.v1.SnapshotEntry
-	(*FetchCommittedSequenceRequest)(nil),  // 46: craq.v1.FetchCommittedSequenceRequest
-	(*FetchCommittedSequenceResponse)(nil), // 47: craq.v1.FetchCommittedSequenceResponse
-	(*RoutingMismatchDetail)(nil),          // 48: craq.v1.RoutingMismatchDetail
-	(*AmbiguousWriteDetail)(nil),           // 49: craq.v1.AmbiguousWriteDetail
-	(*ConditionFailedDetail)(nil),          // 50: craq.v1.ConditionFailedDetail
-	(*BackpressureDetail)(nil),             // 51: craq.v1.BackpressureDetail
-	(*ReadDependencyDetail)(nil),           // 52: craq.v1.ReadDependencyDetail
-	(*DomainErrorDetail)(nil),              // 53: craq.v1.DomainErrorDetail
-	(*NotLeaderDetail)(nil),                // 54: craq.v1.NotLeaderDetail
+	(ReplicationCreditKind)(0),             // 2: craq.v1.ReplicationCreditKind
+	(*Empty)(nil),                          // 3: craq.v1.Empty
+	(*ObjectMetadata)(nil),                 // 4: craq.v1.ObjectMetadata
+	(*BoolCondition)(nil),                  // 5: craq.v1.BoolCondition
+	(*VersionComparison)(nil),              // 6: craq.v1.VersionComparison
+	(*TimeComparison)(nil),                 // 7: craq.v1.TimeComparison
+	(*WriteConditions)(nil),                // 8: craq.v1.WriteConditions
+	(*FailureDomain)(nil),                  // 9: craq.v1.FailureDomain
+	(*Node)(nil),                           // 10: craq.v1.Node
+	(*BootstrapRequest)(nil),               // 11: craq.v1.BootstrapRequest
+	(*MembershipMutationRequest)(nil),      // 12: craq.v1.MembershipMutationRequest
+	(*RegisterNodeRequest)(nil),            // 13: craq.v1.RegisterNodeRequest
+	(*ServerState)(nil),                    // 14: craq.v1.ServerState
+	(*RoutingSnapshotRequest)(nil),         // 15: craq.v1.RoutingSnapshotRequest
+	(*ReadReplicaRoute)(nil),               // 16: craq.v1.ReadReplicaRoute
+	(*SlotRoute)(nil),                      // 17: craq.v1.SlotRoute
+	(*RoutingSnapshotResponse)(nil),        // 18: craq.v1.RoutingSnapshotResponse
+	(*ReplicaReadyReport)(nil),             // 19: craq.v1.ReplicaReadyReport
+	(*ReplicaRemovedReport)(nil),           // 20: craq.v1.ReplicaRemovedReport
+	(*NodeStatus)(nil),                     // 21: craq.v1.NodeStatus
+	(*ChainPeers)(nil),                     // 22: craq.v1.ChainPeers
+	(*ReplicaAssignment)(nil),              // 23: craq.v1.ReplicaAssignment
+	(*RecoveredReplica)(nil),               // 24: craq.v1.RecoveredReplica
+	(*NodeRecoveryReport)(nil),             // 25: craq.v1.NodeRecoveryReport
+	(*AddReplicaAsTailCommand)(nil),        // 26: craq.v1.AddReplicaAsTailCommand
+	(*ActivateReplicaCommand)(nil),         // 27: craq.v1.ActivateReplicaCommand
+	(*MarkReplicaLeavingCommand)(nil),      // 28: craq.v1.MarkReplicaLeavingCommand
+	(*RemoveReplicaCommand)(nil),           // 29: craq.v1.RemoveReplicaCommand
+	(*UpdateChainPeersCommand)(nil),        // 30: craq.v1.UpdateChainPeersCommand
+	(*ResumeRecoveredReplicaCommand)(nil),  // 31: craq.v1.ResumeRecoveredReplicaCommand
+	(*RecoverReplicaCommand)(nil),          // 32: craq.v1.RecoverReplicaCommand
+	(*DropRecoveredReplicaCommand)(nil),    // 33: craq.v1.DropRecoveredReplicaCommand
+	(*ClientGetRequest)(nil),               // 34: craq.v1.ClientGetRequest
+	(*ClientPutRequest)(nil),               // 35: craq.v1.ClientPutRequest
+	(*ClientDeleteRequest)(nil),            // 36: craq.v1.ClientDeleteRequest
+	(*CommitResult)(nil),                   // 37: craq.v1.CommitResult
+	(*ReadResult)(nil),                     // 38: craq.v1.ReadResult
+	(*WriteOperation)(nil),                 // 39: craq.v1.WriteOperation
+	(*ForwardWriteRequest)(nil),            // 40: craq.v1.ForwardWriteRequest
+	(*CommitWriteRequest)(nil),             // 41: craq.v1.CommitWriteRequest
+	(*ReplicationAck)(nil),                 // 42: craq.v1.ReplicationAck
+	(*ReplicationSlotCredit)(nil),          // 43: craq.v1.ReplicationSlotCredit
+	(*ReplicationFrame)(nil),               // 44: craq.v1.ReplicationFrame
+	(*FetchSnapshotRequest)(nil),           // 45: craq.v1.FetchSnapshotRequest
+	(*SnapshotEntry)(nil),                  // 46: craq.v1.SnapshotEntry
+	(*FetchCommittedSequenceRequest)(nil),  // 47: craq.v1.FetchCommittedSequenceRequest
+	(*FetchCommittedSequenceResponse)(nil), // 48: craq.v1.FetchCommittedSequenceResponse
+	(*RoutingMismatchDetail)(nil),          // 49: craq.v1.RoutingMismatchDetail
+	(*AmbiguousWriteDetail)(nil),           // 50: craq.v1.AmbiguousWriteDetail
+	(*ConditionFailedDetail)(nil),          // 51: craq.v1.ConditionFailedDetail
+	(*BackpressureDetail)(nil),             // 52: craq.v1.BackpressureDetail
+	(*ReadDependencyDetail)(nil),           // 53: craq.v1.ReadDependencyDetail
+	(*DomainErrorDetail)(nil),              // 54: craq.v1.DomainErrorDetail
+	(*NotLeaderDetail)(nil),                // 55: craq.v1.NotLeaderDetail
 }
 var file_craq_v1_transport_proto_depIdxs = []int32{
 	0,  // 0: craq.v1.VersionComparison.operator:type_name -> craq.v1.ComparisonOperator
 	0,  // 1: craq.v1.TimeComparison.operator:type_name -> craq.v1.ComparisonOperator
-	4,  // 2: craq.v1.WriteConditions.exists:type_name -> craq.v1.BoolCondition
-	5,  // 3: craq.v1.WriteConditions.version:type_name -> craq.v1.VersionComparison
-	6,  // 4: craq.v1.WriteConditions.updated_at:type_name -> craq.v1.TimeComparison
-	8,  // 5: craq.v1.Node.failure_domains:type_name -> craq.v1.FailureDomain
-	9,  // 6: craq.v1.BootstrapRequest.nodes:type_name -> craq.v1.Node
-	9,  // 7: craq.v1.MembershipMutationRequest.node:type_name -> craq.v1.Node
-	9,  // 8: craq.v1.RegisterNodeRequest.node:type_name -> craq.v1.Node
-	15, // 9: craq.v1.SlotRoute.read_replicas:type_name -> craq.v1.ReadReplicaRoute
-	16, // 10: craq.v1.RoutingSnapshotResponse.slots:type_name -> craq.v1.SlotRoute
-	21, // 11: craq.v1.ReplicaAssignment.peers:type_name -> craq.v1.ChainPeers
-	22, // 12: craq.v1.RecoveredReplica.assignment:type_name -> craq.v1.ReplicaAssignment
-	23, // 13: craq.v1.NodeRecoveryReport.replicas:type_name -> craq.v1.RecoveredReplica
-	22, // 14: craq.v1.AddReplicaAsTailCommand.assignment:type_name -> craq.v1.ReplicaAssignment
-	22, // 15: craq.v1.UpdateChainPeersCommand.assignment:type_name -> craq.v1.ReplicaAssignment
-	22, // 16: craq.v1.ResumeRecoveredReplicaCommand.assignment:type_name -> craq.v1.ReplicaAssignment
-	22, // 17: craq.v1.RecoverReplicaCommand.assignment:type_name -> craq.v1.ReplicaAssignment
+	5,  // 2: craq.v1.WriteConditions.exists:type_name -> craq.v1.BoolCondition
+	6,  // 3: craq.v1.WriteConditions.version:type_name -> craq.v1.VersionComparison
+	7,  // 4: craq.v1.WriteConditions.updated_at:type_name -> craq.v1.TimeComparison
+	9,  // 5: craq.v1.Node.failure_domains:type_name -> craq.v1.FailureDomain
+	10, // 6: craq.v1.BootstrapRequest.nodes:type_name -> craq.v1.Node
+	10, // 7: craq.v1.MembershipMutationRequest.node:type_name -> craq.v1.Node
+	10, // 8: craq.v1.RegisterNodeRequest.node:type_name -> craq.v1.Node
+	16, // 9: craq.v1.SlotRoute.read_replicas:type_name -> craq.v1.ReadReplicaRoute
+	17, // 10: craq.v1.RoutingSnapshotResponse.slots:type_name -> craq.v1.SlotRoute
+	22, // 11: craq.v1.ReplicaAssignment.peers:type_name -> craq.v1.ChainPeers
+	23, // 12: craq.v1.RecoveredReplica.assignment:type_name -> craq.v1.ReplicaAssignment
+	24, // 13: craq.v1.NodeRecoveryReport.replicas:type_name -> craq.v1.RecoveredReplica
+	23, // 14: craq.v1.AddReplicaAsTailCommand.assignment:type_name -> craq.v1.ReplicaAssignment
+	23, // 15: craq.v1.UpdateChainPeersCommand.assignment:type_name -> craq.v1.ReplicaAssignment
+	23, // 16: craq.v1.ResumeRecoveredReplicaCommand.assignment:type_name -> craq.v1.ReplicaAssignment
+	23, // 17: craq.v1.RecoverReplicaCommand.assignment:type_name -> craq.v1.ReplicaAssignment
 	1,  // 18: craq.v1.ClientGetRequest.consistency:type_name -> craq.v1.ReadConsistency
-	7,  // 19: craq.v1.ClientPutRequest.conditions:type_name -> craq.v1.WriteConditions
-	7,  // 20: craq.v1.ClientDeleteRequest.conditions:type_name -> craq.v1.WriteConditions
-	3,  // 21: craq.v1.CommitResult.metadata:type_name -> craq.v1.ObjectMetadata
-	3,  // 22: craq.v1.ReadResult.metadata:type_name -> craq.v1.ObjectMetadata
-	3,  // 23: craq.v1.WriteOperation.metadata:type_name -> craq.v1.ObjectMetadata
-	38, // 24: craq.v1.ForwardWriteRequest.operation:type_name -> craq.v1.WriteOperation
-	39, // 25: craq.v1.ReplicationFrame.forward_write:type_name -> craq.v1.ForwardWriteRequest
-	40, // 26: craq.v1.ReplicationFrame.commit_write:type_name -> craq.v1.CommitWriteRequest
-	41, // 27: craq.v1.ReplicationFrame.ack:type_name -> craq.v1.ReplicationAck
-	42, // 28: craq.v1.ReplicationFrame.slot_credit:type_name -> craq.v1.ReplicationSlotCredit
-	3,  // 29: craq.v1.SnapshotEntry.metadata:type_name -> craq.v1.ObjectMetadata
-	3,  // 30: craq.v1.ConditionFailedDetail.current_metadata:type_name -> craq.v1.ObjectMetadata
-	10, // 31: craq.v1.CoordinatorService.Bootstrap:input_type -> craq.v1.BootstrapRequest
-	12, // 32: craq.v1.CoordinatorService.RegisterNode:input_type -> craq.v1.RegisterNodeRequest
-	11, // 33: craq.v1.CoordinatorService.AddNode:input_type -> craq.v1.MembershipMutationRequest
-	11, // 34: craq.v1.CoordinatorService.BeginDrainNode:input_type -> craq.v1.MembershipMutationRequest
-	11, // 35: craq.v1.CoordinatorService.MarkNodeDead:input_type -> craq.v1.MembershipMutationRequest
-	14, // 36: craq.v1.CoordinatorService.RoutingSnapshot:input_type -> craq.v1.RoutingSnapshotRequest
-	18, // 37: craq.v1.CoordinatorService.ReportReplicaReady:input_type -> craq.v1.ReplicaReadyReport
-	19, // 38: craq.v1.CoordinatorService.ReportReplicaRemoved:input_type -> craq.v1.ReplicaRemovedReport
-	20, // 39: craq.v1.CoordinatorService.ReportNodeHeartbeat:input_type -> craq.v1.NodeStatus
-	24, // 40: craq.v1.CoordinatorService.ReportNodeRecovered:input_type -> craq.v1.NodeRecoveryReport
-	2,  // 41: craq.v1.CoordinatorService.EvaluateLiveness:input_type -> craq.v1.Empty
-	33, // 42: craq.v1.StorageService.Get:input_type -> craq.v1.ClientGetRequest
-	34, // 43: craq.v1.StorageService.Put:input_type -> craq.v1.ClientPutRequest
-	35, // 44: craq.v1.StorageService.Delete:input_type -> craq.v1.ClientDeleteRequest
-	25, // 45: craq.v1.StorageService.AddReplicaAsTail:input_type -> craq.v1.AddReplicaAsTailCommand
-	26, // 46: craq.v1.StorageService.ActivateReplica:input_type -> craq.v1.ActivateReplicaCommand
-	27, // 47: craq.v1.StorageService.MarkReplicaLeaving:input_type -> craq.v1.MarkReplicaLeavingCommand
-	28, // 48: craq.v1.StorageService.RemoveReplica:input_type -> craq.v1.RemoveReplicaCommand
-	29, // 49: craq.v1.StorageService.UpdateChainPeers:input_type -> craq.v1.UpdateChainPeersCommand
-	30, // 50: craq.v1.StorageService.ResumeRecoveredReplica:input_type -> craq.v1.ResumeRecoveredReplicaCommand
-	31, // 51: craq.v1.StorageService.RecoverReplica:input_type -> craq.v1.RecoverReplicaCommand
-	32, // 52: craq.v1.StorageService.DropRecoveredReplica:input_type -> craq.v1.DropRecoveredReplicaCommand
-	39, // 53: craq.v1.StorageService.ForwardWrite:input_type -> craq.v1.ForwardWriteRequest
-	40, // 54: craq.v1.StorageService.CommitWrite:input_type -> craq.v1.CommitWriteRequest
-	43, // 55: craq.v1.StorageService.Replicate:input_type -> craq.v1.ReplicationFrame
-	44, // 56: craq.v1.StorageService.FetchSnapshot:input_type -> craq.v1.FetchSnapshotRequest
-	46, // 57: craq.v1.StorageService.FetchCommittedSequence:input_type -> craq.v1.FetchCommittedSequenceRequest
-	13, // 58: craq.v1.CoordinatorService.Bootstrap:output_type -> craq.v1.ServerState
-	13, // 59: craq.v1.CoordinatorService.RegisterNode:output_type -> craq.v1.ServerState
-	13, // 60: craq.v1.CoordinatorService.AddNode:output_type -> craq.v1.ServerState
-	13, // 61: craq.v1.CoordinatorService.BeginDrainNode:output_type -> craq.v1.ServerState
-	13, // 62: craq.v1.CoordinatorService.MarkNodeDead:output_type -> craq.v1.ServerState
-	17, // 63: craq.v1.CoordinatorService.RoutingSnapshot:output_type -> craq.v1.RoutingSnapshotResponse
-	13, // 64: craq.v1.CoordinatorService.ReportReplicaReady:output_type -> craq.v1.ServerState
-	13, // 65: craq.v1.CoordinatorService.ReportReplicaRemoved:output_type -> craq.v1.ServerState
-	2,  // 66: craq.v1.CoordinatorService.ReportNodeHeartbeat:output_type -> craq.v1.Empty
-	2,  // 67: craq.v1.CoordinatorService.ReportNodeRecovered:output_type -> craq.v1.Empty
-	13, // 68: craq.v1.CoordinatorService.EvaluateLiveness:output_type -> craq.v1.ServerState
-	37, // 69: craq.v1.StorageService.Get:output_type -> craq.v1.ReadResult
-	36, // 70: craq.v1.StorageService.Put:output_type -> craq.v1.CommitResult
-	36, // 71: craq.v1.StorageService.Delete:output_type -> craq.v1.CommitResult
-	2,  // 72: craq.v1.StorageService.AddReplicaAsTail:output_type -> craq.v1.Empty
-	2,  // 73: craq.v1.StorageService.ActivateReplica:output_type -> craq.v1.Empty
-	2,  // 74: craq.v1.StorageService.MarkReplicaLeaving:output_type -> craq.v1.Empty
-	2,  // 75: craq.v1.StorageService.RemoveReplica:output_type -> craq.v1.Empty
-	2,  // 76: craq.v1.StorageService.UpdateChainPeers:output_type -> craq.v1.Empty
-	2,  // 77: craq.v1.StorageService.ResumeRecoveredReplica:output_type -> craq.v1.Empty
-	2,  // 78: craq.v1.StorageService.RecoverReplica:output_type -> craq.v1.Empty
-	2,  // 79: craq.v1.StorageService.DropRecoveredReplica:output_type -> craq.v1.Empty
-	2,  // 80: craq.v1.StorageService.ForwardWrite:output_type -> craq.v1.Empty
-	2,  // 81: craq.v1.StorageService.CommitWrite:output_type -> craq.v1.Empty
-	43, // 82: craq.v1.StorageService.Replicate:output_type -> craq.v1.ReplicationFrame
-	45, // 83: craq.v1.StorageService.FetchSnapshot:output_type -> craq.v1.SnapshotEntry
-	47, // 84: craq.v1.StorageService.FetchCommittedSequence:output_type -> craq.v1.FetchCommittedSequenceResponse
-	58, // [58:85] is the sub-list for method output_type
-	31, // [31:58] is the sub-list for method input_type
-	31, // [31:31] is the sub-list for extension type_name
-	31, // [31:31] is the sub-list for extension extendee
-	0,  // [0:31] is the sub-list for field type_name
+	8,  // 19: craq.v1.ClientPutRequest.conditions:type_name -> craq.v1.WriteConditions
+	8,  // 20: craq.v1.ClientDeleteRequest.conditions:type_name -> craq.v1.WriteConditions
+	4,  // 21: craq.v1.CommitResult.metadata:type_name -> craq.v1.ObjectMetadata
+	4,  // 22: craq.v1.ReadResult.metadata:type_name -> craq.v1.ObjectMetadata
+	4,  // 23: craq.v1.WriteOperation.metadata:type_name -> craq.v1.ObjectMetadata
+	39, // 24: craq.v1.ForwardWriteRequest.operation:type_name -> craq.v1.WriteOperation
+	2,  // 25: craq.v1.ReplicationSlotCredit.kind:type_name -> craq.v1.ReplicationCreditKind
+	40, // 26: craq.v1.ReplicationFrame.forward_write:type_name -> craq.v1.ForwardWriteRequest
+	41, // 27: craq.v1.ReplicationFrame.commit_write:type_name -> craq.v1.CommitWriteRequest
+	42, // 28: craq.v1.ReplicationFrame.ack:type_name -> craq.v1.ReplicationAck
+	43, // 29: craq.v1.ReplicationFrame.slot_credit:type_name -> craq.v1.ReplicationSlotCredit
+	4,  // 30: craq.v1.SnapshotEntry.metadata:type_name -> craq.v1.ObjectMetadata
+	4,  // 31: craq.v1.ConditionFailedDetail.current_metadata:type_name -> craq.v1.ObjectMetadata
+	11, // 32: craq.v1.CoordinatorService.Bootstrap:input_type -> craq.v1.BootstrapRequest
+	13, // 33: craq.v1.CoordinatorService.RegisterNode:input_type -> craq.v1.RegisterNodeRequest
+	12, // 34: craq.v1.CoordinatorService.AddNode:input_type -> craq.v1.MembershipMutationRequest
+	12, // 35: craq.v1.CoordinatorService.BeginDrainNode:input_type -> craq.v1.MembershipMutationRequest
+	12, // 36: craq.v1.CoordinatorService.MarkNodeDead:input_type -> craq.v1.MembershipMutationRequest
+	15, // 37: craq.v1.CoordinatorService.RoutingSnapshot:input_type -> craq.v1.RoutingSnapshotRequest
+	19, // 38: craq.v1.CoordinatorService.ReportReplicaReady:input_type -> craq.v1.ReplicaReadyReport
+	20, // 39: craq.v1.CoordinatorService.ReportReplicaRemoved:input_type -> craq.v1.ReplicaRemovedReport
+	21, // 40: craq.v1.CoordinatorService.ReportNodeHeartbeat:input_type -> craq.v1.NodeStatus
+	25, // 41: craq.v1.CoordinatorService.ReportNodeRecovered:input_type -> craq.v1.NodeRecoveryReport
+	3,  // 42: craq.v1.CoordinatorService.EvaluateLiveness:input_type -> craq.v1.Empty
+	34, // 43: craq.v1.StorageService.Get:input_type -> craq.v1.ClientGetRequest
+	35, // 44: craq.v1.StorageService.Put:input_type -> craq.v1.ClientPutRequest
+	36, // 45: craq.v1.StorageService.Delete:input_type -> craq.v1.ClientDeleteRequest
+	26, // 46: craq.v1.StorageService.AddReplicaAsTail:input_type -> craq.v1.AddReplicaAsTailCommand
+	27, // 47: craq.v1.StorageService.ActivateReplica:input_type -> craq.v1.ActivateReplicaCommand
+	28, // 48: craq.v1.StorageService.MarkReplicaLeaving:input_type -> craq.v1.MarkReplicaLeavingCommand
+	29, // 49: craq.v1.StorageService.RemoveReplica:input_type -> craq.v1.RemoveReplicaCommand
+	30, // 50: craq.v1.StorageService.UpdateChainPeers:input_type -> craq.v1.UpdateChainPeersCommand
+	31, // 51: craq.v1.StorageService.ResumeRecoveredReplica:input_type -> craq.v1.ResumeRecoveredReplicaCommand
+	32, // 52: craq.v1.StorageService.RecoverReplica:input_type -> craq.v1.RecoverReplicaCommand
+	33, // 53: craq.v1.StorageService.DropRecoveredReplica:input_type -> craq.v1.DropRecoveredReplicaCommand
+	40, // 54: craq.v1.StorageService.ForwardWrite:input_type -> craq.v1.ForwardWriteRequest
+	41, // 55: craq.v1.StorageService.CommitWrite:input_type -> craq.v1.CommitWriteRequest
+	44, // 56: craq.v1.StorageService.Replicate:input_type -> craq.v1.ReplicationFrame
+	45, // 57: craq.v1.StorageService.FetchSnapshot:input_type -> craq.v1.FetchSnapshotRequest
+	47, // 58: craq.v1.StorageService.FetchCommittedSequence:input_type -> craq.v1.FetchCommittedSequenceRequest
+	14, // 59: craq.v1.CoordinatorService.Bootstrap:output_type -> craq.v1.ServerState
+	14, // 60: craq.v1.CoordinatorService.RegisterNode:output_type -> craq.v1.ServerState
+	14, // 61: craq.v1.CoordinatorService.AddNode:output_type -> craq.v1.ServerState
+	14, // 62: craq.v1.CoordinatorService.BeginDrainNode:output_type -> craq.v1.ServerState
+	14, // 63: craq.v1.CoordinatorService.MarkNodeDead:output_type -> craq.v1.ServerState
+	18, // 64: craq.v1.CoordinatorService.RoutingSnapshot:output_type -> craq.v1.RoutingSnapshotResponse
+	14, // 65: craq.v1.CoordinatorService.ReportReplicaReady:output_type -> craq.v1.ServerState
+	14, // 66: craq.v1.CoordinatorService.ReportReplicaRemoved:output_type -> craq.v1.ServerState
+	3,  // 67: craq.v1.CoordinatorService.ReportNodeHeartbeat:output_type -> craq.v1.Empty
+	3,  // 68: craq.v1.CoordinatorService.ReportNodeRecovered:output_type -> craq.v1.Empty
+	14, // 69: craq.v1.CoordinatorService.EvaluateLiveness:output_type -> craq.v1.ServerState
+	38, // 70: craq.v1.StorageService.Get:output_type -> craq.v1.ReadResult
+	37, // 71: craq.v1.StorageService.Put:output_type -> craq.v1.CommitResult
+	37, // 72: craq.v1.StorageService.Delete:output_type -> craq.v1.CommitResult
+	3,  // 73: craq.v1.StorageService.AddReplicaAsTail:output_type -> craq.v1.Empty
+	3,  // 74: craq.v1.StorageService.ActivateReplica:output_type -> craq.v1.Empty
+	3,  // 75: craq.v1.StorageService.MarkReplicaLeaving:output_type -> craq.v1.Empty
+	3,  // 76: craq.v1.StorageService.RemoveReplica:output_type -> craq.v1.Empty
+	3,  // 77: craq.v1.StorageService.UpdateChainPeers:output_type -> craq.v1.Empty
+	3,  // 78: craq.v1.StorageService.ResumeRecoveredReplica:output_type -> craq.v1.Empty
+	3,  // 79: craq.v1.StorageService.RecoverReplica:output_type -> craq.v1.Empty
+	3,  // 80: craq.v1.StorageService.DropRecoveredReplica:output_type -> craq.v1.Empty
+	3,  // 81: craq.v1.StorageService.ForwardWrite:output_type -> craq.v1.Empty
+	3,  // 82: craq.v1.StorageService.CommitWrite:output_type -> craq.v1.Empty
+	44, // 83: craq.v1.StorageService.Replicate:output_type -> craq.v1.ReplicationFrame
+	46, // 84: craq.v1.StorageService.FetchSnapshot:output_type -> craq.v1.SnapshotEntry
+	48, // 85: craq.v1.StorageService.FetchCommittedSequence:output_type -> craq.v1.FetchCommittedSequenceResponse
+	59, // [59:86] is the sub-list for method output_type
+	32, // [32:59] is the sub-list for method input_type
+	32, // [32:32] is the sub-list for extension type_name
+	32, // [32:32] is the sub-list for extension extendee
+	0,  // [0:32] is the sub-list for field type_name
 }
 
 func init() { file_craq_v1_transport_proto_init() }
@@ -3908,7 +3972,7 @@ func file_craq_v1_transport_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_craq_v1_transport_proto_rawDesc), len(file_craq_v1_transport_proto_rawDesc)),
-			NumEnums:      2,
+			NumEnums:      3,
 			NumMessages:   53,
 			NumExtensions: 0,
 			NumServices:   2,

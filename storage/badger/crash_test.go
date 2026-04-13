@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/danthegoodman1/craq/storage"
 )
@@ -209,6 +210,28 @@ func TestBadgerNodeReopenAfterDirtyCRAQStateRecoversFromServingPeer(t *testing.T
 		t.Fatalf("tail HandleClientGet returned error: %v", err)
 	} else if !read.Found || read.Value != "v2" {
 		t.Fatalf("tail HandleClientGet = %#v, want value v2", read)
+	}
+	if err := repl.DeliverAll(ctx); err != nil {
+		t.Fatalf("DeliverAll after timed-out write returned error: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got, err := tail.HighestCommittedSequence(3)
+		snapshot, snapErr := tail.CommittedSnapshot(3)
+		value := ""
+		if object, ok := snapshot["alpha"]; ok {
+			value = object.Value
+		}
+		if err == nil && got == 2 && value == "v2" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tail committed state: highest=%d err=%v snapshot=%v snapErr=%v, want highest=2 and alpha=v2", got, err, snapshot, snapErr)
+		}
+		if err := repl.DeliverAll(ctx); err != nil {
+			t.Fatalf("DeliverAll while awaiting tail commit returned error: %v", err)
+		}
+		time.Sleep(250 * time.Microsecond)
 	}
 
 	if err := head.Close(); err != nil {

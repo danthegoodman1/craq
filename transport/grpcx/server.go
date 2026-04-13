@@ -248,6 +248,7 @@ type StorageGRPCServer struct {
 	node       *storage.Node
 	grpc       *grpc.Server
 	lis        net.Listener
+	lisMu      sync.Mutex
 	authorizer *rpcAuthorizer
 	logger     zerolog.Logger
 	observer   *grpcObserver
@@ -298,7 +299,9 @@ func NewStorageGRPCServerWithTLS(node *storage.Node, cfg *ServerTLSConfig) (*Sto
 }
 
 func (s *StorageGRPCServer) Serve(lis net.Listener) error {
+	s.lisMu.Lock()
 	s.lis = lis
+	s.lisMu.Unlock()
 	s.logger.Info().Str("component", "grpc").Str("grpc_component", "storage").Str("address", lis.Addr().String()).Msg("grpc server listening")
 	return s.grpc.Serve(lis)
 }
@@ -308,8 +311,11 @@ func (s *StorageGRPCServer) Close() error {
 	if s.grpc != nil {
 		s.grpc.Stop()
 	}
-	if s.lis != nil {
-		return s.lis.Close()
+	s.lisMu.Lock()
+	lis := s.lis
+	s.lisMu.Unlock()
+	if lis != nil {
+		return lis.Close()
 	}
 	return nil
 }
@@ -539,14 +545,27 @@ func (s *StorageGRPCServer) Replicate(stream grpcproto.StorageService_ReplicateS
 		if slot < 0 {
 			return nil
 		}
-		return sendFrame(&grpcproto.ReplicationFrame{
-			Payload: &grpcproto.ReplicationFrame_SlotCredit{
-				SlotCredit: &grpcproto.ReplicationSlotCredit{
-					Slot:      int32(slot),
-					Available: int32(s.node.ReplicationSlotCredit(slot)),
+		for _, creditKind := range []grpcproto.ReplicationCreditKind{
+			grpcproto.ReplicationCreditKind_REPLICATION_CREDIT_KIND_FORWARD,
+			grpcproto.ReplicationCreditKind_REPLICATION_CREDIT_KIND_COMMIT,
+		} {
+			kindLabel := "forward"
+			if creditKind == grpcproto.ReplicationCreditKind_REPLICATION_CREDIT_KIND_COMMIT {
+				kindLabel = "commit"
+			}
+			if err := sendFrame(&grpcproto.ReplicationFrame{
+				Payload: &grpcproto.ReplicationFrame_SlotCredit{
+					SlotCredit: &grpcproto.ReplicationSlotCredit{
+						Slot:      int32(slot),
+						Available: int32(s.node.ReplicationSlotCreditByKind(slot, kindLabel)),
+						Kind:      creditKind,
+					},
 				},
-			},
-		})
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	unregisterCreditSender := s.registerReplicationCreditSender(sendSlotCredit)
 	defer unregisterCreditSender()

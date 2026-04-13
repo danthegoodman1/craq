@@ -618,6 +618,15 @@ func (t *ReplicationTransport) ForwardWrite(ctx context.Context, toTarget string
 	return t.submitReplicationRequest(ctx, toTarget, replicationForwardPayload{req: req})
 }
 
+func (t *ReplicationTransport) ForwardWriteAsync(
+	ctx context.Context,
+	toTarget string,
+	req storage.ForwardWriteRequest,
+	onComplete func(error),
+) error {
+	return t.submitReplicationRequestAsync(ctx, toTarget, replicationForwardPayload{req: req}, onComplete)
+}
+
 func (t *ReplicationTransport) CommitWrite(ctx context.Context, toTarget string, req storage.CommitWriteRequest) error {
 	return t.submitReplicationRequest(ctx, toTarget, replicationCommitPayload{req: req})
 }

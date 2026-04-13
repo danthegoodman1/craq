@@ -163,14 +163,14 @@ func TestAnalyzeRunGeneratesSummaryAndHTML(t *testing.T) {
 	if got := summary.System["client"].CPUUtilization[0].Timestamp; got != (time.Date(2026, 1, 1, 0, 0, 1, 0, time.UTC)) {
 		t.Fatalf("first client cpu timestamp = %s", got)
 	}
-	if summary.WriteBudget["put-only-c32"].DominantStage != "head_wait_for_commit" {
-		t.Fatalf("dominant stage = %q, want head_wait_for_commit", summary.WriteBudget["put-only-c32"].DominantStage)
+	if summary.WriteBudget["put-only-c32"].DominantStage != "head_wait_for_commit_watermark" {
+		t.Fatalf("dominant stage = %q, want head_wait_for_commit_watermark", summary.WriteBudget["put-only-c32"].DominantStage)
 	}
 	budgetData, err := os.ReadFile(filepath.Join(runDir, "analysis", "write_latency_budget.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(budgetData), `"stage": "head_wait_for_commit"`) {
+	if !strings.Contains(string(budgetData), `"stage": "head_wait_for_commit_watermark"`) {
 		t.Fatalf("write latency budget missing dominant stage: %s", string(budgetData))
 	}
 	if _, err := os.Stat(filepath.Join(runDir, "analysis", "storage_floor_summary.json")); err != nil {
@@ -231,7 +231,7 @@ func writeMetricSnapshot(t *testing.T, path string, headCount uint64, headSum fl
 	}, []string{"component", "method"})
 	registry.MustRegister(stageHist, grpcHist)
 	observeHistogram(stageHist.WithLabelValues("head_get_committed", "head", "success"), headCount, headSum)
-	observeHistogram(stageHist.WithLabelValues("head_wait_for_commit", "head", "success"), waitCount, waitSum)
+	observeHistogram(stageHist.WithLabelValues("head_wait_for_commit_watermark", "head", "success"), waitCount, waitSum)
 	observeHistogram(grpcHist.WithLabelValues("storage", "/craq.v1.StorageService/Put"), putCount, putSum)
 	return writeRegistryMetrics(path, registry)
 }

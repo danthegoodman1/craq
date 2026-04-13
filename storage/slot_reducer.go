@@ -49,6 +49,7 @@ func reduceSubmitWrite(record replicaRecord, operation WriteOperation) slotSubmi
 		},
 		operation: &opCopy,
 	}
+	record.preparedEntries[operation.Sequence] = opCopy
 	record.expectedCommitSources[operation.Sequence] = expectedCommitSource{
 		FromNodeID:   record.assignment.Peers.SuccessorNodeID,
 		ChainVersion: record.assignment.ChainVersion,
@@ -148,6 +149,7 @@ func reduceStageForward(record replicaRecord, req ForwardWriteRequest) replicaRe
 		return record
 	}
 	record.stagedForwards[req.Operation.Sequence] = cloneForwardRequest(req)
+	record.preparedEntries[req.Operation.Sequence] = cloneWriteOperation(req.Operation)
 	record.expectedCommitSources[req.Operation.Sequence] = expectedCommitSource{
 		FromNodeID:   record.assignment.Peers.SuccessorNodeID,
 		ChainVersion: record.assignment.ChainVersion,
@@ -175,6 +177,9 @@ func reduceRecordCommitApplied(
 func ensureProtocolReplicaState(record replicaRecord) replicaRecord {
 	if record.pendingWrites == nil {
 		record.pendingWrites = map[uint64]pendingWrite{}
+	}
+	if record.preparedEntries == nil {
+		record.preparedEntries = map[uint64]WriteOperation{}
 	}
 	if record.expectedCommitSources == nil {
 		record.expectedCommitSources = map[uint64]expectedCommitSource{}
@@ -206,13 +211,19 @@ func ensureProtocolReplicaState(record replicaRecord) replicaRecord {
 func reduceHandlePastForward(record replicaRecord, req ForwardWriteRequest) error {
 	record = ensureProtocolReplicaState(record)
 	if staged, ok := record.stagedForwards[req.Operation.Sequence]; ok {
-		if sameForwardRequest(staged, req) {
+		if sameForwardRequest(staged, req) ||
+			(sameForwardRequestIgnoringChain(staged, req) &&
+				record.assignment.Peers.PredecessorNodeID == req.FromNodeID &&
+				record.assignment.ChainVersion == req.ChainVersion) {
 			return nil
 		}
 		return fmt.Errorf("%w: slot %d sequence %d forward payload conflict", ErrProtocolConflict, req.Operation.Slot, req.Operation.Sequence)
 	}
 	if committed, ok := record.recentCommittedForwards[req.Operation.Sequence]; ok {
-		if sameForwardRequest(committed, req) {
+		if sameForwardRequest(committed, req) ||
+			(sameForwardRequestIgnoringChain(committed, req) &&
+				record.assignment.Peers.PredecessorNodeID == req.FromNodeID &&
+				record.assignment.ChainVersion == req.ChainVersion) {
 			return nil
 		}
 		return fmt.Errorf("%w: slot %d sequence %d committed forward conflict", ErrProtocolConflict, req.Operation.Slot, req.Operation.Sequence)
@@ -328,16 +339,22 @@ func reduceHasStagedForward(record replicaRecord, sequence uint64) bool {
 }
 
 func reduceHasCommittableSequence(record replicaRecord, sequence uint64) bool {
+	record = ensureProtocolReplicaState(record)
+	if _, ok := record.preparedEntries[sequence]; ok {
+		return true
+	}
 	if reduceHasStagedForward(record, sequence) {
 		return true
 	}
-	record = ensureProtocolReplicaState(record)
 	_, ok := record.pendingWrites[sequence]
 	return ok
 }
 
 func reduceCommittableOperation(record replicaRecord, sequence uint64) (WriteOperation, error) {
 	record = ensureProtocolReplicaState(record)
+	if operation, ok := record.preparedEntries[sequence]; ok {
+		return cloneWriteOperation(operation), nil
+	}
 	if pending, ok := record.pendingWrites[sequence]; ok && pending.operation != nil {
 		return cloneWriteOperation(*pending.operation), nil
 	}

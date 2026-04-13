@@ -162,6 +162,38 @@ func (t *ReplicationTransport) submitReplicationRequest(
 	}
 }
 
+func (t *ReplicationTransport) submitReplicationRequestAsync(
+	ctx context.Context,
+	target string,
+	payload isReplicationFramePayload,
+	onComplete func(error),
+) error {
+	req := &outboundReplicationRequest{
+		id:   t.nextRequestID(),
+		ctx:  ctx,
+		done: make(chan error, 1),
+		kind: payload.kind(),
+		at:   time.Now(),
+		slot: payload.slot(),
+		seq:  payload.sequence(),
+	}
+	req.frame = payload.toFrame(req.id)
+	if err := t.sessionForTarget(target).enqueue(req); err != nil {
+		return err
+	}
+	if onComplete != nil {
+		go func() {
+			select {
+			case err := <-req.done:
+				onComplete(err)
+			case <-ctx.Done():
+				onComplete(ctx.Err())
+			}
+		}()
+	}
+	return nil
+}
+
 type isReplicationFramePayload interface {
 	toFrame(requestID uint64) *grpcproto.ReplicationFrame
 	kind() string
@@ -263,18 +295,16 @@ func (s *replicationPeerSession) recordEnqueue(req *outboundReplicationRequest) 
 	}
 }
 
-func (s *replicationPeerSession) recordCredit(slot int, available int) {
+func (s *replicationPeerSession) recordCredit(kind string, slot int, available int) {
 	now := time.Now().UTC()
 	s.diagMu.Lock()
 	defer s.diagMu.Unlock()
-	for _, kind := range []string{"forward", "commit"} {
-		state := s.debugStateFor(kind, slot)
-		state.advertisedCredit = available
-		state.localCredit = available
-		state.lastCreditUpdate = now
-		if available > 0 && state.localSpoolDepth == 0 {
-			state.blockedSince = time.Time{}
-		}
+	state := s.debugStateFor(kind, slot)
+	state.advertisedCredit = available
+	state.localCredit = available
+	state.lastCreditUpdate = now
+	if available > 0 && state.localSpoolDepth == 0 {
+		state.blockedSince = time.Time{}
 	}
 }
 
@@ -407,9 +437,9 @@ func (s *replicationPeerSession) run() {
 		backlog       []*outboundReplicationRequest
 		pending       = map[uint64]*outboundReplicationRequest{}
 		pendingSince  = map[uint64]time.Time{}
-		pendingBySlot = map[int]int{}
-		credits       = map[int]int{}
-		probeAfter    = map[int]time.Time{}
+		pendingBySlot = map[replicationSlotKindKey]int{}
+		credits       = map[replicationSlotKindKey]int{}
+		probeAfter    = map[replicationSlotKindKey]time.Time{}
 		stream        grpc.BidiStreamingClient[grpcproto.ReplicationFrame, grpcproto.ReplicationFrame]
 		errCh         <-chan error
 		ackCh         <-chan *grpcproto.ReplicationFrame
@@ -436,48 +466,50 @@ func (s *replicationPeerSession) run() {
 			ids = append(ids, id)
 		}
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-			replayed := make([]*outboundReplicationRequest, 0, len(ids))
+		replayed := make([]*outboundReplicationRequest, 0, len(ids))
 		for _, id := range ids {
 			req := pending[id]
 			replayed = append(replayed, req)
 			s.recordRequeued(req)
 			delete(pending, id)
 			delete(pendingSince, id)
-			pendingBySlot[req.slot]--
-			if pendingBySlot[req.slot] <= 0 {
-				delete(pendingBySlot, req.slot)
+			key := replicationSlotKindKey{kind: req.kind, slot: req.slot}
+			pendingBySlot[key]--
+			if pendingBySlot[key] <= 0 {
+				delete(pendingBySlot, key)
 			}
 		}
 		backlog = append(replayed, backlog...)
 	}
 
-	slotCredit := func(slot int) int {
-		credit, ok := credits[slot]
+	slotCredit := func(kind string, slot int) int {
+		credit, ok := credits[replicationSlotKindKey{kind: kind, slot: slot}]
 		if !ok {
 			return 1
 		}
 		return credit
 	}
 
-	setSlotCredit := func(slot int, available int) {
+	setSlotCredit := func(kind string, slot int, available int) {
 		if available < 0 {
 			available = 0
 		}
-		credits[slot] = available
+		credits[replicationSlotKindKey{kind: kind, slot: slot}] = available
 	}
 
-	allowBlockedProbe := func(slot int) bool {
-		if slotCredit(slot) > 0 {
+	allowBlockedProbe := func(kind string, slot int) bool {
+		key := replicationSlotKindKey{kind: kind, slot: slot}
+		if slotCredit(kind, slot) > 0 {
 			return true
 		}
-		if pendingBySlot[slot] > 0 {
+		if pendingBySlot[key] > 0 {
 			return false
 		}
 		now := time.Now()
-		if until, ok := probeAfter[slot]; ok && now.Before(until) {
+		if until, ok := probeAfter[key]; ok && now.Before(until) {
 			return false
 		}
-		probeAfter[slot] = now.Add(replicationBlockedSlotProbe)
+		probeAfter[key] = now.Add(replicationBlockedSlotProbe)
 		return true
 	}
 
@@ -541,7 +573,7 @@ func (s *replicationPeerSession) run() {
 					return nextSendableIndex()
 				}
 			}
-			if !allowBlockedProbe(req.slot) {
+			if !allowBlockedProbe(req.kind, req.slot) {
 				s.recordBlocked(req)
 				continue
 			}
@@ -558,11 +590,18 @@ func (s *replicationPeerSession) run() {
 		case *grpcproto.ReplicationFrame_SlotCredit:
 			slot := int(payload.SlotCredit.Slot)
 			available := int(payload.SlotCredit.Available)
-			setSlotCredit(slot, available)
-			if available > 0 {
-				delete(probeAfter, slot)
+			kind := "forward"
+			switch payload.SlotCredit.GetKind() {
+			case grpcproto.ReplicationCreditKind_REPLICATION_CREDIT_KIND_COMMIT:
+				kind = "commit"
+			case grpcproto.ReplicationCreditKind_REPLICATION_CREDIT_KIND_FORWARD:
+				kind = "forward"
 			}
-			s.recordCredit(slot, available)
+			setSlotCredit(kind, slot, available)
+			if available > 0 {
+				delete(probeAfter, replicationSlotKindKey{kind: kind, slot: slot})
+			}
+			s.recordCredit(kind, slot, available)
 		case *grpcproto.ReplicationFrame_Ack:
 			req, ok := pending[frame.GetRequestId()]
 			if !ok {
@@ -570,9 +609,10 @@ func (s *replicationPeerSession) run() {
 			}
 			delete(pending, frame.GetRequestId())
 			delete(pendingSince, frame.GetRequestId())
-			pendingBySlot[req.slot]--
-			if pendingBySlot[req.slot] <= 0 {
-				delete(pendingBySlot, req.slot)
+			slotKey := replicationSlotKindKey{kind: req.kind, slot: req.slot}
+			pendingBySlot[slotKey]--
+			if pendingBySlot[slotKey] <= 0 {
+				delete(pendingBySlot, slotKey)
 			}
 			s.recordAck(req)
 			if payload.Ack == nil || payload.Ack.Success {
@@ -581,8 +621,8 @@ func (s *replicationPeerSession) run() {
 			}
 			ackErr := unmarshalEncodedError(payload.Ack.EncodedError)
 			if errors.Is(ackErr, storage.ErrReplicaBackpressure) {
-				setSlotCredit(req.slot, 0)
-				probeAfter[req.slot] = time.Now().Add(replicationBlockedSlotProbe)
+				setSlotCredit(req.kind, req.slot, 0)
+				probeAfter[slotKey] = time.Now().Add(replicationBlockedSlotProbe)
 				s.recordRequeued(req)
 				backlog = append([]*outboundReplicationRequest{req}, backlog...)
 				return
@@ -702,12 +742,12 @@ func (s *replicationPeerSession) run() {
 				if observer := s.transport.currentObserver(); observer != nil {
 					observer.ObserveReplicationSessionQueueWait(req.kind, s.target, time.Since(req.at))
 				}
-				nextCredit := slotCredit(req.slot) - 1
-				setSlotCredit(req.slot, nextCredit)
+				nextCredit := slotCredit(req.kind, req.slot) - 1
+				setSlotCredit(req.kind, req.slot, nextCredit)
 				s.recordSent(req, nextCredit)
 				pending[req.id] = req
 				pendingSince[req.id] = time.Now()
-				pendingBySlot[req.slot]++
+				pendingBySlot[replicationSlotKindKey{kind: req.kind, slot: req.slot}]++
 				backlog = append(backlog[:idx], backlog[idx+1:]...)
 				continue
 			}

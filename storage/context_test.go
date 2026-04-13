@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestOpenNodeHonorsCanceledContextDuringLoad(t *testing.T) {
@@ -114,13 +115,7 @@ func TestHandleClientPutSingleReplicaReturnsAmbiguousOnPersistCancellation(t *te
 	if !errors.Is(err, ErrAmbiguousWrite) {
 		t.Fatalf("error = %v, want ErrAmbiguousWrite", err)
 	}
-	snapshot, snapErr := node.CommittedSnapshot(4)
-	if snapErr != nil {
-		t.Fatalf("CommittedSnapshot returned error: %v", snapErr)
-	}
-	if got, want := snapshotValues(snapshot), map[string]string{"k": "v"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("committed snapshot = %v, want %v", got, want)
-	}
+	waitForCommittedSnapshotValues(t, node, 4, map[string]string{"k": "v"})
 }
 
 func TestTailHandleForwardWriteHonorsContextDuringCommitPersist(t *testing.T) {
@@ -157,13 +152,7 @@ func TestTailHandleForwardWriteHonorsContextDuringCommitPersist(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context canceled", err)
 	}
-	snapshot, snapErr := node.CommittedSnapshot(6)
-	if snapErr != nil {
-		t.Fatalf("CommittedSnapshot returned error: %v", snapErr)
-	}
-	if got, want := snapshotValues(snapshot), map[string]string{"k": "v"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("committed snapshot = %v, want %v", got, want)
-	}
+	waitForCommittedSnapshotValues(t, node, 6, map[string]string{"k": "v"})
 }
 
 func TestHandleCommitWriteHonorsContextDuringCommitPersist(t *testing.T) {
@@ -179,17 +168,7 @@ func TestHandleCommitWriteHonorsContextDuringCommitPersist(t *testing.T) {
 		Role:         ReplicaRoleHead,
 		Peers:        ChainPeers{SuccessorNodeID: "tail"},
 	})
-	record := mustSlotRecord(t, node, 7)
-	op := WriteOperation{Slot: 7, Sequence: 1, Kind: OperationKindPut, Key: "k", Value: "v", Metadata: testObjectMetadata(1)}
-	if err := node.stageOperation(op); err != nil {
-		t.Fatalf("stageOperation returned error: %v", err)
-	}
-	record.stagedForwards[1] = ForwardWriteRequest{Operation: op, FromNodeID: "client", ChainVersion: 1}
-	record.pendingWrites[1] = pendingWrite{}
-	record.nextSequence = 2
-	mustMutateSlotRecord(t, node, 7, func(replicaRecord) replicaRecord {
-		return record
-	})
+	preparePendingCommitState(t, node, 7, []uint64{1}, "tail", 1)
 
 	local.blockUpsert = true
 	cancelCtx, cancel := context.WithCancel(context.Background())
@@ -201,19 +180,10 @@ func TestHandleCommitWriteHonorsContextDuringCommitPersist(t *testing.T) {
 		FromNodeID:   "tail",
 		ChainVersion: 1,
 	})
-	if err == nil {
-		t.Fatal("HandleCommitWrite unexpectedly succeeded")
+	if err != nil {
+		t.Fatalf("HandleCommitWrite returned error: %v", err)
 	}
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("error = %v, want context canceled", err)
-	}
-	snapshot, snapErr := node.CommittedSnapshot(7)
-	if snapErr != nil {
-		t.Fatalf("CommittedSnapshot returned error: %v", snapErr)
-	}
-	if got, want := snapshotValues(snapshot), map[string]string{"k": "v"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("committed snapshot = %v, want %v", got, want)
-	}
+	waitForCommittedSnapshotValues(t, node, 7, map[string]string{"key": "value"})
 }
 
 type blockingLocalStateStore struct {
@@ -257,4 +227,24 @@ func (s *blockingLocalStateStore) SetHighestAcceptedCoordinatorEpoch(ctx context
 
 func (s *blockingLocalStateStore) Close() error {
 	return s.inner.Close()
+}
+
+func waitForCommittedSnapshotValues(t *testing.T, node *Node, slot int, want map[string]string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot, err := node.CommittedSnapshot(slot)
+		if err != nil {
+			t.Fatalf("CommittedSnapshot returned error: %v", err)
+		}
+		if got := snapshotValues(snapshot); reflect.DeepEqual(got, want) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	snapshot, err := node.CommittedSnapshot(slot)
+	if err != nil {
+		t.Fatalf("CommittedSnapshot returned error: %v", err)
+	}
+	t.Fatalf("committed snapshot = %v, want %v", snapshotValues(snapshot), want)
 }

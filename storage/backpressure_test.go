@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestWriteBackpressureRejectsConcurrentWriteOnSameSlot(t *testing.T) {
@@ -264,6 +265,10 @@ func TestReplicaBackpressureEnforcesNodeWideBufferedLimit(t *testing.T) {
 		ChainVersion: 1,
 	}); err != nil {
 		t.Fatalf("HandleForwardWrite(seq=1) returned error: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for node.BufferedReplicaMessages() != 0 && time.Now().Before(deadline) {
+		time.Sleep(250 * time.Microsecond)
 	}
 	if got, want := node.BufferedReplicaMessages(), 0; got != want {
 		t.Fatalf("buffered replica messages after drain = %d, want %d", got, want)

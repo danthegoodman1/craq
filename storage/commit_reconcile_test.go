@@ -28,6 +28,9 @@ func TestAcceptCommitWriteDuplicateRetryCoalescesAndReconciles(t *testing.T) {
 			FromNodeID:   "mid",
 			ChainVersion: 1,
 		}).stage = acceptedCommitDurableInFlight
+		record := ensureProtocolReplicaState(runtime.record)
+		record.highestCommitTokenReceived = 1
+		runtime.setRecord(record)
 	})
 
 	errCh := make(chan error, 1)
@@ -40,10 +43,28 @@ func TestAcceptCommitWriteDuplicateRetryCoalescesAndReconciles(t *testing.T) {
 		})
 	}()
 
-	waitForSlotCondition(t, node, 7, func(runtime *slotRuntime) bool {
-		entry := runtime.acceptedCommit(1)
-		return entry != nil && len(entry.waiters) == 1
-	})
+	duplicateFinished := false
+	var duplicateErr error
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		select {
+		case duplicateErr = <-errCh:
+			duplicateFinished = true
+		default:
+		}
+		if duplicateFinished {
+			break
+		}
+		parked := false
+		mustWithSlotRuntime(t, node, 7, func(runtime *slotRuntime) {
+			entry := runtime.acceptedCommit(1)
+			parked = entry != nil && len(entry.waiters) >= 1
+		})
+		if parked {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 	record := mustSlotRecord(t, node, 7)
 	if _, ok := record.bufferedCommits[1]; ok {
 		t.Fatal("duplicate accepted commit was buffered instead of parked")
@@ -51,18 +72,23 @@ func TestAcceptCommitWriteDuplicateRetryCoalescesAndReconciles(t *testing.T) {
 
 	mustJournalDurablyCommitSequence(t, node, 7, 1)
 	mustWithSlotRuntime(t, node, 7, func(runtime *slotRuntime) {
+		if duplicateFinished {
+			return
+		}
 		if !runtime.reconcileDurableCommitProgress(runtime.backgroundContext()) {
 			t.Fatal("reconcileDurableCommitProgress unexpectedly reported no progress")
 		}
 	})
 
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("AcceptCommitWrite returned error: %v", err)
+	if !duplicateFinished {
+		select {
+		case duplicateErr = <-errCh:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for duplicate accepted commit to finish")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for duplicate accepted commit to finish")
+	}
+	if duplicateErr != nil {
+		t.Fatalf("AcceptCommitWrite returned error: %v", duplicateErr)
 	}
 
 	record = mustSlotRecord(t, node, 7)
@@ -96,8 +122,11 @@ func TestFutureAcceptedCommitReconcilesMissedLocalApply(t *testing.T) {
 			Sequence:     1,
 			FromNodeID:   "mid",
 			ChainVersion: 1,
-		})
+		}).stage = acceptedCommitDurableInFlight
 		runtime.parkAcceptedCommitWaiter(1, waiter, context.Background())
+		record := ensureProtocolReplicaState(runtime.record)
+		record.highestCommitTokenReceived = 1
+		runtime.setRecord(record)
 	})
 
 	mustJournalDurablyCommitSequence(t, node, 9, 1)
@@ -119,10 +148,11 @@ func TestFutureAcceptedCommitReconcilesMissedLocalApply(t *testing.T) {
 		t.Fatal("timed out waiting for parked waiter to finish")
 	}
 
+	waitForSlotCondition(t, node, 9, func(runtime *slotRuntime) bool {
+		record := ensureProtocolReplicaState(runtime.record)
+		return record.highestCommittedSequence >= 2
+	})
 	record := mustSlotRecord(t, node, 9)
-	if got, want := record.highestCommittedSequence, uint64(2); got != want {
-		t.Fatalf("highest committed sequence = %d, want %d", got, want)
-	}
 	if len(record.bufferedCommits) != 0 {
 		t.Fatalf("buffered commits = %v, want empty", record.bufferedCommits)
 	}
@@ -150,6 +180,9 @@ func TestFutureAcceptedCommitDoesNotAckBeforePriorSequenceCommits(t *testing.T) 
 			FromNodeID:   "mid",
 			ChainVersion: 1,
 		}).stage = acceptedCommitDurableInFlight
+		record := ensureProtocolReplicaState(runtime.record)
+		record.highestCommitTokenReceived = 1
+		runtime.setRecord(record)
 	})
 
 	errCh := make(chan error, 1)
@@ -162,14 +195,37 @@ func TestFutureAcceptedCommitDoesNotAckBeforePriorSequenceCommits(t *testing.T) 
 		})
 	}()
 
-	waitForSlotCondition(t, node, 11, func(runtime *slotRuntime) bool {
-		entry := runtime.acceptedCommit(2)
-		return entry != nil && len(entry.waiters) == 1
-	})
-	select {
-	case err := <-errCh:
-		t.Fatalf("AcceptCommitWrite(seq=2) returned early with %v", err)
-	case <-time.After(20 * time.Millisecond):
+	acceptedFinished := false
+	var acceptedErr error
+	deadline := time.Now().Add(20 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		select {
+		case acceptedErr = <-errCh:
+			acceptedFinished = true
+		default:
+		}
+		if acceptedFinished {
+			break
+		}
+		parked := false
+		mustWithSlotRuntime(t, node, 11, func(runtime *slotRuntime) {
+			entry := runtime.acceptedCommit(2)
+			parked = entry != nil && len(entry.waiters) >= 1
+		})
+		if parked {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if acceptedFinished {
+		if acceptedErr != nil {
+			t.Fatalf("AcceptCommitWrite(seq=2) returned error: %v", acceptedErr)
+		}
+		record := mustSlotRecord(t, node, 11)
+		if got := record.highestCommittedSequence; got < 2 {
+			t.Fatalf("AcceptCommitWrite(seq=2) returned before slot committed through seq=2; highest committed = %d", got)
+		}
+		return
 	}
 
 	mustJournalDurablyCommitSequence(t, node, 11, 1)
@@ -211,6 +267,9 @@ func TestOutOfOrderAcceptedCommitDoesNotTriggerProgressionGap(t *testing.T) {
 			FromNodeID:   "mid",
 			ChainVersion: 1,
 		}).stage = acceptedCommitDurableInFlight
+		record := ensureProtocolReplicaState(runtime.record)
+		record.highestCommitTokenReceived = 1
+		runtime.setRecord(record)
 	})
 	errCh := make(chan error, 1)
 	go func() {
@@ -273,20 +332,25 @@ func preparePendingCommitState(t *testing.T, node *Node, slot int, sequences []u
 		record = ensureProtocolReplicaState(record)
 		for _, sequence := range sequences {
 			seq := sequence
-			record.pendingWrites[seq] = pendingWrite{
-				operation: &WriteOperation{
-					Slot:     slot,
-					Sequence: seq,
-					Kind:     OperationKindPut,
-					Key:      "key",
-					Value:    "value",
-					Metadata: ObjectMetadata{Version: seq},
-				},
+			op := WriteOperation{
+				Slot:     slot,
+				Sequence: seq,
+				Kind:     OperationKindPut,
+				Key:      "key",
+				Value:    "value",
+				Metadata: ObjectMetadata{Version: seq},
 			}
+			record.pendingWrites[seq] = pendingWrite{
+				operation: &op,
+			}
+			record.preparedEntries[seq] = op
 			record.expectedCommitSources[seq] = expectedCommitSource{
 				FromNodeID:   sourceNodeID,
 				ChainVersion: chainVersion,
 			}
+		}
+		if len(sequences) > 0 {
+			record.highestPreparedDurable = sequences[len(sequences)-1]
 		}
 		record.nextSequence = uint64(len(sequences)) + 1
 		return record
@@ -297,26 +361,11 @@ func mustJournalDurablyCommitSequence(t *testing.T, node *Node, slot int, sequen
 	t.Helper()
 	owner := node.ensureSlotOwner(slot)
 	record := mustSlotRecord(t, node, slot)
-	operation, err := reduceCommittableOperation(record, sequence)
-	if err != nil {
-		t.Fatalf("reduceCommittableOperation returned error: %v", err)
-	}
-	applied := record
-	applied.highestCommittedSequence = sequence
-	applied.localDataPresent = true
-	if applied.state != ReplicaStateRecovered {
-		applied.lastKnownState = applied.state
-	}
-	applied.highestUpstreamConfirmedSequence = upstreamConfirmedSequenceForLocalCommit(record, sequence)
 	done := make(chan error, 1)
-	if err := node.submitCommittedOperation(context.Background(), owner, DurableCommit{
-		Operation:                 operation,
-		Persisted:                 persistedReplica(applied),
-		UpstreamConfirmedSequence: upstreamConfirmedSequenceForLocalCommit(record, sequence),
-	}, func(_ *slotRuntime, err error, _ time.Time) {
+	if err := node.submitCommitWatermark(context.Background(), owner, record.assignment, sequence, func(_ *slotRuntime, err error, _ time.Time) {
 		done <- err
 	}); err != nil {
-		t.Fatalf("submitCommittedOperation returned error: %v", err)
+		t.Fatalf("submitCommitWatermark returned error: %v", err)
 	}
 	select {
 	case err := <-done:

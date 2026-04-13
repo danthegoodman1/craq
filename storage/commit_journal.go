@@ -18,12 +18,50 @@ const (
 	defaultJournalBatchDelayLow      = 50 * time.Microsecond
 	defaultJournalBatchDelayHigh     = 250 * time.Microsecond
 	defaultJournalBatchLowDepthLimit = 8
-	defaultJournalBatchMaxOps        = 128
+	defaultJournalBatchMaxOps        = 64
 	defaultJournalBatchMaxBytes      = 1 << 20
+	defaultMaterializeBatchMaxOps    = 128
 	defaultMaterializeBatchDelay     = 250 * time.Microsecond
 	defaultMaterializeRetryDelay     = 5 * time.Millisecond
 	defaultJournalShardCount         = 16
 )
+
+type journalConfig struct {
+	shardCount          int
+	batchDelayLow       time.Duration
+	batchDelayHigh      time.Duration
+	batchDepthThreshold int
+	batchMaxOps         int
+}
+
+func resolvedJournalConfig(cfg Config) journalConfig {
+	journal := journalConfig{
+		shardCount:          cfg.JournalShards,
+		batchDelayLow:       cfg.JournalBatchDelayLow,
+		batchDelayHigh:      cfg.JournalBatchDelayHigh,
+		batchDepthThreshold: cfg.JournalBatchDepthThreshold,
+		batchMaxOps:         cfg.JournalBatchMaxOps,
+	}
+	if journal.shardCount <= 0 {
+		journal.shardCount = defaultJournalShardCount
+	}
+	if journal.batchDelayLow <= 0 {
+		journal.batchDelayLow = defaultJournalBatchDelayLow
+	}
+	if journal.batchDelayHigh <= 0 {
+		journal.batchDelayHigh = defaultJournalBatchDelayHigh
+	}
+	if journal.batchDepthThreshold <= 0 {
+		journal.batchDepthThreshold = defaultJournalBatchLowDepthLimit
+	}
+	if journal.batchMaxOps <= 0 {
+		journal.batchMaxOps = defaultJournalBatchMaxOps
+	}
+	if journal.batchDelayLow > journal.batchDelayHigh {
+		journal.batchDelayLow = journal.batchDelayHigh
+	}
+	return journal
+}
 
 type CommitJournalStore interface {
 	AppendBatch(records []journalRecord) error
@@ -44,8 +82,10 @@ type commitJournalShardProvider interface {
 type journalRecordType string
 
 const (
-	journalRecordTypeCommit          journalRecordType = "commit"
+	journalRecordTypePrepare         journalRecordType = "prepare"
+	journalRecordTypeCommitWatermark journalRecordType = "commit_watermark"
 	journalRecordTypeUpstreamConfirm journalRecordType = "upstream_confirm"
+	journalRecordTypeLegacyCommit    journalRecordType = "commit"
 )
 
 type journalRecord struct {
@@ -62,26 +102,30 @@ type journalRecord struct {
 
 func (r journalRecord) recordType() journalRecordType {
 	if r.Type == "" {
-		return journalRecordTypeCommit
+		return journalRecordTypeLegacyCommit
 	}
 	return r.Type
 }
 
-func journalRecordFromCommit(commit DurableCommit) journalRecord {
-	confirmed := commit.UpstreamConfirmedSequence
-	if confirmed > commit.Operation.Sequence {
-		confirmed = commit.Operation.Sequence
-	}
+func journalRecordFromPrepare(prepare DurableCommit) journalRecord {
 	return journalRecord{
-		Type:                      journalRecordTypeCommit,
-		Slot:                      commit.Operation.Slot,
-		ChainVersion:              commit.Persisted.Assignment.ChainVersion,
-		Sequence:                  commit.Operation.Sequence,
-		Kind:                      commit.Operation.Kind,
-		Key:                       commit.Operation.Key,
-		Value:                     commit.Operation.Value,
-		Metadata:                  cloneObjectMetadata(commit.Operation.Metadata),
-		UpstreamConfirmedSequence: confirmed,
+		Type:         journalRecordTypePrepare,
+		Slot:         prepare.Operation.Slot,
+		ChainVersion: prepare.Persisted.Assignment.ChainVersion,
+		Sequence:     prepare.Operation.Sequence,
+		Kind:         prepare.Operation.Kind,
+		Key:          prepare.Operation.Key,
+		Value:        prepare.Operation.Value,
+		Metadata:     cloneObjectMetadata(prepare.Operation.Metadata),
+	}
+}
+
+func journalRecordFromCommitWatermark(assignment ReplicaAssignment, sequence uint64) journalRecord {
+	return journalRecord{
+		Type:         journalRecordTypeCommitWatermark,
+		Slot:         assignment.Slot,
+		ChainVersion: assignment.ChainVersion,
+		Sequence:     sequence,
 	}
 }
 
@@ -276,9 +320,18 @@ func (j *inMemoryCommitJournal) Close() error {
 
 type journalCompletionHandler func(*slotRuntime, error, time.Time)
 
-type journalCommitIntent struct {
+type journalPrepareIntent struct {
 	ctx        context.Context
-	commit     DurableCommit
+	prepare    DurableCommit
+	owner      *slotOwner
+	onComplete journalCompletionHandler
+	queuedAt   time.Time
+}
+
+type journalWatermarkIntent struct {
+	ctx        context.Context
+	assignment ReplicaAssignment
+	sequence   uint64
 	owner      *slotOwner
 	onComplete journalCompletionHandler
 	queuedAt   time.Time
@@ -293,8 +346,31 @@ type journalConfirmIntent struct {
 }
 
 type journalBatchItem struct {
-	commit  *journalCommitIntent
-	confirm *journalConfirmIntent
+	prepare      *journalPrepareIntent
+	watermark    *pendingJournalWatermark
+	confirmBatch *pendingJournalConfirm
+}
+
+type journalWatermarkKey struct {
+	slot         int
+	chainVersion uint64
+}
+
+type pendingJournalWatermark struct {
+	assignment ReplicaAssignment
+	sequence   uint64
+	intents    []*journalWatermarkIntent
+}
+
+type journalConfirmKey struct {
+	slot         int
+	chainVersion uint64
+}
+
+type pendingJournalConfirm struct {
+	assignment ReplicaAssignment
+	sequence   uint64
+	intents    []*journalConfirmIntent
 }
 
 type commitJournalEngine struct {
@@ -302,7 +378,33 @@ type commitJournalEngine struct {
 
 	highWaterMu sync.RWMutex
 	highWater   map[int]uint64
+	prepareHigh map[int]uint64
 	shards      []*commitJournalShard
+	config      journalConfig
+}
+
+func (e *commitJournalEngine) allowSlot(slot int) {
+	if e == nil {
+		return
+	}
+	shard := e.shardForSlot(slot)
+	if shard != nil && shard.materializer != nil {
+		shard.materializer.allowSlot(slot)
+	}
+}
+
+func (e *commitJournalEngine) dropSlot(slot int) {
+	if e == nil {
+		return
+	}
+	e.highWaterMu.Lock()
+	delete(e.highWater, slot)
+	delete(e.prepareHigh, slot)
+	e.highWaterMu.Unlock()
+	shard := e.shardForSlot(slot)
+	if shard != nil && shard.materializer != nil {
+		shard.materializer.dropSlot(slot)
+	}
 }
 
 type commitJournalShard struct {
@@ -310,7 +412,8 @@ type commitJournalShard struct {
 	index        int
 	journal      commitJournalStore
 	materializer *commitMaterializer
-	commitCh     chan *journalCommitIntent
+	prepareCh    chan *journalPrepareIntent
+	watermarkCh  chan *journalWatermarkIntent
 	confirmCh    chan *journalConfirmIntent
 	closeCh      chan struct{}
 	closedCh     chan struct{}
@@ -318,13 +421,23 @@ type commitJournalShard struct {
 	diagMu       sync.Mutex
 	lastFlushAt  time.Time
 	recentBySlot map[int][]journalRecord
+	pendingDiag  journalShardPendingSnapshot
 }
 
-func newCommitJournalEngine(node *Node, journals []commitJournalStore, highWater map[int]uint64, backlog []DurableCommit) *commitJournalEngine {
+type journalShardPendingSnapshot struct {
+	prepareItems int
+	prepareSlots int
+	watermarks   int
+	confirmItems int
+}
+
+func newCommitJournalEngine(node *Node, journals []commitJournalStore, highWater map[int]uint64, backlog []DurableCommit, cfg journalConfig) *commitJournalEngine {
 	engine := &commitJournalEngine{
-		node:      node,
-		highWater: make(map[int]uint64, len(highWater)),
-		shards:    make([]*commitJournalShard, 0, len(journals)),
+		node:        node,
+		highWater:   make(map[int]uint64, len(highWater)),
+		prepareHigh: make(map[int]uint64, len(highWater)),
+		shards:      make([]*commitJournalShard, 0, len(journals)),
+		config:      cfg,
 	}
 	for slot, sequence := range highWater {
 		engine.highWater[slot] = sequence
@@ -339,7 +452,8 @@ func newCommitJournalEngine(node *Node, journals []commitJournalStore, highWater
 			engine:       engine,
 			index:        i,
 			journal:      journal,
-			commitCh:     make(chan *journalCommitIntent, 4096),
+			prepareCh:    make(chan *journalPrepareIntent, 4096),
+			watermarkCh:  make(chan *journalWatermarkIntent, 4096),
 			confirmCh:    make(chan *journalConfirmIntent, 4096),
 			closeCh:      make(chan struct{}),
 			closedCh:     make(chan struct{}),
@@ -370,11 +484,28 @@ func (e *commitJournalEngine) committedSequence(slot int) uint64 {
 	return e.highWater[slot]
 }
 
+func (e *commitJournalEngine) preparedSequence(slot int) uint64 {
+	if e == nil {
+		return 0
+	}
+	e.highWaterMu.RLock()
+	defer e.highWaterMu.RUnlock()
+	return e.prepareHigh[slot]
+}
+
 func (e *commitJournalEngine) markCommitted(slot int, sequence uint64) {
 	e.highWaterMu.Lock()
 	defer e.highWaterMu.Unlock()
 	if sequence > e.highWater[slot] {
 		e.highWater[slot] = sequence
+	}
+}
+
+func (e *commitJournalEngine) markPrepared(slot int, sequence uint64) {
+	e.highWaterMu.Lock()
+	defer e.highWaterMu.Unlock()
+	if sequence > e.prepareHigh[slot] {
+		e.prepareHigh[slot] = sequence
 	}
 }
 
@@ -396,24 +527,46 @@ func (e *commitJournalEngine) shardForSlot(slot int) *commitJournalShard {
 	return e.shards[e.shardIndex(slot)]
 }
 
-func (e *commitJournalEngine) submitCommit(
+func (e *commitJournalEngine) submitPrepare(
 	ctx context.Context,
 	owner *slotOwner,
-	commit DurableCommit,
+	prepare DurableCommit,
 	onComplete journalCompletionHandler,
 ) error {
-	shard := e.shardForSlot(commit.Operation.Slot)
+	shard := e.shardForSlot(prepare.Operation.Slot)
 	if shard == nil {
 		return fmt.Errorf("%w: commit journal unavailable", ErrInvalidConfig)
 	}
-	intent := &journalCommitIntent{
+	intent := &journalPrepareIntent{
 		ctx:        ctx,
-		commit:     cloneDurableCommit(commit),
+		prepare:    cloneDurableCommit(prepare),
 		owner:      owner,
 		onComplete: onComplete,
 		queuedAt:   time.Now(),
 	}
-	return shard.enqueueCommit(intent)
+	return shard.enqueuePrepare(intent)
+}
+
+func (e *commitJournalEngine) submitCommitWatermark(
+	ctx context.Context,
+	owner *slotOwner,
+	assignment ReplicaAssignment,
+	sequence uint64,
+	onComplete journalCompletionHandler,
+) error {
+	shard := e.shardForSlot(assignment.Slot)
+	if shard == nil {
+		return fmt.Errorf("%w: commit journal unavailable", ErrInvalidConfig)
+	}
+	intent := &journalWatermarkIntent{
+		ctx:        ctx,
+		assignment: cloneAssignment(assignment),
+		sequence:   sequence,
+		owner:      owner,
+		onComplete: onComplete,
+		queuedAt:   time.Now(),
+	}
+	return shard.enqueueCommitWatermark(intent)
 }
 
 func (e *commitJournalEngine) submitUpstreamConfirm(
@@ -437,6 +590,23 @@ func (e *commitJournalEngine) submitUpstreamConfirm(
 	return shard.enqueueConfirm(intent)
 }
 
+func (e *commitJournalEngine) enqueueMaterialized(commits []DurableCommit) {
+	if e == nil || len(commits) == 0 {
+		return
+	}
+	byShard := map[int][]DurableCommit{}
+	for _, commit := range commits {
+		shard := e.shardIndex(commit.Operation.Slot)
+		byShard[shard] = append(byShard[shard], cloneDurableCommit(commit))
+	}
+	for shardIdx, shardCommits := range byShard {
+		shard := e.shards[shardIdx]
+		if shard != nil && shard.materializer != nil {
+			shard.materializer.enqueue(shardCommits)
+		}
+	}
+}
+
 func (s *commitJournalShard) close() {
 	select {
 	case <-s.closeCh:
@@ -452,7 +622,7 @@ func (s *commitJournalShard) close() {
 	}
 }
 
-func (s *commitJournalShard) enqueueCommit(intent *journalCommitIntent) error {
+func (s *commitJournalShard) enqueuePrepare(intent *journalPrepareIntent) error {
 	select {
 	case <-s.closeCh:
 		return context.Canceled
@@ -461,8 +631,23 @@ func (s *commitJournalShard) enqueueCommit(intent *journalCommitIntent) error {
 	select {
 	case <-s.closeCh:
 		return context.Canceled
-	case s.commitCh <- intent:
-		s.engine.node.recordTimeoutJournalQueueDepth(len(s.commitCh) + len(s.confirmCh))
+	case s.prepareCh <- intent:
+		s.engine.node.recordTimeoutJournalQueueDepth(len(s.prepareCh) + len(s.watermarkCh) + len(s.confirmCh))
+		return nil
+	}
+}
+
+func (s *commitJournalShard) enqueueCommitWatermark(intent *journalWatermarkIntent) error {
+	select {
+	case <-s.closeCh:
+		return context.Canceled
+	default:
+	}
+	select {
+	case <-s.closeCh:
+		return context.Canceled
+	case s.watermarkCh <- intent:
+		s.engine.node.recordTimeoutJournalQueueDepth(len(s.prepareCh) + len(s.watermarkCh) + len(s.confirmCh))
 		return nil
 	}
 }
@@ -477,19 +662,56 @@ func (s *commitJournalShard) enqueueConfirm(intent *journalConfirmIntent) error 
 	case <-s.closeCh:
 		return context.Canceled
 	case s.confirmCh <- intent:
-		s.engine.node.recordTimeoutJournalQueueDepth(len(s.commitCh) + len(s.confirmCh))
+		s.engine.node.recordTimeoutJournalQueueDepth(len(s.prepareCh) + len(s.watermarkCh) + len(s.confirmCh))
 		return nil
 	}
+}
+
+func (s *commitJournalShard) deliver(owner *slotOwner, handler journalCompletionHandler, err error, completedAt time.Time) {
+	if owner == nil || handler == nil {
+		return
+	}
+	_ = owner.enqueueCompletion(func(runtime *slotRuntime) {
+		handler(runtime, err, completedAt)
+	})
+}
+
+func (s *commitJournalShard) nextBatchDelay(queueDepth int) time.Duration {
+	if queueDepth < s.engine.config.batchDepthThreshold {
+		return s.engine.config.batchDelayLow
+	}
+	return s.engine.config.batchDelayHigh
+}
+
+func (s *commitJournalShard) updatePendingSnapshot(prepareItems int, prepareSlots int, watermarks int, confirmItems int) {
+	if s == nil {
+		return
+	}
+	s.diagMu.Lock()
+	s.pendingDiag = journalShardPendingSnapshot{
+		prepareItems: prepareItems,
+		prepareSlots: prepareSlots,
+		watermarks:   watermarks,
+		confirmItems: confirmItems,
+	}
+	s.diagMu.Unlock()
+	s.engine.node.observeJournalShardPending(s.index, prepareItems, prepareSlots, confirmItems)
 }
 
 func (s *commitJournalShard) run() {
 	defer close(s.closedCh)
 
 	var (
-		batch     []journalBatchItem
-		batchSize int
-		timer     *time.Timer
-		timerCh   <-chan time.Time
+		timer               *time.Timer
+		timerCh             <-chan time.Time
+		pendingPrepareMap   = map[int][]*journalPrepareIntent{}
+		pendingPrepareSeq   []int
+		pendingPrepareN     int
+		pendingPrepareBytes int
+		pendingWatermarks   = map[journalWatermarkKey]*pendingJournalWatermark{}
+		pendingWatermarkSeq []journalWatermarkKey
+		pendingConfirms     = map[journalConfirmKey]*pendingJournalConfirm{}
+		pendingConfirmSeq   []journalConfirmKey
 	)
 
 	stopTimer := func() {
@@ -506,15 +728,8 @@ func (s *commitJournalShard) run() {
 		timerCh = nil
 	}
 
-	nextBatchDelay := func(queueDepth int) time.Duration {
-		if queueDepth < defaultJournalBatchLowDepthLimit {
-			return defaultJournalBatchDelayLow
-		}
-		return defaultJournalBatchDelayHigh
-	}
-
 	resetTimer := func(queueDepth int) {
-		delay := nextBatchDelay(queueDepth)
+		delay := s.nextBatchDelay(queueDepth)
 		if timer == nil {
 			timer = time.NewTimer(delay)
 		} else {
@@ -523,64 +738,280 @@ func (s *commitJournalShard) run() {
 		timerCh = timer.C
 	}
 
-	deliver := func(owner *slotOwner, handler journalCompletionHandler, err error, completedAt time.Time) {
-		if owner == nil || handler == nil {
+	queueDepth := func() int {
+		return len(s.prepareCh) + len(s.watermarkCh) + len(s.confirmCh) + pendingPrepareN + len(pendingWatermarks) + len(pendingConfirms)
+	}
+
+	updatePending := func() {
+		s.updatePendingSnapshot(pendingPrepareN, len(pendingPrepareMap), len(pendingWatermarks), len(pendingConfirms))
+		s.engine.node.recordTimeoutJournalQueueDepth(queueDepth())
+	}
+
+	enqueuePendingPrepare := func(intent *journalPrepareIntent) {
+		slot := intent.prepare.Operation.Slot
+		queue := pendingPrepareMap[slot]
+		if len(queue) == 0 {
+			pendingPrepareSeq = append(pendingPrepareSeq, slot)
+		}
+		pendingPrepareMap[slot] = append(queue, intent)
+		pendingPrepareN++
+		pendingPrepareBytes += estimatedCommitBytes(intent.prepare)
+		updatePending()
+	}
+
+	enqueuePendingWatermark := func(intent *journalWatermarkIntent) {
+		key := journalWatermarkKey{slot: intent.assignment.Slot, chainVersion: intent.assignment.ChainVersion}
+		entry, ok := pendingWatermarks[key]
+		if !ok {
+			pendingWatermarks[key] = &pendingJournalWatermark{
+				assignment: cloneAssignment(intent.assignment),
+				sequence:   intent.sequence,
+				intents:    []*journalWatermarkIntent{intent},
+			}
+			pendingWatermarkSeq = append(pendingWatermarkSeq, key)
+			updatePending()
 			return
 		}
-		_ = owner.enqueueCompletion(func(runtime *slotRuntime) {
-			handler(runtime, err, completedAt)
-		})
+		if intent.sequence > entry.sequence {
+			entry.sequence = intent.sequence
+			entry.assignment = cloneAssignment(intent.assignment)
+		}
+		entry.intents = append(entry.intents, intent)
+		updatePending()
+	}
+
+	enqueuePendingConfirm := func(intent *journalConfirmIntent) {
+		key := journalConfirmKey{slot: intent.assignment.Slot, chainVersion: intent.assignment.ChainVersion}
+		entry, ok := pendingConfirms[key]
+		if !ok {
+			pendingConfirms[key] = &pendingJournalConfirm{
+				assignment: cloneAssignment(intent.assignment),
+				sequence:   intent.sequence,
+				intents:    []*journalConfirmIntent{intent},
+			}
+			pendingConfirmSeq = append(pendingConfirmSeq, key)
+			updatePending()
+			return
+		}
+		if intent.sequence > entry.sequence {
+			entry.sequence = intent.sequence
+			entry.assignment = cloneAssignment(intent.assignment)
+		}
+		entry.intents = append(entry.intents, intent)
+		s.engine.node.observeJournalCoalescedConfirm(1)
+		updatePending()
+	}
+
+	popPrepareBatch := func() ([]journalBatchItem, int, int, int) {
+		if pendingPrepareN == 0 || len(pendingPrepareSeq) == 0 {
+			return nil, 0, 0, 0
+		}
+		items := make([]journalBatchItem, 0, min(pendingPrepareN, s.engine.config.batchMaxOps))
+		batchBytes := 0
+		prepareCount := 0
+		seenSlots := map[int]struct{}{}
+		order := pendingPrepareSeq
+		for len(order) > 0 && prepareCount < s.engine.config.batchMaxOps && batchBytes < defaultJournalBatchMaxBytes {
+			nextOrder := make([]int, 0, len(order))
+			madeProgress := false
+			for idx, slot := range order {
+				queue := pendingPrepareMap[slot]
+				if len(queue) == 0 {
+					delete(pendingPrepareMap, slot)
+					continue
+				}
+				intent := queue[0]
+				intentBytes := estimatedCommitBytes(intent.prepare)
+				if prepareCount > 0 && batchBytes+intentBytes > defaultJournalBatchMaxBytes {
+					nextOrder = append(nextOrder, slot)
+					nextOrder = append(nextOrder, order[idx+1:]...)
+					order = nextOrder
+					pendingPrepareSeq = order
+					updatePending()
+					return items, batchBytes, prepareCount, len(seenSlots)
+				}
+				queue = queue[1:]
+				pendingPrepareN--
+				pendingPrepareBytes -= intentBytes
+				items = append(items, journalBatchItem{prepare: intent})
+				batchBytes += intentBytes
+				prepareCount++
+				seenSlots[slot] = struct{}{}
+				madeProgress = true
+				if len(queue) > 0 {
+					pendingPrepareMap[slot] = queue
+					nextOrder = append(nextOrder, slot)
+				} else {
+					delete(pendingPrepareMap, slot)
+				}
+				if prepareCount >= s.engine.config.batchMaxOps || batchBytes >= defaultJournalBatchMaxBytes {
+					nextOrder = append(nextOrder, order[idx+1:]...)
+					order = nextOrder
+					pendingPrepareSeq = order
+					updatePending()
+					return items, batchBytes, prepareCount, len(seenSlots)
+				}
+			}
+			order = nextOrder
+			pendingPrepareSeq = order
+			if !madeProgress {
+				break
+			}
+		}
+		updatePending()
+		return items, batchBytes, prepareCount, len(seenSlots)
+	}
+
+	popWatermarkBatch := func(remainingOps int, remainingBytes int, allow bool) ([]journalBatchItem, int) {
+		if !allow || remainingOps <= 0 || remainingBytes <= 0 || len(pendingWatermarkSeq) == 0 {
+			return nil, 0
+		}
+		items := make([]journalBatchItem, 0, min(len(pendingWatermarkSeq), remainingOps))
+		count := 0
+		nextOrder := make([]journalWatermarkKey, 0, len(pendingWatermarkSeq))
+		for idx, key := range pendingWatermarkSeq {
+			entry := pendingWatermarks[key]
+			if entry == nil {
+				continue
+			}
+			if count > 0 && (count >= remainingOps || (count+1)*64 > remainingBytes) {
+				nextOrder = append(nextOrder, key)
+				nextOrder = append(nextOrder, pendingWatermarkSeq[idx+1:]...)
+				break
+			}
+			items = append(items, journalBatchItem{watermark: entry})
+			delete(pendingWatermarks, key)
+			count++
+			if count >= remainingOps || count*64 >= remainingBytes {
+				nextOrder = append(nextOrder, pendingWatermarkSeq[idx+1:]...)
+				break
+			}
+		}
+		pendingWatermarkSeq = nextOrder
+		updatePending()
+		return items, count
+	}
+
+	popConfirmBatch := func(remainingOps int, remainingBytes int, allow bool) ([]journalBatchItem, int) {
+		if !allow || remainingOps <= 0 || remainingBytes <= 0 || len(pendingConfirmSeq) == 0 {
+			return nil, 0
+		}
+		items := make([]journalBatchItem, 0, min(len(pendingConfirmSeq), remainingOps))
+		confirmCount := 0
+		nextOrder := make([]journalConfirmKey, 0, len(pendingConfirmSeq))
+		for idx, key := range pendingConfirmSeq {
+			entry := pendingConfirms[key]
+			if entry == nil {
+				continue
+			}
+			if confirmCount > 0 && (confirmCount >= remainingOps || (confirmCount+1)*64 > remainingBytes) {
+				nextOrder = append(nextOrder, key)
+				nextOrder = append(nextOrder, pendingConfirmSeq[idx+1:]...)
+				break
+			}
+			items = append(items, journalBatchItem{confirmBatch: entry})
+			delete(pendingConfirms, key)
+			confirmCount++
+			if confirmCount >= remainingOps || confirmCount*64 >= remainingBytes {
+				nextOrder = append(nextOrder, pendingConfirmSeq[idx+1:]...)
+				break
+			}
+		}
+		pendingConfirmSeq = nextOrder
+		updatePending()
+		return items, confirmCount
 	}
 
 	flush := func() {
-		if len(batch) == 0 {
+		if pendingPrepareN == 0 && len(pendingWatermarks) == 0 && len(pendingConfirms) == 0 {
 			stopTimer()
+			updatePending()
 			return
 		}
-		items := batch
-		batch = nil
-		batchSize = 0
 		stopTimer()
-		s.engine.node.recordTimeoutJournalQueueDepth(len(s.commitCh) + len(s.confirmCh))
+		items, prepareBytes, prepareCount, slotsTouched := popPrepareBatch()
+		remainingOps := s.engine.config.batchMaxOps - prepareCount
+		remainingBytes := defaultJournalBatchMaxBytes - prepareBytes
+		watermarkItems, watermarkCount := popWatermarkBatch(remainingOps, remainingBytes, prepareCount == 0 || remainingOps > 0)
+		items = append(items, watermarkItems...)
+		remainingOps -= watermarkCount
+		remainingBytes -= watermarkCount * 64
+		confirmItems, confirmCount := popConfirmBatch(remainingOps, remainingBytes, prepareCount == 0 || remainingOps > 0)
+		items = append(items, confirmItems...)
+		if len(items) == 0 {
+			return
+		}
 
 		records := make([]journalRecord, 0, len(items))
-		commits := make([]*journalCommitIntent, 0, len(items))
-		commitBytes := 0
+		prepares := make([]*journalPrepareIntent, 0, len(items))
 		for _, item := range items {
 			switch {
-			case item.commit != nil:
-				intent := item.commit
+			case item.prepare != nil:
+				intent := item.prepare
 				if intent.ctx != nil {
 					if err := intent.ctx.Err(); err != nil {
-						deliver(intent.owner, intent.onComplete, err, time.Now())
+						s.deliver(intent.owner, intent.onComplete, err, time.Now())
 						continue
 					}
 				}
-				s.engine.node.observeWriteStage(writeStageCommitBatchWait, intent.commit.Persisted.Assignment.Role, writeStageResultSuccess, time.Since(intent.queuedAt))
-				records = append(records, journalRecordFromCommit(intent.commit))
-				commits = append(commits, intent)
-				commitBytes += estimatedCommitBytes(intent.commit)
-			case item.confirm != nil:
-				intent := item.confirm
-				if intent.ctx != nil {
-					if err := intent.ctx.Err(); err != nil {
-						deliver(intent.owner, intent.onComplete, err, time.Now())
-						continue
+				s.engine.node.observeWriteStage(writeStagePrepareQueueWait, intent.prepare.Persisted.Assignment.Role, writeStageResultSuccess, time.Since(intent.queuedAt))
+				records = append(records, journalRecordFromPrepare(intent.prepare))
+				prepares = append(prepares, intent)
+			case item.watermark != nil:
+				entry := item.watermark
+				if len(entry.intents) == 0 {
+					continue
+				}
+				canceled := 0
+				for _, intent := range entry.intents {
+					if intent.ctx != nil {
+						if err := intent.ctx.Err(); err != nil {
+							s.deliver(intent.owner, intent.onComplete, err, time.Now())
+							canceled++
+						}
 					}
 				}
-				records = append(records, journalRecordFromUpstreamConfirm(intent.assignment, intent.sequence))
+				if canceled == len(entry.intents) {
+					continue
+				}
+				records = append(records, journalRecordFromCommitWatermark(entry.assignment, entry.sequence))
+			case item.confirmBatch != nil:
+				entry := item.confirmBatch
+				if len(entry.intents) == 0 {
+					continue
+				}
+				canceled := 0
+				for _, intent := range entry.intents {
+					if intent.ctx != nil {
+						if err := intent.ctx.Err(); err != nil {
+							s.deliver(intent.owner, intent.onComplete, err, time.Now())
+							canceled++
+						}
+					}
+				}
+				if canceled == len(entry.intents) {
+					continue
+				}
+				records = append(records, journalRecordFromUpstreamConfirm(entry.assignment, entry.sequence))
 			}
 		}
 		if len(records) == 0 {
 			return
 		}
-		if len(commits) > 0 {
-			s.engine.node.observeCommitBatchSize(len(commits), commitBytes)
-			for _, intent := range commits {
-				if stage := writeTraceFlushStartStage(intent.commit.Persisted.Assignment.Role); stage != "" {
-					s.engine.node.traceWriteEvent(intent.commit.Persisted.Assignment, intent.commit.Operation.Sequence, stage)
+		if len(prepares) > 0 {
+			s.engine.node.observeCommitBatchSize(len(prepares), prepareBytes)
+			s.engine.node.observeJournalCommitBatchSlots(slotsTouched)
+			for _, intent := range prepares {
+				if stage := writeTracePrepareFlushStartStage(intent.prepare.Persisted.Assignment.Role); stage != "" {
+					s.engine.node.traceWriteEvent(intent.prepare.Persisted.Assignment, intent.prepare.Operation.Sequence, stage)
 				}
 			}
+		}
+		if watermarkCount > 0 {
+			s.engine.node.observeJournalCommitWatermarkBatchCount(watermarkCount)
+		}
+		if confirmCount > 0 {
+			s.engine.node.observeJournalConfirmBatchCount(confirmCount)
 		}
 		flushStarted := time.Now()
 		appendErr := s.journal.AppendBatch(records)
@@ -589,76 +1020,110 @@ func (s *commitJournalShard) run() {
 		if appendErr != nil {
 			for _, item := range items {
 				switch {
-				case item.commit != nil:
-					intent := item.commit
-					s.engine.node.observeCommitFlush(intent.commit.Persisted.Assignment.Role, writeStageResult(appendErr), flushDuration)
-					deliver(intent.owner, intent.onComplete, appendErr, completedAt)
-				case item.confirm != nil:
-					intent := item.confirm
-					deliver(intent.owner, intent.onComplete, appendErr, completedAt)
+				case item.prepare != nil:
+					intent := item.prepare
+					s.engine.node.observeWriteStage(writeStagePrepareFlush, intent.prepare.Persisted.Assignment.Role, writeStageResult(appendErr), flushDuration)
+					s.deliver(intent.owner, intent.onComplete, appendErr, completedAt)
+				case item.watermark != nil:
+					for _, intent := range item.watermark.intents {
+						s.engine.node.observeWriteStage(writeStageCommitWatermarkFlush, intent.assignment.Role, writeStageResult(appendErr), flushDuration)
+						s.deliver(intent.owner, intent.onComplete, appendErr, completedAt)
+					}
+				case item.confirmBatch != nil:
+					for _, intent := range item.confirmBatch.intents {
+						s.deliver(intent.owner, intent.onComplete, appendErr, completedAt)
+					}
 				}
 			}
 			return
 		}
 		s.recordDurableRecords(records, completedAt)
-		committed := make([]DurableCommit, 0, len(commits))
 		for _, item := range items {
 			switch {
-			case item.commit != nil:
-				intent := item.commit
-				s.engine.markCommitted(intent.commit.Operation.Slot, intent.commit.Operation.Sequence)
-				s.engine.node.observeCommitFlush(intent.commit.Persisted.Assignment.Role, writeStageResultSuccess, flushDuration)
-				if stage := writeTraceFlushEndStage(intent.commit.Persisted.Assignment.Role); stage != "" {
-					s.engine.node.traceWriteEvent(intent.commit.Persisted.Assignment, intent.commit.Operation.Sequence, stage)
+			case item.prepare != nil:
+				intent := item.prepare
+				s.engine.markPrepared(intent.prepare.Operation.Slot, intent.prepare.Operation.Sequence)
+				s.engine.node.observeWriteStage(writeStagePrepareFlush, intent.prepare.Persisted.Assignment.Role, writeStageResultSuccess, flushDuration)
+				if stage := writeTracePrepareFlushEndStage(intent.prepare.Persisted.Assignment.Role); stage != "" {
+					s.engine.node.traceWriteEvent(intent.prepare.Persisted.Assignment, intent.prepare.Operation.Sequence, stage)
 				}
-				committed = append(committed, cloneDurableCommit(intent.commit))
-				deliver(intent.owner, intent.onComplete, nil, completedAt)
-			case item.confirm != nil:
-				intent := item.confirm
-				deliver(intent.owner, intent.onComplete, nil, completedAt)
+				s.deliver(intent.owner, intent.onComplete, nil, completedAt)
+			case item.watermark != nil:
+				s.engine.markCommitted(item.watermark.assignment.Slot, item.watermark.sequence)
+				for _, intent := range item.watermark.intents {
+					s.engine.node.observeWriteStage(writeStageCommitWatermarkFlush, intent.assignment.Role, writeStageResultSuccess, flushDuration)
+					s.deliver(intent.owner, intent.onComplete, nil, completedAt)
+				}
+			case item.confirmBatch != nil:
+				for _, intent := range item.confirmBatch.intents {
+					s.deliver(intent.owner, intent.onComplete, nil, completedAt)
+				}
 			}
-		}
-		if s.materializer != nil && len(committed) > 0 {
-			s.materializer.enqueue(committed)
 		}
 	}
 
 	for {
 		select {
 		case <-s.closeCh:
-			for _, item := range batch {
-				switch {
-				case item.commit != nil:
-					deliver(item.commit.owner, item.commit.onComplete, context.Canceled, time.Now())
-				case item.confirm != nil:
-					deliver(item.confirm.owner, item.confirm.onComplete, context.Canceled, time.Now())
+			now := time.Now()
+			for _, slot := range pendingPrepareSeq {
+				for _, intent := range pendingPrepareMap[slot] {
+					s.deliver(intent.owner, intent.onComplete, context.Canceled, now)
+				}
+			}
+			for _, key := range pendingWatermarkSeq {
+				entry := pendingWatermarks[key]
+				if entry == nil {
+					continue
+				}
+				for _, intent := range entry.intents {
+					s.deliver(intent.owner, intent.onComplete, context.Canceled, now)
+				}
+			}
+			for _, key := range pendingConfirmSeq {
+				entry := pendingConfirms[key]
+				if entry == nil {
+					continue
+				}
+				for _, intent := range entry.intents {
+					s.deliver(intent.owner, intent.onComplete, context.Canceled, now)
 				}
 			}
 			return
-		case intent := <-s.commitCh:
-			batch = append(batch, journalBatchItem{commit: intent})
-			batchSize += estimatedCommitBytes(intent.commit)
-			if len(batch) == 1 {
-				resetTimer(len(s.commitCh) + len(s.confirmCh))
+		case intent := <-s.prepareCh:
+			enqueuePendingPrepare(intent)
+			if queueDepth() == 1 {
+				resetTimer(queueDepth())
 			}
-			if len(batch) > 1 && len(s.commitCh)+len(s.confirmCh) == 0 {
+			if queueDepth() > 1 && len(s.prepareCh)+len(s.watermarkCh)+len(s.confirmCh) == 0 {
 				flush()
 				continue
 			}
-			if len(batch) >= defaultJournalBatchMaxOps || batchSize >= defaultJournalBatchMaxBytes {
+			if pendingPrepareN >= s.engine.config.batchMaxOps || pendingPrepareBytes >= defaultJournalBatchMaxBytes {
+				flush()
+			}
+		case intent := <-s.watermarkCh:
+			enqueuePendingWatermark(intent)
+			if queueDepth() == 1 {
+				resetTimer(queueDepth())
+			}
+			if queueDepth() > 1 && len(s.prepareCh)+len(s.watermarkCh)+len(s.confirmCh) == 0 {
+				flush()
+				continue
+			}
+			if pendingPrepareN >= s.engine.config.batchMaxOps || pendingPrepareBytes >= defaultJournalBatchMaxBytes {
 				flush()
 			}
 		case intent := <-s.confirmCh:
-			batch = append(batch, journalBatchItem{confirm: intent})
-			batchSize += 64
-			if len(batch) == 1 {
-				resetTimer(len(s.commitCh) + len(s.confirmCh))
+			enqueuePendingConfirm(intent)
+			if queueDepth() == 1 {
+				resetTimer(queueDepth())
 			}
-			if len(batch) > 1 && len(s.commitCh)+len(s.confirmCh) == 0 {
+			if queueDepth() > 1 && len(s.prepareCh)+len(s.watermarkCh)+len(s.confirmCh) == 0 {
 				flush()
 				continue
 			}
-			if len(batch) >= defaultJournalBatchMaxOps || batchSize >= defaultJournalBatchMaxBytes {
+			if pendingPrepareN >= s.engine.config.batchMaxOps || pendingPrepareBytes >= defaultJournalBatchMaxBytes {
 				flush()
 			}
 		case <-timerCh:
@@ -691,10 +1156,11 @@ func (s *commitJournalShard) snapshot(slot int) journalSlotSnapshot {
 	}
 	out := journalSlotSnapshot{
 		Shard:      s.index,
-		QueueDepth: len(s.commitCh) + len(s.confirmCh),
+		QueueDepth: len(s.prepareCh) + len(s.watermarkCh) + len(s.confirmCh),
 	}
 	s.diagMu.Lock()
 	out.LastFlushAt = s.lastFlushAt
+	out.QueueDepth += s.pendingDiag.prepareItems + s.pendingDiag.watermarks + s.pendingDiag.confirmItems
 	if records := s.recentBySlot[slot]; len(records) > 0 {
 		out.RecentRecords = make([]journalRecordSnapshot, 0, len(records))
 		for _, record := range records {
@@ -726,18 +1192,26 @@ func (e *commitJournalEngine) snapshot(slot int) *journalSlotSnapshot {
 }
 
 type commitMaterializer struct {
-	node     *Node
-	submitCh chan []DurableCommit
-	closeCh  chan struct{}
-	closedCh chan struct{}
+	node      *Node
+	submitCh  chan []DurableCommit
+	controlCh chan materializerSlotControl
+	closeCh   chan struct{}
+	closedCh  chan struct{}
+}
+
+type materializerSlotControl struct {
+	slot  int
+	allow bool
+	done  chan struct{}
 }
 
 func newCommitMaterializer(node *Node, backlog []DurableCommit) *commitMaterializer {
 	m := &commitMaterializer{
-		node:     node,
-		submitCh: make(chan []DurableCommit, 1024),
-		closeCh:  make(chan struct{}),
-		closedCh: make(chan struct{}),
+		node:      node,
+		submitCh:  make(chan []DurableCommit, 1024),
+		controlCh: make(chan materializerSlotControl, 128),
+		closeCh:   make(chan struct{}),
+		closedCh:  make(chan struct{}),
 	}
 	go m.run(backlog)
 	return m
@@ -770,10 +1244,36 @@ func (m *commitMaterializer) enqueue(commits []DurableCommit) {
 	}
 }
 
+func (m *commitMaterializer) allowSlot(slot int) {
+	m.controlSlot(slot, true)
+}
+
+func (m *commitMaterializer) dropSlot(slot int) {
+	m.controlSlot(slot, false)
+}
+
+func (m *commitMaterializer) controlSlot(slot int, allow bool) {
+	if m == nil {
+		return
+	}
+	done := make(chan struct{})
+	control := materializerSlotControl{slot: slot, allow: allow, done: done}
+	select {
+	case <-m.closeCh:
+		return
+	case m.controlCh <- control:
+	}
+	select {
+	case <-m.closeCh:
+	case <-done:
+	}
+}
+
 func (m *commitMaterializer) run(backlog []DurableCommit) {
 	defer close(m.closedCh)
 	pending := make([]DurableCommit, 0, len(backlog))
 	pending = append(pending, cloneDurableCommits(backlog)...)
+	suppressedSlots := map[int]struct{}{}
 	var (
 		timer   *time.Timer
 		timerCh <-chan time.Time
@@ -811,6 +1311,9 @@ func (m *commitMaterializer) run(backlog []DurableCommit) {
 		filtered := make([]DurableCommit, 0, len(pending))
 		appliedHigh := map[int]uint64{}
 		for _, commit := range pending {
+			if _, suppressed := suppressedSlots[commit.Operation.Slot]; suppressed {
+				continue
+			}
 			if !m.node.shouldMaterializeCommit(commit) {
 				continue
 			}
@@ -847,13 +1350,33 @@ func (m *commitMaterializer) run(backlog []DurableCommit) {
 		select {
 		case <-m.closeCh:
 			return
+		case control := <-m.controlCh:
+			if control.allow {
+				delete(suppressedSlots, control.slot)
+			} else {
+				suppressedSlots[control.slot] = struct{}{}
+				filtered := pending[:0]
+				for _, commit := range pending {
+					if commit.Operation.Slot != control.slot {
+						filtered = append(filtered, commit)
+					}
+				}
+				pending = filtered
+				m.node.recordTimeoutMaterializerQueueDepth(len(pending))
+			}
+			close(control.done)
 		case commits := <-m.submitCh:
-			pending = append(pending, commits...)
+			for _, commit := range commits {
+				if _, suppressed := suppressedSlots[commit.Operation.Slot]; suppressed {
+					continue
+				}
+				pending = append(pending, commit)
+			}
 			m.node.recordTimeoutMaterializerQueueDepth(len(pending))
-			if len(pending) == len(commits) {
+			if len(pending) > 0 && timer == nil {
 				resetTimer()
 			}
-			if len(pending) >= defaultJournalBatchMaxOps {
+			if len(pending) >= defaultMaterializeBatchMaxOps {
 				_ = flush()
 			}
 		case <-timerCh:
@@ -933,10 +1456,13 @@ func cloneDurableCommits(commits []DurableCommit) []DurableCommit {
 	return cloned
 }
 
-func openNodeCommitJournals(local LocalStateStore, nodeID string) ([]commitJournalStore, error) {
+func openNodeCommitJournals(local LocalStateStore, nodeID string, shardCount int) ([]commitJournalStore, error) {
+	if shardCount <= 0 {
+		shardCount = defaultJournalShardCount
+	}
 	if provider, ok := local.(commitJournalShardProvider); ok {
-		journals := make([]commitJournalStore, 0, defaultJournalShardCount)
-		for shard := 0; shard < defaultJournalShardCount; shard++ {
+		journals := make([]commitJournalStore, 0, shardCount)
+		for shard := 0; shard < shardCount; shard++ {
 			journal, err := provider.CommitJournalShard(nodeID, shard)
 			if err != nil {
 				for _, existing := range journals {
@@ -970,7 +1496,6 @@ func recoverJournaledReplicaState(journals []commitJournalStore, records map[int
 	if len(journals) == 0 {
 		return nil, highWater, nil
 	}
-	backlog := make([]DurableCommit, 0)
 	for _, journal := range journals {
 		if journal == nil {
 			continue
@@ -989,24 +1514,30 @@ func recoverJournaledReplicaState(journals []commitJournalStore, records map[int
 				if entry.Sequence > record.highestUpstreamConfirmedSequence {
 					record.highestUpstreamConfirmedSequence = entry.Sequence
 				}
-			case journalRecordTypeCommit:
+			case journalRecordTypePrepare:
+				if entry.Sequence > record.highestPreparedDurable {
+					record.highestPreparedDurable = entry.Sequence
+				}
+				record.preparedEntries[entry.Sequence] = entry.operation()
+				if nextSequence := entry.Sequence + 1; record.nextSequence < nextSequence {
+					record.nextSequence = nextSequence
+				}
+			case journalRecordTypeCommitWatermark:
 				if entry.Sequence > record.highestCommittedSequence {
 					record.highestCommittedSequence = entry.Sequence
 					record.localDataPresent = true
-					if nextSequence := entry.Sequence + 1; record.nextSequence < nextSequence {
-						record.nextSequence = nextSequence
-					}
+				}
+			case journalRecordTypeLegacyCommit:
+				if entry.Sequence > record.highestPreparedDurable {
+					record.highestPreparedDurable = entry.Sequence
+				}
+				record.preparedEntries[entry.Sequence] = entry.operation()
+				if entry.Sequence > record.highestCommittedSequence {
+					record.highestCommittedSequence = entry.Sequence
+					record.localDataPresent = true
 				}
 				if entry.UpstreamConfirmedSequence > record.highestUpstreamConfirmedSequence {
 					record.highestUpstreamConfirmedSequence = entry.UpstreamConfirmedSequence
-				}
-				if entry.Sequence > record.materializedCommittedSequence {
-					record = recordWithCommittedOverlay(record, entry.operation())
-					backlog = append(backlog, DurableCommit{
-						Operation:                 entry.operation(),
-						Persisted:                 persistedReplica(record),
-						UpstreamConfirmedSequence: entry.UpstreamConfirmedSequence,
-					})
 				}
 			}
 			record.highestUpstreamConfirmedSequence = normalizeUpstreamConfirmedSequence(record)
@@ -1018,6 +1549,21 @@ func recoverJournaledReplicaState(journals []commitJournalStore, records map[int
 		}); err != nil {
 			return nil, nil, err
 		}
+	}
+	backlog := make([]DurableCommit, 0)
+	for slot, record := range records {
+		for sequence := record.materializedCommittedSequence + 1; sequence <= record.highestCommittedSequence; sequence++ {
+			operation, ok := record.preparedEntries[sequence]
+			if !ok {
+				continue
+			}
+			record = recordWithCommittedOverlay(record, operation)
+			backlog = append(backlog, DurableCommit{
+				Operation: cloneWriteOperation(operation),
+				Persisted: persistedReplica(record),
+			})
+		}
+		records[slot] = record
 	}
 	return backlog, highWater, nil
 }

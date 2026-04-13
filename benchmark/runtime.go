@@ -36,15 +36,20 @@ type CoordinatorProcessConfig struct {
 }
 
 type StorageProcessConfig struct {
-	ManifestPath         string        `json:"manifest_path"`
-	NodeID               string        `json:"node_id"`
-	DataDir              string        `json:"data_dir"`
-	HeartbeatInterval    time.Duration `json:"heartbeat_interval"`
-	ActivationInterval   time.Duration `json:"activation_interval"`
-	RPCDeadline          time.Duration `json:"rpc_deadline"`
-	WriteTraceOutput     string        `json:"write_trace_output"`
-	WriteTraceSampleRate int           `json:"write_trace_sample_rate"`
-	WriteTimeoutArtifacts string       `json:"write_timeout_artifacts"`
+	ManifestPath               string        `json:"manifest_path"`
+	NodeID                     string        `json:"node_id"`
+	DataDir                    string        `json:"data_dir"`
+	HeartbeatInterval          time.Duration `json:"heartbeat_interval"`
+	ActivationInterval         time.Duration `json:"activation_interval"`
+	RPCDeadline                time.Duration `json:"rpc_deadline"`
+	WriteTraceOutput           string        `json:"write_trace_output"`
+	WriteTraceSampleRate       int           `json:"write_trace_sample_rate"`
+	WriteTimeoutArtifacts      string        `json:"write_timeout_artifacts"`
+	JournalShards              int           `json:"journal_shards"`
+	JournalBatchDelayLow       time.Duration `json:"journal_batch_delay_low"`
+	JournalBatchDelayHigh      time.Duration `json:"journal_batch_delay_high"`
+	JournalBatchDepthThreshold int           `json:"journal_batch_depth_threshold"`
+	JournalBatchMaxOps         int           `json:"journal_batch_max_ops"`
 }
 
 func RunCoordinatorProcess(ctx context.Context, cfg CoordinatorProcessConfig) error {
@@ -192,6 +197,11 @@ func RunStorageProcess(ctx context.Context, cfg StorageProcessConfig) error {
 			WriteTraceOutputPath:           cfg.WriteTraceOutput,
 			WriteTraceSampleRate:           cfg.WriteTraceSampleRate,
 			WriteTimeoutArtifactOutputPath: cfg.WriteTimeoutArtifacts,
+			JournalShards:                  cfg.JournalShards,
+			JournalBatchDelayLow:           cfg.JournalBatchDelayLow,
+			JournalBatchDelayHigh:          cfg.JournalBatchDelayHigh,
+			JournalBatchDepthThreshold:     cfg.JournalBatchDepthThreshold,
+			JournalBatchMaxOps:             cfg.JournalBatchMaxOps,
 		},
 		store.Backend(),
 		store.LocalStateStore(),

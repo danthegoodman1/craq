@@ -263,9 +263,16 @@ message ReplicationAck {
   bytes encoded_error = 2;
 }
 
+enum ReplicationCreditKind {
+  REPLICATION_CREDIT_KIND_UNSPECIFIED = 0;
+  REPLICATION_CREDIT_KIND_FORWARD = 1;
+  REPLICATION_CREDIT_KIND_COMMIT = 2;
+}
+
 message ReplicationSlotCredit {
   int32 slot = 1;
   int32 available = 2;
+  ReplicationCreditKind kind = 3;
 }
 
 message ReplicationFrame {

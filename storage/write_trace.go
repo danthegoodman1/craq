@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -229,6 +230,36 @@ func writeTraceCommitIntentStage(role ReplicaRole) string {
 	}
 }
 
+func writeTracePrepareFlushStartStage(role ReplicaRole) string {
+	switch role {
+	case ReplicaRoleHead:
+		return "head_prepare_flush_start"
+	case ReplicaRoleMiddle:
+		return "middle_prepare_flush_start"
+	case ReplicaRoleTail:
+		return "tail_prepare_flush_start"
+	case ReplicaRoleSingle:
+		return "single_prepare_flush_start"
+	default:
+		return ""
+	}
+}
+
+func writeTracePrepareFlushEndStage(role ReplicaRole) string {
+	switch role {
+	case ReplicaRoleHead:
+		return "head_prepare_flush_end"
+	case ReplicaRoleMiddle:
+		return "middle_prepare_flush_end"
+	case ReplicaRoleTail:
+		return "tail_prepare_flush_end"
+	case ReplicaRoleSingle:
+		return "single_prepare_flush_end"
+	default:
+		return ""
+	}
+}
+
 func writeTraceFlushStartStage(role ReplicaRole) string {
 	switch role {
 	case ReplicaRoleHead:
@@ -274,7 +305,13 @@ type pipelineMetrics struct {
 	commitFlushDuration *prometheus.HistogramVec
 	commitOwnerCallback *prometheus.HistogramVec
 	commitBatchOps      prometheus.Histogram
+	commitBatchSlots    prometheus.Histogram
 	commitBatchBytes    prometheus.Histogram
+	confirmBatchCount   prometheus.Histogram
+	coalescedConfirms   prometheus.Counter
+	journalPendingItems *prometheus.GaugeVec
+	journalPendingSlots *prometheus.GaugeVec
+	journalPendingConfs *prometheus.GaugeVec
 	sessionQueueWait    *prometheus.HistogramVec
 	sessionQueueDepth   *prometheus.GaugeVec
 }
@@ -297,13 +334,39 @@ func newPipelineMetrics(registry *prometheus.Registry) *pipelineMetrics {
 		commitBatchOps: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "craq_storage_commit_batch_ops",
 			Help:    "Durable commit-engine batch sizes in operations.",
-			Buckets: []float64{1, 2, 4, 8, 16, 32, 64, 128, 256},
+			Buckets: []float64{1, 2, 4, 8, 16, 32, 64, 128},
+		}),
+		commitBatchSlots: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "craq_storage_commit_batch_slots",
+			Help:    "Unique slots touched by a durable commit-engine batch.",
+			Buckets: []float64{1, 2, 4, 8, 16, 32, 64},
 		}),
 		commitBatchBytes: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "craq_storage_commit_batch_bytes",
 			Help:    "Estimated durable commit-engine batch sizes in bytes.",
 			Buckets: []float64{256, 512, 1024, 2048, 4096, 8192, 16384, 65536, 262144, 1048576},
 		}),
+		confirmBatchCount: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "craq_storage_confirm_batch_count",
+			Help:    "Coalesced upstream-confirm records appended in a journal batch.",
+			Buckets: []float64{1, 2, 4, 8, 16, 32, 64},
+		}),
+		coalescedConfirms: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "craq_storage_confirm_coalesced_total",
+			Help: "Upstream confirm intents merged into an existing pending confirm item.",
+		}),
+		journalPendingItems: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "craq_storage_journal_pending_commit_items",
+			Help: "Current pending commit items per journal shard.",
+		}, []string{"shard"}),
+		journalPendingSlots: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "craq_storage_journal_pending_commit_slots",
+			Help: "Current slots with pending commit items per journal shard.",
+		}, []string{"shard"}),
+		journalPendingConfs: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "craq_storage_journal_pending_confirm_items",
+			Help: "Current pending coalesced confirm items per journal shard.",
+		}, []string{"shard"}),
 		sessionQueueWait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "craq_storage_replication_session_queue_wait_seconds",
 			Help:    "Queue wait before a replication request is written to the session stream.",
@@ -318,7 +381,13 @@ func newPipelineMetrics(registry *prometheus.Registry) *pipelineMetrics {
 		m.commitFlushDuration,
 		m.commitOwnerCallback,
 		m.commitBatchOps,
+		m.commitBatchSlots,
 		m.commitBatchBytes,
+		m.confirmBatchCount,
+		m.coalescedConfirms,
+		m.journalPendingItems,
+		m.journalPendingSlots,
+		m.journalPendingConfs,
 		m.sessionQueueWait,
 		m.sessionQueueDepth,
 	)
@@ -351,6 +420,44 @@ func (n *Node) observeCommitBatchSize(ops int, bytes int) {
 	}
 	n.pipelineMetrics.commitBatchOps.Observe(float64(ops))
 	n.pipelineMetrics.commitBatchBytes.Observe(float64(bytes))
+}
+
+func (n *Node) observeJournalCommitBatchSlots(slots int) {
+	if n == nil || n.pipelineMetrics == nil || slots <= 0 {
+		return
+	}
+	n.pipelineMetrics.commitBatchSlots.Observe(float64(slots))
+}
+
+func (n *Node) observeJournalConfirmBatchCount(count int) {
+	if n == nil || n.pipelineMetrics == nil || count <= 0 {
+		return
+	}
+	n.pipelineMetrics.confirmBatchCount.Observe(float64(count))
+}
+
+func (n *Node) observeJournalCommitWatermarkBatchCount(count int) {
+	if n == nil || n.pipelineMetrics == nil || count <= 0 {
+		return
+	}
+	n.pipelineMetrics.confirmBatchCount.Observe(float64(count))
+}
+
+func (n *Node) observeJournalCoalescedConfirm(count int) {
+	if n == nil || n.pipelineMetrics == nil || count <= 0 {
+		return
+	}
+	n.pipelineMetrics.coalescedConfirms.Add(float64(count))
+}
+
+func (n *Node) observeJournalShardPending(shard int, commitItems int, commitSlots int, confirmItems int) {
+	if n == nil || n.pipelineMetrics == nil {
+		return
+	}
+	label := strconv.Itoa(shard)
+	n.pipelineMetrics.journalPendingItems.WithLabelValues(label).Set(float64(commitItems))
+	n.pipelineMetrics.journalPendingSlots.WithLabelValues(label).Set(float64(commitSlots))
+	n.pipelineMetrics.journalPendingConfs.WithLabelValues(label).Set(float64(confirmItems))
 }
 
 func (n *Node) ObserveReplicationSessionQueueWait(kind string, target string, wait time.Duration) {

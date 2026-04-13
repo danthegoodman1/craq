@@ -34,9 +34,9 @@ type AnalysisSummary struct {
 }
 
 type TimeoutRootCauseReport struct {
-	RunID       string              `json:"run_id"`
-	GeneratedAt time.Time           `json:"generated_at"`
-	Roots       []TimeoutRootCause  `json:"roots"`
+	RunID       string             `json:"run_id"`
+	GeneratedAt time.Time          `json:"generated_at"`
+	Roots       []TimeoutRootCause `json:"roots"`
 }
 
 type TimeoutRootCause struct {
@@ -880,14 +880,14 @@ type timeoutArtifactJournalState struct {
 }
 
 type timeoutArtifact struct {
-	At           time.Time                    `json:"at"`
-	NodeID       string                       `json:"node_id"`
-	Slot         int                          `json:"slot"`
-	Sequence     uint64                       `json:"sequence"`
-	Error        string                       `json:"error"`
-	SlotState    timeoutArtifactSlotState     `json:"slot_state"`
+	At           time.Time                     `json:"at"`
+	NodeID       string                        `json:"node_id"`
+	Slot         int                           `json:"slot"`
+	Sequence     uint64                        `json:"sequence"`
+	Error        string                        `json:"error"`
+	SlotState    timeoutArtifactSlotState      `json:"slot_state"`
 	SessionState []timeoutArtifactSessionState `json:"session_state"`
-	JournalState *timeoutArtifactJournalState `json:"journal_state"`
+	JournalState *timeoutArtifactJournalState  `json:"journal_state"`
 }
 
 func buildWritePipelineSummary(runDir string, report LoadGenReport) (WritePipelineSummary, error) {
@@ -953,7 +953,9 @@ func buildWritePipelineSummary(runDir string, report LoadGenReport) (WritePipeli
 			"owner_callback_delay": "craq_storage_commit_owner_callback_delay_seconds",
 			"session_queue_wait":   "craq_storage_replication_session_queue_wait_seconds",
 			"commit_batch_ops":     "craq_storage_commit_batch_ops",
+			"commit_batch_slots":   "craq_storage_commit_batch_slots",
 			"commit_batch_bytes":   "craq_storage_commit_batch_bytes",
+			"confirm_batch_count":  "craq_storage_confirm_batch_count",
 		} {
 			meanMillis, err := scenarioHistogramMean(metricRoot, startName, endName, family)
 			if err == nil {

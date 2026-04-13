@@ -457,15 +457,20 @@ func installRemoteConfigs(ctx context.Context, state RunState, manifestPath stri
 	}
 	for _, nodeID := range []string{"a", "b", "c"} {
 		cfg := StorageProcessConfig{
-			ManifestPath:         "/etc/craq-bench/manifest.json",
-			NodeID:               nodeID,
-			DataDir:              benchmarkStorageDataDir(nodeID),
-			HeartbeatInterval:    state.Profile.Cluster.HeartbeatInterval,
-			ActivationInterval:   state.Profile.Cluster.ActivationInterval,
-			RPCDeadline:          state.Profile.Cluster.RPCDeadline,
-			WriteTraceOutput:     filepath.Join(runRoot, "storage-"+nodeID, "write-pipeline-trace.jsonl"),
-			WriteTraceSampleRate: 1024,
-			WriteTimeoutArtifacts: filepath.Join(runRoot, "storage-"+nodeID, "write-timeout-artifacts.jsonl"),
+			ManifestPath:               "/etc/craq-bench/manifest.json",
+			NodeID:                     nodeID,
+			DataDir:                    benchmarkStorageDataDir(nodeID),
+			HeartbeatInterval:          state.Profile.Cluster.HeartbeatInterval,
+			ActivationInterval:         state.Profile.Cluster.ActivationInterval,
+			RPCDeadline:                state.Profile.Cluster.RPCDeadline,
+			WriteTraceOutput:           filepath.Join(runRoot, "storage-"+nodeID, "write-pipeline-trace.jsonl"),
+			WriteTraceSampleRate:       1024,
+			WriteTimeoutArtifacts:      filepath.Join(runRoot, "storage-"+nodeID, "write-timeout-artifacts.jsonl"),
+			JournalShards:              state.Profile.Storage.JournalShards,
+			JournalBatchDelayLow:       state.Profile.Storage.JournalBatchDelayLow,
+			JournalBatchDelayHigh:      state.Profile.Storage.JournalBatchDelayHigh,
+			JournalBatchDepthThreshold: state.Profile.Storage.JournalBatchDepthThreshold,
+			JournalBatchMaxOps:         state.Profile.Storage.JournalBatchMaxOps,
 		}
 		configs["storage-"+nodeID+".json"] = mustJSON(cfg)
 	}

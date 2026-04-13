@@ -414,17 +414,8 @@ func stageTailCommittedDirtyOps(
 		if err := mid.HandleForwardWrite(ctx, req); err != nil {
 			t.Fatalf("HandleForwardWrite(%d) returned error: %v", op.Sequence, err)
 		}
-		pending := repl.Pending()
-		if pending == 0 {
-			t.Fatalf("replication queue empty after staging sequence %d", op.Sequence)
-		}
-		if pending > 1 {
-			if err := repl.MoveToFront(pending - 1); err != nil {
-				t.Fatalf("MoveToFront(%d) returned error: %v", pending-1, err)
-			}
-		}
-		if err := repl.DeliverNext(ctx); err != nil {
-			t.Fatalf("DeliverNext(sequence=%d) returned error: %v", op.Sequence, err)
+		if err := deliverQueuedForward(t, ctx, repl, "tail", slot, op.Sequence); err != nil {
+			t.Fatalf("deliverQueuedForward(sequence=%d) returned error: %v", op.Sequence, err)
 		}
 	}
 }
@@ -480,12 +471,16 @@ func deliverQueuedForward(
 	sequence uint64,
 ) error {
 	t.Helper()
-	return deliverQueuedMessage(t, ctx, repl, func(msg QueuedReplicationMessage) bool {
+	if err := deliverQueuedMessage(t, ctx, repl, func(msg QueuedReplicationMessage) bool {
 		return msg.ToNodeID == toNodeID &&
 			msg.Forward != nil &&
 			msg.Forward.Operation.Slot == slot &&
 			msg.Forward.Operation.Sequence == sequence
-	})
+	}); err != nil {
+		return err
+	}
+	waitQueuedNodeCommittedThrough(t, ctx, repl, toNodeID, slot, sequence)
+	return nil
 }
 
 func deliverQueuedCommit(
@@ -536,6 +531,56 @@ func deliverQueuedMessage(
 	}
 	t.Fatalf("queued replication message not found")
 	return nil
+}
+
+func waitQueuedNodeCommittedThrough(
+	t *testing.T,
+	ctx context.Context,
+	repl *QueuedInMemoryReplicationTransport,
+	nodeID string,
+	slot int,
+	sequence uint64,
+) {
+	t.Helper()
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for {
+		repl.mu.Lock()
+		handler := repl.nodes[nodeID]
+		repl.mu.Unlock()
+		node, ok := handler.(*Node)
+		if !ok || node == nil {
+			t.Fatalf("queued node %q missing or not a *Node", nodeID)
+		}
+		highest, err := node.HighestCommittedSequence(slot)
+		if err == nil && highest >= sequence {
+			return
+		}
+		if time.Now().After(deadline) {
+			staged, stagedErr := node.StagedSequences(slot)
+			bufferedForwards, forwardErr := node.BufferedForwardSequences(slot)
+			bufferedCommits, commitErr := node.BufferedCommitSequences(slot)
+			t.Fatalf(
+				"node %q slot %d highest committed did not reach %d (got %d, err=%v, staged=%v stagedErr=%v bufferedForwards=%v forwardErr=%v bufferedCommits=%v commitErr=%v pending=%v)",
+				nodeID,
+				slot,
+				sequence,
+				highest,
+				err,
+				staged,
+				stagedErr,
+				bufferedForwards,
+				forwardErr,
+				bufferedCommits,
+				commitErr,
+				repl.PendingMessages(),
+			)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context canceled waiting for node %q slot %d to reach sequence %d: %v", nodeID, slot, sequence, ctx.Err())
+		case <-time.After(100 * time.Microsecond):
+		}
+	}
 }
 
 func misconfigureReplicaTail(t *testing.T, node *Node, slot int, tailNodeID string) {

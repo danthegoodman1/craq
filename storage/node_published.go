@@ -6,7 +6,10 @@ type publishedReplicaSnapshot struct {
 	assignment                       ReplicaAssignment
 	state                            ReplicaState
 	lastKnownState                   ReplicaState
+	highestPreparedDurable           uint64
 	highestCommittedSequence         uint64
+	materializedCommittedSequence    uint64
+	highestCommitTokenReceived       uint64
 	highestUpstreamConfirmedSequence uint64
 	localDataPresent                 bool
 	inFlightClientWrites             int
@@ -21,7 +24,10 @@ func publishedReplicaFromRecord(record replicaRecord) publishedReplicaSnapshot {
 		assignment:                       cloneAssignment(record.assignment),
 		state:                            record.state,
 		lastKnownState:                   record.lastKnownState,
+		highestPreparedDurable:           record.highestPreparedDurable,
 		highestCommittedSequence:         record.highestCommittedSequence,
+		materializedCommittedSequence:    record.materializedCommittedSequence,
+		highestCommitTokenReceived:       record.highestCommitTokenReceived,
 		highestUpstreamConfirmedSequence: record.highestUpstreamConfirmedSequence,
 		localDataPresent:                 record.localDataPresent,
 		inFlightClientWrites:             record.inFlightClientWrites,
@@ -36,8 +42,10 @@ func replicaRecordFromPublished(snapshot publishedReplicaSnapshot) replicaRecord
 		assignment:                       cloneAssignment(snapshot.assignment),
 		state:                            snapshot.state,
 		nextSequence:                     snapshot.highestCommittedSequence + 1,
+		highestPreparedDurable:           snapshot.highestPreparedDurable,
 		highestCommittedSequence:         snapshot.highestCommittedSequence,
-		materializedCommittedSequence:    snapshot.highestCommittedSequence,
+		materializedCommittedSequence:    snapshot.materializedCommittedSequence,
+		highestCommitTokenReceived:       snapshot.highestCommitTokenReceived,
 		highestUpstreamConfirmedSequence: snapshot.highestUpstreamConfirmedSequence,
 		localDataPresent:                 snapshot.localDataPresent,
 		lastKnownState:                   snapshot.lastKnownState,

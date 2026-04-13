@@ -19,6 +19,12 @@ func TestLoadProfileDefaultsAndValidate(t *testing.T) {
 	if got, want := profile.GCP.StorageLayout, "single_nvme_ext4"; got != want {
 		t.Fatalf("StorageLayout = %q, want %q", got, want)
 	}
+	if got, want := profile.Storage.JournalShards, 16; got != want {
+		t.Fatalf("JournalShards = %d, want %d", got, want)
+	}
+	if got, want := profile.Local.StorageLayout, "repo_disk"; got != want {
+		t.Fatalf("Local.StorageLayout = %q, want %q", got, want)
+	}
 	if profile.Cluster.SlotCount != 1024 {
 		t.Fatalf("SlotCount = %d, want 1024", profile.Cluster.SlotCount)
 	}
@@ -76,5 +82,59 @@ func TestLoadLocalSmokeCloudShapeProfileDefaultsAndValidate(t *testing.T) {
 	}
 	if got := profile.GCP.Project; got == "" || !strings.Contains(got, "CHANGEME") {
 		t.Fatalf("local cloud-shape project = %q, want CHANGEME placeholder", got)
+	}
+}
+
+func TestLoadLocalPutScalingProfileDefaultsAndValidate(t *testing.T) {
+	profile, err := LoadProfile("../profiles/bench/local_put_scaling.yaml")
+	if err != nil {
+		t.Fatalf("LoadProfile returned error: %v", err)
+	}
+	if got, want := profile.Storage.JournalShards, 16; got != want {
+		t.Fatalf("JournalShards = %d, want %d", got, want)
+	}
+	if got, want := profile.Storage.JournalBatchDelayLow.String(), "50µs"; got != want {
+		t.Fatalf("JournalBatchDelayLow = %q, want %q", got, want)
+	}
+	if got, want := profile.Storage.JournalBatchMaxOps, 64; got != want {
+		t.Fatalf("JournalBatchMaxOps = %d, want %d", got, want)
+	}
+	if got, want := profile.Local.StorageLayout, "repo_disk"; got != want {
+		t.Fatalf("Local.StorageLayout = %q, want %q", got, want)
+	}
+	if got, want := len(profile.Workload.Scenarios), 6; got != want {
+		t.Fatalf("len(Scenarios) = %d, want %d", got, want)
+	}
+}
+
+func TestLoadLocalPutScalingDevProfileDefaultsAndValidate(t *testing.T) {
+	profile, err := LoadProfile("../profiles/bench/local_put_scaling_dev.yaml")
+	if err != nil {
+		t.Fatalf("LoadProfile returned error: %v", err)
+	}
+	if got, want := profile.Storage.JournalBatchMaxOps, 64; got != want {
+		t.Fatalf("JournalBatchMaxOps = %d, want %d", got, want)
+	}
+	if got, want := profile.Workload.PreloadKeys, 1000; got != want {
+		t.Fatalf("PreloadKeys = %d, want %d", got, want)
+	}
+	if got, want := profile.Local.StorageLayout, "repo_disk"; got != want {
+		t.Fatalf("Local.StorageLayout = %q, want %q", got, want)
+	}
+}
+
+func TestLoadLocalPutScalingRealAndRamdiskProfiles(t *testing.T) {
+	tests := map[string]string{
+		"../profiles/bench/local_put_scaling_real.yaml":    "repo_disk",
+		"../profiles/bench/local_put_scaling_ramdisk.yaml": "ramdisk",
+	}
+	for path, wantLayout := range tests {
+		profile, err := LoadProfile(path)
+		if err != nil {
+			t.Fatalf("LoadProfile(%s) returned error: %v", path, err)
+		}
+		if got := profile.Local.StorageLayout; got != wantLayout {
+			t.Fatalf("LoadProfile(%s) Local.StorageLayout = %q, want %q", path, got, wantLayout)
+		}
 	}
 }

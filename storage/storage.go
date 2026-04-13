@@ -54,6 +54,11 @@ type Config struct {
 	WriteTraceOutputPath              string
 	WriteTraceSampleRate              int
 	WriteTimeoutArtifactOutputPath    string
+	JournalShards                     int
+	JournalBatchDelayLow              time.Duration
+	JournalBatchDelayHigh             time.Duration
+	JournalBatchDepthThreshold        int
+	JournalBatchMaxOps                int
 }
 
 type Clock interface {
@@ -172,6 +177,10 @@ type ReplicationTransport interface {
 	FetchCommittedSequence(ctx context.Context, fromNodeID string, slot int) (uint64, error)
 	ForwardWrite(ctx context.Context, toNodeID string, req ForwardWriteRequest) error
 	CommitWrite(ctx context.Context, toNodeID string, req CommitWriteRequest) error
+}
+
+type asyncForwardReplicationTransport interface {
+	ForwardWriteAsync(ctx context.Context, toNodeID string, req ForwardWriteRequest, onComplete func(error)) error
 }
 
 type ReplicationTransportObserver interface {
@@ -556,12 +565,15 @@ type replicaRecord struct {
 	assignment                       ReplicaAssignment
 	state                            ReplicaState
 	nextSequence                     uint64
+	highestPreparedDurable           uint64
+	highestCommitTokenReceived       uint64
 	highestCommittedSequence         uint64
 	materializedCommittedSequence    uint64
 	highestUpstreamConfirmedSequence uint64
 	localDataPresent                 bool
 	lastKnownState                   ReplicaState
 	pendingWrites                    map[uint64]pendingWrite
+	preparedEntries                  map[uint64]WriteOperation
 	expectedCommitSources            map[uint64]expectedCommitSource
 	stagedForwards                   map[uint64]ForwardWriteRequest
 	bufferedForwards                 map[uint64]ForwardWriteRequest
@@ -684,6 +696,21 @@ func OpenNode(
 	if cfg.WriteCommitTimeout < 0 {
 		return nil, fmt.Errorf("%w: write commit timeout must be >= 0", ErrInvalidConfig)
 	}
+	if cfg.JournalShards < 0 {
+		return nil, fmt.Errorf("%w: journal shards must be >= 0", ErrInvalidConfig)
+	}
+	if cfg.JournalBatchDelayLow < 0 {
+		return nil, fmt.Errorf("%w: journal batch delay low must be >= 0", ErrInvalidConfig)
+	}
+	if cfg.JournalBatchDelayHigh < 0 {
+		return nil, fmt.Errorf("%w: journal batch delay high must be >= 0", ErrInvalidConfig)
+	}
+	if cfg.JournalBatchDepthThreshold < 0 {
+		return nil, fmt.Errorf("%w: journal batch depth threshold must be >= 0", ErrInvalidConfig)
+	}
+	if cfg.JournalBatchMaxOps < 0 {
+		return nil, fmt.Errorf("%w: journal batch max ops must be >= 0", ErrInvalidConfig)
+	}
 	if backend == nil {
 		return nil, fmt.Errorf("%w: backend must not be nil", ErrInvalidConfig)
 	}
@@ -769,7 +796,8 @@ func OpenNode(
 		setter.SetReplicationTransportObserver(node)
 	}
 
-	journals, err := openNodeCommitJournals(local, cfg.NodeID)
+	journalConfig := resolvedJournalConfig(cfg)
+	journals, err := openNodeCommitJournals(local, cfg.NodeID, journalConfig.shardCount)
 	if err != nil {
 		return nil, fmt.Errorf("open commit journal: %w", err)
 	}
@@ -789,6 +817,8 @@ func OpenNode(
 			assignment:                       cloneAssignment(replica.Assignment),
 			state:                            ReplicaStateRecovered,
 			nextSequence:                     replica.HighestCommittedSequence + 1,
+			highestPreparedDurable:           replica.HighestCommittedSequence,
+			highestCommitTokenReceived:       replica.HighestCommittedSequence,
 			highestCommittedSequence:         replica.HighestCommittedSequence,
 			materializedCommittedSequence:    0,
 			highestUpstreamConfirmedSequence: replica.HighestUpstreamConfirmedSequence,
@@ -798,6 +828,8 @@ func OpenNode(
 
 		if sequence, err := backend.HighestCommittedSequence(replica.Assignment.Slot); err == nil {
 			record.localDataPresent = true
+			record.highestPreparedDurable = sequence
+			record.highestCommitTokenReceived = sequence
 			record.highestCommittedSequence = sequence
 			record.materializedCommittedSequence = sequence
 			record.nextSequence = sequence + 1
@@ -839,7 +871,7 @@ func OpenNode(
 		node.slotOwners[slot] = newSlotOwner(node, slot, true, record)
 		node.publishReplicaRecord(slot, record)
 	}
-	node.commitJournal = newCommitJournalEngine(node, journals, highWater, backlog)
+	node.commitJournal = newCommitJournalEngine(node, journals, highWater, backlog, journalConfig)
 
 	return node, nil
 }
@@ -1217,6 +1249,10 @@ func validateForwardSource(record replicaRecord, req ForwardWriteRequest) error 
 		)
 	}
 	if expectedChainVersion != req.ChainVersion {
+		if record.assignment.Peers.PredecessorNodeID == req.FromNodeID &&
+			record.assignment.ChainVersion == req.ChainVersion {
+			return nil
+		}
 		return fmt.Errorf(
 			"%w: slot %d expected chain version %d, got %d",
 			ErrPeerMismatch,
@@ -1800,6 +1836,11 @@ func (n *Node) dirtyEntriesForKey(record replicaRecord, key string) []dirtyReadE
 func sameForwardRequest(left ForwardWriteRequest, right ForwardWriteRequest) bool {
 	return left.FromNodeID == right.FromNodeID &&
 		left.ChainVersion == right.ChainVersion &&
+		left.Operation == right.Operation
+}
+
+func sameForwardRequestIgnoringChain(left ForwardWriteRequest, right ForwardWriteRequest) bool {
+	return left.FromNodeID == right.FromNodeID &&
 		left.Operation == right.Operation
 }
 
