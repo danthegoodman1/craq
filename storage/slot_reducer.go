@@ -340,26 +340,16 @@ func reduceHasStagedForward(record replicaRecord, sequence uint64) bool {
 
 func reduceHasCommittableSequence(record replicaRecord, sequence uint64) bool {
 	record = ensureProtocolReplicaState(record)
-	if _, ok := record.preparedEntries[sequence]; ok {
-		return true
-	}
-	if reduceHasStagedForward(record, sequence) {
-		return true
-	}
-	_, ok := record.pendingWrites[sequence]
-	return ok
+	return sequence <= record.highestPreparedDurable
 }
 
 func reduceCommittableOperation(record replicaRecord, sequence uint64) (WriteOperation, error) {
 	record = ensureProtocolReplicaState(record)
+	if sequence > record.highestPreparedDurable {
+		return WriteOperation{}, fmt.Errorf("%w: slot %d sequence %d is not durably prepared", ErrSequenceMismatch, record.assignment.Slot, sequence)
+	}
 	if operation, ok := record.preparedEntries[sequence]; ok {
 		return cloneWriteOperation(operation), nil
-	}
-	if pending, ok := record.pendingWrites[sequence]; ok && pending.operation != nil {
-		return cloneWriteOperation(*pending.operation), nil
-	}
-	if staged, ok := record.stagedForwards[sequence]; ok {
-		return cloneWriteOperation(staged.Operation), nil
 	}
 	return WriteOperation{}, fmt.Errorf("%w: slot %d sequence %d is not committable", ErrSequenceMismatch, record.assignment.Slot, sequence)
 }

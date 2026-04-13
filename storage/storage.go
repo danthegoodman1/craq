@@ -59,6 +59,7 @@ type Config struct {
 	JournalBatchDelayHigh             time.Duration
 	JournalBatchDepthThreshold        int
 	JournalBatchMaxOps                int
+	JournalExperiment                 JournalExperiment
 }
 
 type Clock interface {
@@ -177,6 +178,7 @@ type ReplicationTransport interface {
 	FetchCommittedSequence(ctx context.Context, fromNodeID string, slot int) (uint64, error)
 	ForwardWrite(ctx context.Context, toNodeID string, req ForwardWriteRequest) error
 	CommitWrite(ctx context.Context, toNodeID string, req CommitWriteRequest) error
+	CommitAdvance(ctx context.Context, toNodeID string, req CommitAdvanceRequest) error
 }
 
 type asyncForwardReplicationTransport interface {
@@ -243,6 +245,13 @@ type CommitWriteRequest struct {
 	Sequence     uint64
 	FromNodeID   string
 	ChainVersion uint64
+}
+
+type CommitAdvanceRequest struct {
+	Slot             int
+	CommittedThrough uint64
+	FromNodeID       string
+	ChainVersion     uint64
 }
 
 type ClientGetRequest struct {
@@ -711,6 +720,9 @@ func OpenNode(
 	if cfg.JournalBatchMaxOps < 0 {
 		return nil, fmt.Errorf("%w: journal batch max ops must be >= 0", ErrInvalidConfig)
 	}
+	if cfg.JournalExperiment != "" && !ValidJournalExperiment(cfg.JournalExperiment) {
+		return nil, fmt.Errorf("%w: unsupported journal experiment %q", ErrInvalidConfig, cfg.JournalExperiment)
+	}
 	if backend == nil {
 		return nil, fmt.Errorf("%w: backend must not be nil", ErrInvalidConfig)
 	}
@@ -797,7 +809,7 @@ func OpenNode(
 	}
 
 	journalConfig := resolvedJournalConfig(cfg)
-	journals, err := openNodeCommitJournals(local, cfg.NodeID, journalConfig.shardCount)
+	journals, err := openNodeCommitJournals(local, cfg.NodeID, journalConfig)
 	if err != nil {
 		return nil, fmt.Errorf("open commit journal: %w", err)
 	}
@@ -1211,6 +1223,21 @@ func (n *Node) HandleCommitWrite(ctx context.Context, req CommitWriteRequest) er
 	return err
 }
 
+func (n *Node) HandleCommitAdvance(ctx context.Context, req CommitAdvanceRequest) error {
+	err := n.handleCommitAdvanceOwned(ctx, req)
+	if n.metrics != nil {
+		label := "success"
+		if err != nil {
+			label = "error"
+		}
+		n.metrics.replicationCommits.WithLabelValues(label).Inc()
+	}
+	if err != nil {
+		n.events.record(n.logger, zerolog.ErrorLevel, "replication_commit_advance_failed", "storage commit advance failed", ops.IntPtr(req.Slot), nil, ops.Uint64Ptr(req.CommittedThrough), req.FromNodeID, "", err)
+	}
+	return err
+}
+
 func (n *Node) AcceptCommitWrite(ctx context.Context, req CommitWriteRequest) error {
 	err := n.handleCommitWriteAcceptedOwned(ctx, req)
 	if n.metrics != nil {
@@ -1222,6 +1249,21 @@ func (n *Node) AcceptCommitWrite(ctx context.Context, req CommitWriteRequest) er
 	}
 	if err != nil {
 		n.events.record(n.logger, zerolog.ErrorLevel, "replication_commit_failed", "storage commit write accept failed", ops.IntPtr(req.Slot), nil, ops.Uint64Ptr(req.Sequence), req.FromNodeID, "", err)
+	}
+	return err
+}
+
+func (n *Node) AcceptCommitAdvance(ctx context.Context, req CommitAdvanceRequest) error {
+	err := n.handleCommitAdvanceAcceptedOwned(ctx, req)
+	if n.metrics != nil {
+		label := "success"
+		if err != nil {
+			label = "error"
+		}
+		n.metrics.replicationCommits.WithLabelValues(label).Inc()
+	}
+	if err != nil {
+		n.events.record(n.logger, zerolog.ErrorLevel, "replication_commit_advance_failed", "storage commit advance accept failed", ops.IntPtr(req.Slot), nil, ops.Uint64Ptr(req.CommittedThrough), req.FromNodeID, "", err)
 	}
 	return err
 }
@@ -1300,6 +1342,30 @@ func validateCommitSource(record replicaRecord, req CommitWriteRequest) error {
 	} else if staged, ok := record.stagedForwards[req.Sequence]; ok {
 		expectedChainVersion = staged.ChainVersion
 	}
+	if expectedNodeID == "" || expectedNodeID != req.FromNodeID {
+		return fmt.Errorf(
+			"%w: slot %d expected successor %q, got %q",
+			ErrPeerMismatch,
+			req.Slot,
+			expectedNodeID,
+			req.FromNodeID,
+		)
+	}
+	if expectedChainVersion != req.ChainVersion {
+		return fmt.Errorf(
+			"%w: slot %d expected chain version %d, got %d",
+			ErrPeerMismatch,
+			req.Slot,
+			expectedChainVersion,
+			req.ChainVersion,
+		)
+	}
+	return nil
+}
+
+func validateCommitAdvanceSource(record replicaRecord, req CommitAdvanceRequest) error {
+	expectedNodeID := record.assignment.Peers.SuccessorNodeID
+	expectedChainVersion := record.assignment.ChainVersion
 	if expectedNodeID == "" || expectedNodeID != req.FromNodeID {
 		return fmt.Errorf(
 			"%w: slot %d expected successor %q, got %q",
@@ -1848,6 +1914,10 @@ func sameCommitRequest(left CommitWriteRequest, right CommitWriteRequest) bool {
 	return left == right
 }
 
+func sameCommitAdvanceRequest(left CommitAdvanceRequest, right CommitAdvanceRequest) bool {
+	return left == right
+}
+
 func cloneForwardRequest(req ForwardWriteRequest) ForwardWriteRequest {
 	return ForwardWriteRequest{
 		Operation:    cloneWriteOperation(req.Operation),
@@ -1862,6 +1932,15 @@ func cloneCommitRequest(req CommitWriteRequest) CommitWriteRequest {
 		Sequence:     req.Sequence,
 		FromNodeID:   req.FromNodeID,
 		ChainVersion: req.ChainVersion,
+	}
+}
+
+func cloneCommitAdvanceRequest(req CommitAdvanceRequest) CommitAdvanceRequest {
+	return CommitAdvanceRequest{
+		Slot:             req.Slot,
+		CommittedThrough: req.CommittedThrough,
+		FromNodeID:       req.FromNodeID,
+		ChainVersion:     req.ChainVersion,
 	}
 }
 

@@ -58,6 +58,37 @@ func BenchmarkBackendApplyCommitted256B(b *testing.B) {
 	}
 }
 
+func BenchmarkBackendStagePut256B(b *testing.B) {
+	store, err := Open(filepath.Join(b.TempDir(), "badger"))
+	if err != nil {
+		b.Fatalf("Open returned error: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	backend := store.Backend()
+	if err := backend.CreateReplica(1); err != nil {
+		b.Fatalf("CreateReplica returned error: %v", err)
+	}
+
+	value := benchSizedValue("stage-value", 256)
+	base := time.Unix(0, 0).UTC()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		sequence := uint64(i + 1)
+		timestamp := base.Add(time.Duration(sequence) * time.Nanosecond)
+		if err := backend.StagePut(1, sequence, fmt.Sprintf("stage-key-%d", i), value, storage.ObjectMetadata{
+			Version:   sequence,
+			CreatedAt: timestamp,
+			UpdatedAt: timestamp,
+		}); err != nil {
+			b.Fatalf("StagePut returned error: %v", err)
+		}
+	}
+}
+
 func benchSizedValue(seed string, size int) string {
 	if size <= len(seed) {
 		return seed[:size]

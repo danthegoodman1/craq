@@ -19,6 +19,7 @@ func TestOpenNodeRestoresRecoveredReplicaAndResumePreservesSequence(t *testing.T
 	if err != nil {
 		t.Fatalf("OpenNode returned error: %v", err)
 	}
+	t.Cleanup(func() { _ = node.Close() })
 	repl.Register("node-a", backend)
 	repl.RegisterNode("node-a", node)
 
@@ -55,6 +56,7 @@ func TestOpenNodeRestoresRecoveredReplicaAndResumePreservesSequence(t *testing.T
 	if err != nil {
 		t.Fatalf("reopen OpenNode returned error: %v", err)
 	}
+	t.Cleanup(func() { _ = recovered.Close() })
 	repl.RegisterNode("node-a", recovered)
 
 	replica := recovered.State().Replicas[1]
@@ -113,6 +115,7 @@ func TestReportRecoveredStateMarksMissingBackendDataAsUnavailable(t *testing.T) 
 	if err != nil {
 		t.Fatalf("OpenNode returned error: %v", err)
 	}
+	t.Cleanup(func() { _ = node.Close() })
 	if err := node.AddReplicaAsTail(ctx, AddReplicaAsTailCommand{
 		Assignment: ReplicaAssignment{Slot: 3, ChainVersion: 1, Role: ReplicaRoleSingle},
 	}); err != nil {
@@ -130,6 +133,7 @@ func TestReportRecoveredStateMarksMissingBackendDataAsUnavailable(t *testing.T) 
 	if err != nil {
 		t.Fatalf("reopen OpenNode returned error: %v", err)
 	}
+	t.Cleanup(func() { _ = recovered.Close() })
 	if err := recovered.ReportRecoveredState(ctx); err != nil {
 		t.Fatalf("ReportRecoveredState returned error: %v", err)
 	}
@@ -171,6 +175,7 @@ func TestRecoverReplicaRebuildsFromPeerAndDropRecoveredReplicaDeletesLocalState(
 	if err != nil {
 		t.Fatalf("OpenNode(source) returned error: %v", err)
 	}
+	t.Cleanup(func() { _ = source.Close() })
 	repl.Register("source", sourceBackend)
 	repl.RegisterNode("source", source)
 	if err := source.AddReplicaAsTail(ctx, AddReplicaAsTailCommand{
@@ -192,6 +197,7 @@ func TestRecoverReplicaRebuildsFromPeerAndDropRecoveredReplicaDeletesLocalState(
 	if err != nil {
 		t.Fatalf("OpenNode(target) returned error: %v", err)
 	}
+	t.Cleanup(func() { _ = target.Close() })
 	if err := target.AddReplicaAsTail(ctx, AddReplicaAsTailCommand{
 		Assignment: ReplicaAssignment{Slot: 2, ChainVersion: 1, Role: ReplicaRoleSingle},
 	}); err != nil {
@@ -208,6 +214,7 @@ func TestRecoverReplicaRebuildsFromPeerAndDropRecoveredReplicaDeletesLocalState(
 	if err != nil {
 		t.Fatalf("reopen OpenNode(target) returned error: %v", err)
 	}
+	t.Cleanup(func() { _ = recoveredTarget.Close() })
 	repl.Register("target", targetBackend)
 	repl.RegisterNode("target", recoveredTarget)
 
@@ -244,6 +251,7 @@ func TestRecoverReplicaRebuildsFromPeerAndDropRecoveredReplicaDeletesLocalState(
 	if err != nil {
 		t.Fatalf("OpenNode(stale) returned error: %v", err)
 	}
+	t.Cleanup(func() { _ = stale.Close() })
 	if err := stale.AddReplicaAsTail(ctx, AddReplicaAsTailCommand{
 		Assignment: ReplicaAssignment{Slot: 9, ChainVersion: 1, Role: ReplicaRoleSingle},
 	}); err != nil {
@@ -256,6 +264,7 @@ func TestRecoverReplicaRebuildsFromPeerAndDropRecoveredReplicaDeletesLocalState(
 	if err != nil {
 		t.Fatalf("reopen OpenNode(stale) returned error: %v", err)
 	}
+	t.Cleanup(func() { _ = reopenedStale.Close() })
 	if err := reopenedStale.DropRecoveredReplica(ctx, DropRecoveredReplicaCommand{Slot: 9}); err != nil {
 		t.Fatalf("DropRecoveredReplica returned error: %v", err)
 	}

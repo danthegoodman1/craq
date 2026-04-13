@@ -631,6 +631,10 @@ func (t *ReplicationTransport) CommitWrite(ctx context.Context, toTarget string,
 	return t.submitReplicationRequest(ctx, toTarget, replicationCommitPayload{req: req})
 }
 
+func (t *ReplicationTransport) CommitAdvance(ctx context.Context, toTarget string, req storage.CommitAdvanceRequest) error {
+	return t.submitReplicationRequest(ctx, toTarget, replicationCommitAdvancePayload{req: req})
+}
+
 type ClientTransport struct {
 	pool *ConnPool
 }

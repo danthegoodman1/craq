@@ -131,9 +131,10 @@ func (ReadConsistency) EnumDescriptor() ([]byte, []int) {
 type ReplicationCreditKind int32
 
 const (
-	ReplicationCreditKind_REPLICATION_CREDIT_KIND_UNSPECIFIED ReplicationCreditKind = 0
-	ReplicationCreditKind_REPLICATION_CREDIT_KIND_FORWARD     ReplicationCreditKind = 1
-	ReplicationCreditKind_REPLICATION_CREDIT_KIND_COMMIT      ReplicationCreditKind = 2
+	ReplicationCreditKind_REPLICATION_CREDIT_KIND_UNSPECIFIED    ReplicationCreditKind = 0
+	ReplicationCreditKind_REPLICATION_CREDIT_KIND_FORWARD        ReplicationCreditKind = 1
+	ReplicationCreditKind_REPLICATION_CREDIT_KIND_COMMIT         ReplicationCreditKind = 2
+	ReplicationCreditKind_REPLICATION_CREDIT_KIND_COMMIT_ADVANCE ReplicationCreditKind = 3
 )
 
 // Enum value maps for ReplicationCreditKind.
@@ -142,11 +143,13 @@ var (
 		0: "REPLICATION_CREDIT_KIND_UNSPECIFIED",
 		1: "REPLICATION_CREDIT_KIND_FORWARD",
 		2: "REPLICATION_CREDIT_KIND_COMMIT",
+		3: "REPLICATION_CREDIT_KIND_COMMIT_ADVANCE",
 	}
 	ReplicationCreditKind_value = map[string]int32{
-		"REPLICATION_CREDIT_KIND_UNSPECIFIED": 0,
-		"REPLICATION_CREDIT_KIND_FORWARD":     1,
-		"REPLICATION_CREDIT_KIND_COMMIT":      2,
+		"REPLICATION_CREDIT_KIND_UNSPECIFIED":    0,
+		"REPLICATION_CREDIT_KIND_FORWARD":        1,
+		"REPLICATION_CREDIT_KIND_COMMIT":         2,
+		"REPLICATION_CREDIT_KIND_COMMIT_ADVANCE": 3,
 	}
 )
 
@@ -2573,6 +2576,74 @@ func (x *CommitWriteRequest) GetChainVersion() uint64 {
 	return 0
 }
 
+type CommitAdvanceRequest struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Slot             int32                  `protobuf:"varint,1,opt,name=slot,proto3" json:"slot,omitempty"`
+	CommittedThrough uint64                 `protobuf:"varint,2,opt,name=committed_through,json=committedThrough,proto3" json:"committed_through,omitempty"`
+	FromNodeId       string                 `protobuf:"bytes,3,opt,name=from_node_id,json=fromNodeId,proto3" json:"from_node_id,omitempty"`
+	ChainVersion     uint64                 `protobuf:"varint,4,opt,name=chain_version,json=chainVersion,proto3" json:"chain_version,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *CommitAdvanceRequest) Reset() {
+	*x = CommitAdvanceRequest{}
+	mi := &file_craq_v1_transport_proto_msgTypes[39]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CommitAdvanceRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CommitAdvanceRequest) ProtoMessage() {}
+
+func (x *CommitAdvanceRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_craq_v1_transport_proto_msgTypes[39]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CommitAdvanceRequest.ProtoReflect.Descriptor instead.
+func (*CommitAdvanceRequest) Descriptor() ([]byte, []int) {
+	return file_craq_v1_transport_proto_rawDescGZIP(), []int{39}
+}
+
+func (x *CommitAdvanceRequest) GetSlot() int32 {
+	if x != nil {
+		return x.Slot
+	}
+	return 0
+}
+
+func (x *CommitAdvanceRequest) GetCommittedThrough() uint64 {
+	if x != nil {
+		return x.CommittedThrough
+	}
+	return 0
+}
+
+func (x *CommitAdvanceRequest) GetFromNodeId() string {
+	if x != nil {
+		return x.FromNodeId
+	}
+	return ""
+}
+
+func (x *CommitAdvanceRequest) GetChainVersion() uint64 {
+	if x != nil {
+		return x.ChainVersion
+	}
+	return 0
+}
+
 type ReplicationAck struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
@@ -2583,7 +2654,7 @@ type ReplicationAck struct {
 
 func (x *ReplicationAck) Reset() {
 	*x = ReplicationAck{}
-	mi := &file_craq_v1_transport_proto_msgTypes[39]
+	mi := &file_craq_v1_transport_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2595,7 +2666,7 @@ func (x *ReplicationAck) String() string {
 func (*ReplicationAck) ProtoMessage() {}
 
 func (x *ReplicationAck) ProtoReflect() protoreflect.Message {
-	mi := &file_craq_v1_transport_proto_msgTypes[39]
+	mi := &file_craq_v1_transport_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2608,7 +2679,7 @@ func (x *ReplicationAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicationAck.ProtoReflect.Descriptor instead.
 func (*ReplicationAck) Descriptor() ([]byte, []int) {
-	return file_craq_v1_transport_proto_rawDescGZIP(), []int{39}
+	return file_craq_v1_transport_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *ReplicationAck) GetSuccess() bool {
@@ -2636,7 +2707,7 @@ type ReplicationSlotCredit struct {
 
 func (x *ReplicationSlotCredit) Reset() {
 	*x = ReplicationSlotCredit{}
-	mi := &file_craq_v1_transport_proto_msgTypes[40]
+	mi := &file_craq_v1_transport_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2648,7 +2719,7 @@ func (x *ReplicationSlotCredit) String() string {
 func (*ReplicationSlotCredit) ProtoMessage() {}
 
 func (x *ReplicationSlotCredit) ProtoReflect() protoreflect.Message {
-	mi := &file_craq_v1_transport_proto_msgTypes[40]
+	mi := &file_craq_v1_transport_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2661,7 +2732,7 @@ func (x *ReplicationSlotCredit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicationSlotCredit.ProtoReflect.Descriptor instead.
 func (*ReplicationSlotCredit) Descriptor() ([]byte, []int) {
-	return file_craq_v1_transport_proto_rawDescGZIP(), []int{40}
+	return file_craq_v1_transport_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *ReplicationSlotCredit) GetSlot() int32 {
@@ -2694,6 +2765,7 @@ type ReplicationFrame struct {
 	//	*ReplicationFrame_CommitWrite
 	//	*ReplicationFrame_Ack
 	//	*ReplicationFrame_SlotCredit
+	//	*ReplicationFrame_CommitAdvance
 	Payload       isReplicationFrame_Payload `protobuf_oneof:"payload"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2701,7 +2773,7 @@ type ReplicationFrame struct {
 
 func (x *ReplicationFrame) Reset() {
 	*x = ReplicationFrame{}
-	mi := &file_craq_v1_transport_proto_msgTypes[41]
+	mi := &file_craq_v1_transport_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2713,7 +2785,7 @@ func (x *ReplicationFrame) String() string {
 func (*ReplicationFrame) ProtoMessage() {}
 
 func (x *ReplicationFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_craq_v1_transport_proto_msgTypes[41]
+	mi := &file_craq_v1_transport_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2726,7 +2798,7 @@ func (x *ReplicationFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicationFrame.ProtoReflect.Descriptor instead.
 func (*ReplicationFrame) Descriptor() ([]byte, []int) {
-	return file_craq_v1_transport_proto_rawDescGZIP(), []int{41}
+	return file_craq_v1_transport_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *ReplicationFrame) GetRequestId() uint64 {
@@ -2779,6 +2851,15 @@ func (x *ReplicationFrame) GetSlotCredit() *ReplicationSlotCredit {
 	return nil
 }
 
+func (x *ReplicationFrame) GetCommitAdvance() *CommitAdvanceRequest {
+	if x != nil {
+		if x, ok := x.Payload.(*ReplicationFrame_CommitAdvance); ok {
+			return x.CommitAdvance
+		}
+	}
+	return nil
+}
+
 type isReplicationFrame_Payload interface {
 	isReplicationFrame_Payload()
 }
@@ -2799,6 +2880,10 @@ type ReplicationFrame_SlotCredit struct {
 	SlotCredit *ReplicationSlotCredit `protobuf:"bytes,5,opt,name=slot_credit,json=slotCredit,proto3,oneof"`
 }
 
+type ReplicationFrame_CommitAdvance struct {
+	CommitAdvance *CommitAdvanceRequest `protobuf:"bytes,6,opt,name=commit_advance,json=commitAdvance,proto3,oneof"`
+}
+
 func (*ReplicationFrame_ForwardWrite) isReplicationFrame_Payload() {}
 
 func (*ReplicationFrame_CommitWrite) isReplicationFrame_Payload() {}
@@ -2806,6 +2891,8 @@ func (*ReplicationFrame_CommitWrite) isReplicationFrame_Payload() {}
 func (*ReplicationFrame_Ack) isReplicationFrame_Payload() {}
 
 func (*ReplicationFrame_SlotCredit) isReplicationFrame_Payload() {}
+
+func (*ReplicationFrame_CommitAdvance) isReplicationFrame_Payload() {}
 
 type FetchSnapshotRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -2816,7 +2903,7 @@ type FetchSnapshotRequest struct {
 
 func (x *FetchSnapshotRequest) Reset() {
 	*x = FetchSnapshotRequest{}
-	mi := &file_craq_v1_transport_proto_msgTypes[42]
+	mi := &file_craq_v1_transport_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2828,7 +2915,7 @@ func (x *FetchSnapshotRequest) String() string {
 func (*FetchSnapshotRequest) ProtoMessage() {}
 
 func (x *FetchSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_craq_v1_transport_proto_msgTypes[42]
+	mi := &file_craq_v1_transport_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2841,7 +2928,7 @@ func (x *FetchSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*FetchSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_craq_v1_transport_proto_rawDescGZIP(), []int{42}
+	return file_craq_v1_transport_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *FetchSnapshotRequest) GetSlot() int32 {
@@ -2862,7 +2949,7 @@ type SnapshotEntry struct {
 
 func (x *SnapshotEntry) Reset() {
 	*x = SnapshotEntry{}
-	mi := &file_craq_v1_transport_proto_msgTypes[43]
+	mi := &file_craq_v1_transport_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2874,7 +2961,7 @@ func (x *SnapshotEntry) String() string {
 func (*SnapshotEntry) ProtoMessage() {}
 
 func (x *SnapshotEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_craq_v1_transport_proto_msgTypes[43]
+	mi := &file_craq_v1_transport_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2887,7 +2974,7 @@ func (x *SnapshotEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotEntry.ProtoReflect.Descriptor instead.
 func (*SnapshotEntry) Descriptor() ([]byte, []int) {
-	return file_craq_v1_transport_proto_rawDescGZIP(), []int{43}
+	return file_craq_v1_transport_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *SnapshotEntry) GetKey() string {
@@ -2920,7 +3007,7 @@ type FetchCommittedSequenceRequest struct {
 
 func (x *FetchCommittedSequenceRequest) Reset() {
 	*x = FetchCommittedSequenceRequest{}
-	mi := &file_craq_v1_transport_proto_msgTypes[44]
+	mi := &file_craq_v1_transport_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2932,7 +3019,7 @@ func (x *FetchCommittedSequenceRequest) String() string {
 func (*FetchCommittedSequenceRequest) ProtoMessage() {}
 
 func (x *FetchCommittedSequenceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_craq_v1_transport_proto_msgTypes[44]
+	mi := &file_craq_v1_transport_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2945,7 +3032,7 @@ func (x *FetchCommittedSequenceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchCommittedSequenceRequest.ProtoReflect.Descriptor instead.
 func (*FetchCommittedSequenceRequest) Descriptor() ([]byte, []int) {
-	return file_craq_v1_transport_proto_rawDescGZIP(), []int{44}
+	return file_craq_v1_transport_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *FetchCommittedSequenceRequest) GetSlot() int32 {
@@ -2964,7 +3051,7 @@ type FetchCommittedSequenceResponse struct {
 
 func (x *FetchCommittedSequenceResponse) Reset() {
 	*x = FetchCommittedSequenceResponse{}
-	mi := &file_craq_v1_transport_proto_msgTypes[45]
+	mi := &file_craq_v1_transport_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2976,7 +3063,7 @@ func (x *FetchCommittedSequenceResponse) String() string {
 func (*FetchCommittedSequenceResponse) ProtoMessage() {}
 
 func (x *FetchCommittedSequenceResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_craq_v1_transport_proto_msgTypes[45]
+	mi := &file_craq_v1_transport_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2989,7 +3076,7 @@ func (x *FetchCommittedSequenceResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchCommittedSequenceResponse.ProtoReflect.Descriptor instead.
 func (*FetchCommittedSequenceResponse) Descriptor() ([]byte, []int) {
-	return file_craq_v1_transport_proto_rawDescGZIP(), []int{45}
+	return file_craq_v1_transport_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *FetchCommittedSequenceResponse) GetSequence() uint64 {
@@ -3013,7 +3100,7 @@ type RoutingMismatchDetail struct {
 
 func (x *RoutingMismatchDetail) Reset() {
 	*x = RoutingMismatchDetail{}
-	mi := &file_craq_v1_transport_proto_msgTypes[46]
+	mi := &file_craq_v1_transport_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3025,7 +3112,7 @@ func (x *RoutingMismatchDetail) String() string {
 func (*RoutingMismatchDetail) ProtoMessage() {}
 
 func (x *RoutingMismatchDetail) ProtoReflect() protoreflect.Message {
-	mi := &file_craq_v1_transport_proto_msgTypes[46]
+	mi := &file_craq_v1_transport_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3038,7 +3125,7 @@ func (x *RoutingMismatchDetail) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RoutingMismatchDetail.ProtoReflect.Descriptor instead.
 func (*RoutingMismatchDetail) Descriptor() ([]byte, []int) {
-	return file_craq_v1_transport_proto_rawDescGZIP(), []int{46}
+	return file_craq_v1_transport_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *RoutingMismatchDetail) GetSlot() int32 {
@@ -3095,7 +3182,7 @@ type AmbiguousWriteDetail struct {
 
 func (x *AmbiguousWriteDetail) Reset() {
 	*x = AmbiguousWriteDetail{}
-	mi := &file_craq_v1_transport_proto_msgTypes[47]
+	mi := &file_craq_v1_transport_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3107,7 +3194,7 @@ func (x *AmbiguousWriteDetail) String() string {
 func (*AmbiguousWriteDetail) ProtoMessage() {}
 
 func (x *AmbiguousWriteDetail) ProtoReflect() protoreflect.Message {
-	mi := &file_craq_v1_transport_proto_msgTypes[47]
+	mi := &file_craq_v1_transport_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3120,7 +3207,7 @@ func (x *AmbiguousWriteDetail) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AmbiguousWriteDetail.ProtoReflect.Descriptor instead.
 func (*AmbiguousWriteDetail) Descriptor() ([]byte, []int) {
-	return file_craq_v1_transport_proto_rawDescGZIP(), []int{47}
+	return file_craq_v1_transport_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *AmbiguousWriteDetail) GetSlot() int32 {
@@ -3164,7 +3251,7 @@ type ConditionFailedDetail struct {
 
 func (x *ConditionFailedDetail) Reset() {
 	*x = ConditionFailedDetail{}
-	mi := &file_craq_v1_transport_proto_msgTypes[48]
+	mi := &file_craq_v1_transport_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3176,7 +3263,7 @@ func (x *ConditionFailedDetail) String() string {
 func (*ConditionFailedDetail) ProtoMessage() {}
 
 func (x *ConditionFailedDetail) ProtoReflect() protoreflect.Message {
-	mi := &file_craq_v1_transport_proto_msgTypes[48]
+	mi := &file_craq_v1_transport_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3189,7 +3276,7 @@ func (x *ConditionFailedDetail) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConditionFailedDetail.ProtoReflect.Descriptor instead.
 func (*ConditionFailedDetail) Descriptor() ([]byte, []int) {
-	return file_craq_v1_transport_proto_rawDescGZIP(), []int{48}
+	return file_craq_v1_transport_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *ConditionFailedDetail) GetSlot() int32 {
@@ -3240,7 +3327,7 @@ type BackpressureDetail struct {
 
 func (x *BackpressureDetail) Reset() {
 	*x = BackpressureDetail{}
-	mi := &file_craq_v1_transport_proto_msgTypes[49]
+	mi := &file_craq_v1_transport_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3252,7 +3339,7 @@ func (x *BackpressureDetail) String() string {
 func (*BackpressureDetail) ProtoMessage() {}
 
 func (x *BackpressureDetail) ProtoReflect() protoreflect.Message {
-	mi := &file_craq_v1_transport_proto_msgTypes[49]
+	mi := &file_craq_v1_transport_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3265,7 +3352,7 @@ func (x *BackpressureDetail) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackpressureDetail.ProtoReflect.Descriptor instead.
 func (*BackpressureDetail) Descriptor() ([]byte, []int) {
-	return file_craq_v1_transport_proto_rawDescGZIP(), []int{49}
+	return file_craq_v1_transport_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *BackpressureDetail) GetSlot() int32 {
@@ -3315,7 +3402,7 @@ type ReadDependencyDetail struct {
 
 func (x *ReadDependencyDetail) Reset() {
 	*x = ReadDependencyDetail{}
-	mi := &file_craq_v1_transport_proto_msgTypes[50]
+	mi := &file_craq_v1_transport_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3327,7 +3414,7 @@ func (x *ReadDependencyDetail) String() string {
 func (*ReadDependencyDetail) ProtoMessage() {}
 
 func (x *ReadDependencyDetail) ProtoReflect() protoreflect.Message {
-	mi := &file_craq_v1_transport_proto_msgTypes[50]
+	mi := &file_craq_v1_transport_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3340,7 +3427,7 @@ func (x *ReadDependencyDetail) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadDependencyDetail.ProtoReflect.Descriptor instead.
 func (*ReadDependencyDetail) Descriptor() ([]byte, []int) {
-	return file_craq_v1_transport_proto_rawDescGZIP(), []int{50}
+	return file_craq_v1_transport_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *ReadDependencyDetail) GetSlot() int32 {
@@ -3383,7 +3470,7 @@ type DomainErrorDetail struct {
 
 func (x *DomainErrorDetail) Reset() {
 	*x = DomainErrorDetail{}
-	mi := &file_craq_v1_transport_proto_msgTypes[51]
+	mi := &file_craq_v1_transport_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3395,7 +3482,7 @@ func (x *DomainErrorDetail) String() string {
 func (*DomainErrorDetail) ProtoMessage() {}
 
 func (x *DomainErrorDetail) ProtoReflect() protoreflect.Message {
-	mi := &file_craq_v1_transport_proto_msgTypes[51]
+	mi := &file_craq_v1_transport_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3408,7 +3495,7 @@ func (x *DomainErrorDetail) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DomainErrorDetail.ProtoReflect.Descriptor instead.
 func (*DomainErrorDetail) Descriptor() ([]byte, []int) {
-	return file_craq_v1_transport_proto_rawDescGZIP(), []int{51}
+	return file_craq_v1_transport_proto_rawDescGZIP(), []int{52}
 }
 
 func (x *DomainErrorDetail) GetKind() string {
@@ -3448,7 +3535,7 @@ type NotLeaderDetail struct {
 
 func (x *NotLeaderDetail) Reset() {
 	*x = NotLeaderDetail{}
-	mi := &file_craq_v1_transport_proto_msgTypes[52]
+	mi := &file_craq_v1_transport_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3460,7 +3547,7 @@ func (x *NotLeaderDetail) String() string {
 func (*NotLeaderDetail) ProtoMessage() {}
 
 func (x *NotLeaderDetail) ProtoReflect() protoreflect.Message {
-	mi := &file_craq_v1_transport_proto_msgTypes[52]
+	mi := &file_craq_v1_transport_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3473,7 +3560,7 @@ func (x *NotLeaderDetail) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NotLeaderDetail.ProtoReflect.Descriptor instead.
 func (*NotLeaderDetail) Descriptor() ([]byte, []int) {
-	return file_craq_v1_transport_proto_rawDescGZIP(), []int{52}
+	return file_craq_v1_transport_proto_rawDescGZIP(), []int{53}
 }
 
 func (x *NotLeaderDetail) GetLeaderEndpoint() string {
@@ -3681,6 +3768,12 @@ const file_craq_v1_transport_proto_rawDesc = "" +
 	"\bsequence\x18\x02 \x01(\x04R\bsequence\x12 \n" +
 	"\ffrom_node_id\x18\x03 \x01(\tR\n" +
 	"fromNodeId\x12#\n" +
+	"\rchain_version\x18\x04 \x01(\x04R\fchainVersion\"\x9e\x01\n" +
+	"\x14CommitAdvanceRequest\x12\x12\n" +
+	"\x04slot\x18\x01 \x01(\x05R\x04slot\x12+\n" +
+	"\x11committed_through\x18\x02 \x01(\x04R\x10committedThrough\x12 \n" +
+	"\ffrom_node_id\x18\x03 \x01(\tR\n" +
+	"fromNodeId\x12#\n" +
 	"\rchain_version\x18\x04 \x01(\x04R\fchainVersion\"O\n" +
 	"\x0eReplicationAck\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12#\n" +
@@ -3688,7 +3781,7 @@ const file_craq_v1_transport_proto_rawDesc = "" +
 	"\x15ReplicationSlotCredit\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\x05R\x04slot\x12\x1c\n" +
 	"\tavailable\x18\x02 \x01(\x05R\tavailable\x122\n" +
-	"\x04kind\x18\x03 \x01(\x0e2\x1e.craq.v1.ReplicationCreditKindR\x04kind\"\xb3\x02\n" +
+	"\x04kind\x18\x03 \x01(\x0e2\x1e.craq.v1.ReplicationCreditKindR\x04kind\"\xfb\x02\n" +
 	"\x10ReplicationFrame\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12C\n" +
@@ -3696,7 +3789,8 @@ const file_craq_v1_transport_proto_rawDesc = "" +
 	"\fcommit_write\x18\x03 \x01(\v2\x1b.craq.v1.CommitWriteRequestH\x00R\vcommitWrite\x12+\n" +
 	"\x03ack\x18\x04 \x01(\v2\x17.craq.v1.ReplicationAckH\x00R\x03ack\x12A\n" +
 	"\vslot_credit\x18\x05 \x01(\v2\x1e.craq.v1.ReplicationSlotCreditH\x00R\n" +
-	"slotCreditB\t\n" +
+	"slotCredit\x12F\n" +
+	"\x0ecommit_advance\x18\x06 \x01(\v2\x1d.craq.v1.CommitAdvanceRequestH\x00R\rcommitAdvanceB\t\n" +
 	"\apayload\"*\n" +
 	"\x14FetchSnapshotRequest\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\x05R\x04slot\"l\n" +
@@ -3755,11 +3849,12 @@ const file_craq_v1_transport_proto_rawDesc = "" +
 	"\x0fReadConsistency\x12 \n" +
 	"\x1cREAD_CONSISTENCY_UNSPECIFIED\x10\x00\x12!\n" +
 	"\x1dREAD_CONSISTENCY_LINEARIZABLE\x10\x01\x12$\n" +
-	" READ_CONSISTENCY_LOCAL_COMMITTED\x10\x02*\x89\x01\n" +
+	" READ_CONSISTENCY_LOCAL_COMMITTED\x10\x02*\xb5\x01\n" +
 	"\x15ReplicationCreditKind\x12'\n" +
 	"#REPLICATION_CREDIT_KIND_UNSPECIFIED\x10\x00\x12#\n" +
 	"\x1fREPLICATION_CREDIT_KIND_FORWARD\x10\x01\x12\"\n" +
-	"\x1eREPLICATION_CREDIT_KIND_COMMIT\x10\x022\x97\x06\n" +
+	"\x1eREPLICATION_CREDIT_KIND_COMMIT\x10\x02\x12*\n" +
+	"&REPLICATION_CREDIT_KIND_COMMIT_ADVANCE\x10\x032\x97\x06\n" +
 	"\x12CoordinatorService\x12<\n" +
 	"\tBootstrap\x12\x19.craq.v1.BootstrapRequest\x1a\x14.craq.v1.ServerState\x12B\n" +
 	"\fRegisterNode\x12\x1c.craq.v1.RegisterNodeRequest\x1a\x14.craq.v1.ServerState\x12C\n" +
@@ -3771,7 +3866,7 @@ const file_craq_v1_transport_proto_rawDesc = "" +
 	"\x14ReportReplicaRemoved\x12\x1d.craq.v1.ReplicaRemovedReport\x1a\x14.craq.v1.ServerState\x12:\n" +
 	"\x13ReportNodeHeartbeat\x12\x13.craq.v1.NodeStatus\x1a\x0e.craq.v1.Empty\x12B\n" +
 	"\x13ReportNodeRecovered\x12\x1b.craq.v1.NodeRecoveryReport\x1a\x0e.craq.v1.Empty\x128\n" +
-	"\x10EvaluateLiveness\x12\x0e.craq.v1.Empty\x1a\x14.craq.v1.ServerState2\xf1\b\n" +
+	"\x10EvaluateLiveness\x12\x0e.craq.v1.Empty\x1a\x14.craq.v1.ServerState2\xb1\t\n" +
 	"\x0eStorageService\x125\n" +
 	"\x03Get\x12\x19.craq.v1.ClientGetRequest\x1a\x13.craq.v1.ReadResult\x127\n" +
 	"\x03Put\x12\x19.craq.v1.ClientPutRequest\x1a\x15.craq.v1.CommitResult\x12=\n" +
@@ -3785,7 +3880,8 @@ const file_craq_v1_transport_proto_rawDesc = "" +
 	"\x0eRecoverReplica\x12\x1e.craq.v1.RecoverReplicaCommand\x1a\x0e.craq.v1.Empty\x12L\n" +
 	"\x14DropRecoveredReplica\x12$.craq.v1.DropRecoveredReplicaCommand\x1a\x0e.craq.v1.Empty\x12<\n" +
 	"\fForwardWrite\x12\x1c.craq.v1.ForwardWriteRequest\x1a\x0e.craq.v1.Empty\x12:\n" +
-	"\vCommitWrite\x12\x1b.craq.v1.CommitWriteRequest\x1a\x0e.craq.v1.Empty\x12E\n" +
+	"\vCommitWrite\x12\x1b.craq.v1.CommitWriteRequest\x1a\x0e.craq.v1.Empty\x12>\n" +
+	"\rCommitAdvance\x12\x1d.craq.v1.CommitAdvanceRequest\x1a\x0e.craq.v1.Empty\x12E\n" +
 	"\tReplicate\x12\x19.craq.v1.ReplicationFrame\x1a\x19.craq.v1.ReplicationFrame(\x010\x01\x12H\n" +
 	"\rFetchSnapshot\x12\x1d.craq.v1.FetchSnapshotRequest\x1a\x16.craq.v1.SnapshotEntry0\x01\x12i\n" +
 	"\x16FetchCommittedSequence\x12&.craq.v1.FetchCommittedSequenceRequest\x1a'.craq.v1.FetchCommittedSequenceResponseB8Z6github.com/danthegoodman1/craq/proto/craq/v1;grpcprotob\x06proto3"
@@ -3803,7 +3899,7 @@ func file_craq_v1_transport_proto_rawDescGZIP() []byte {
 }
 
 var file_craq_v1_transport_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_craq_v1_transport_proto_msgTypes = make([]protoimpl.MessageInfo, 53)
+var file_craq_v1_transport_proto_msgTypes = make([]protoimpl.MessageInfo, 54)
 var file_craq_v1_transport_proto_goTypes = []any{
 	(ComparisonOperator)(0),                // 0: craq.v1.ComparisonOperator
 	(ReadConsistency)(0),                   // 1: craq.v1.ReadConsistency
@@ -3847,20 +3943,21 @@ var file_craq_v1_transport_proto_goTypes = []any{
 	(*WriteOperation)(nil),                 // 39: craq.v1.WriteOperation
 	(*ForwardWriteRequest)(nil),            // 40: craq.v1.ForwardWriteRequest
 	(*CommitWriteRequest)(nil),             // 41: craq.v1.CommitWriteRequest
-	(*ReplicationAck)(nil),                 // 42: craq.v1.ReplicationAck
-	(*ReplicationSlotCredit)(nil),          // 43: craq.v1.ReplicationSlotCredit
-	(*ReplicationFrame)(nil),               // 44: craq.v1.ReplicationFrame
-	(*FetchSnapshotRequest)(nil),           // 45: craq.v1.FetchSnapshotRequest
-	(*SnapshotEntry)(nil),                  // 46: craq.v1.SnapshotEntry
-	(*FetchCommittedSequenceRequest)(nil),  // 47: craq.v1.FetchCommittedSequenceRequest
-	(*FetchCommittedSequenceResponse)(nil), // 48: craq.v1.FetchCommittedSequenceResponse
-	(*RoutingMismatchDetail)(nil),          // 49: craq.v1.RoutingMismatchDetail
-	(*AmbiguousWriteDetail)(nil),           // 50: craq.v1.AmbiguousWriteDetail
-	(*ConditionFailedDetail)(nil),          // 51: craq.v1.ConditionFailedDetail
-	(*BackpressureDetail)(nil),             // 52: craq.v1.BackpressureDetail
-	(*ReadDependencyDetail)(nil),           // 53: craq.v1.ReadDependencyDetail
-	(*DomainErrorDetail)(nil),              // 54: craq.v1.DomainErrorDetail
-	(*NotLeaderDetail)(nil),                // 55: craq.v1.NotLeaderDetail
+	(*CommitAdvanceRequest)(nil),           // 42: craq.v1.CommitAdvanceRequest
+	(*ReplicationAck)(nil),                 // 43: craq.v1.ReplicationAck
+	(*ReplicationSlotCredit)(nil),          // 44: craq.v1.ReplicationSlotCredit
+	(*ReplicationFrame)(nil),               // 45: craq.v1.ReplicationFrame
+	(*FetchSnapshotRequest)(nil),           // 46: craq.v1.FetchSnapshotRequest
+	(*SnapshotEntry)(nil),                  // 47: craq.v1.SnapshotEntry
+	(*FetchCommittedSequenceRequest)(nil),  // 48: craq.v1.FetchCommittedSequenceRequest
+	(*FetchCommittedSequenceResponse)(nil), // 49: craq.v1.FetchCommittedSequenceResponse
+	(*RoutingMismatchDetail)(nil),          // 50: craq.v1.RoutingMismatchDetail
+	(*AmbiguousWriteDetail)(nil),           // 51: craq.v1.AmbiguousWriteDetail
+	(*ConditionFailedDetail)(nil),          // 52: craq.v1.ConditionFailedDetail
+	(*BackpressureDetail)(nil),             // 53: craq.v1.BackpressureDetail
+	(*ReadDependencyDetail)(nil),           // 54: craq.v1.ReadDependencyDetail
+	(*DomainErrorDetail)(nil),              // 55: craq.v1.DomainErrorDetail
+	(*NotLeaderDetail)(nil),                // 56: craq.v1.NotLeaderDetail
 }
 var file_craq_v1_transport_proto_depIdxs = []int32{
 	0,  // 0: craq.v1.VersionComparison.operator:type_name -> craq.v1.ComparisonOperator
@@ -3891,69 +3988,72 @@ var file_craq_v1_transport_proto_depIdxs = []int32{
 	2,  // 25: craq.v1.ReplicationSlotCredit.kind:type_name -> craq.v1.ReplicationCreditKind
 	40, // 26: craq.v1.ReplicationFrame.forward_write:type_name -> craq.v1.ForwardWriteRequest
 	41, // 27: craq.v1.ReplicationFrame.commit_write:type_name -> craq.v1.CommitWriteRequest
-	42, // 28: craq.v1.ReplicationFrame.ack:type_name -> craq.v1.ReplicationAck
-	43, // 29: craq.v1.ReplicationFrame.slot_credit:type_name -> craq.v1.ReplicationSlotCredit
-	4,  // 30: craq.v1.SnapshotEntry.metadata:type_name -> craq.v1.ObjectMetadata
-	4,  // 31: craq.v1.ConditionFailedDetail.current_metadata:type_name -> craq.v1.ObjectMetadata
-	11, // 32: craq.v1.CoordinatorService.Bootstrap:input_type -> craq.v1.BootstrapRequest
-	13, // 33: craq.v1.CoordinatorService.RegisterNode:input_type -> craq.v1.RegisterNodeRequest
-	12, // 34: craq.v1.CoordinatorService.AddNode:input_type -> craq.v1.MembershipMutationRequest
-	12, // 35: craq.v1.CoordinatorService.BeginDrainNode:input_type -> craq.v1.MembershipMutationRequest
-	12, // 36: craq.v1.CoordinatorService.MarkNodeDead:input_type -> craq.v1.MembershipMutationRequest
-	15, // 37: craq.v1.CoordinatorService.RoutingSnapshot:input_type -> craq.v1.RoutingSnapshotRequest
-	19, // 38: craq.v1.CoordinatorService.ReportReplicaReady:input_type -> craq.v1.ReplicaReadyReport
-	20, // 39: craq.v1.CoordinatorService.ReportReplicaRemoved:input_type -> craq.v1.ReplicaRemovedReport
-	21, // 40: craq.v1.CoordinatorService.ReportNodeHeartbeat:input_type -> craq.v1.NodeStatus
-	25, // 41: craq.v1.CoordinatorService.ReportNodeRecovered:input_type -> craq.v1.NodeRecoveryReport
-	3,  // 42: craq.v1.CoordinatorService.EvaluateLiveness:input_type -> craq.v1.Empty
-	34, // 43: craq.v1.StorageService.Get:input_type -> craq.v1.ClientGetRequest
-	35, // 44: craq.v1.StorageService.Put:input_type -> craq.v1.ClientPutRequest
-	36, // 45: craq.v1.StorageService.Delete:input_type -> craq.v1.ClientDeleteRequest
-	26, // 46: craq.v1.StorageService.AddReplicaAsTail:input_type -> craq.v1.AddReplicaAsTailCommand
-	27, // 47: craq.v1.StorageService.ActivateReplica:input_type -> craq.v1.ActivateReplicaCommand
-	28, // 48: craq.v1.StorageService.MarkReplicaLeaving:input_type -> craq.v1.MarkReplicaLeavingCommand
-	29, // 49: craq.v1.StorageService.RemoveReplica:input_type -> craq.v1.RemoveReplicaCommand
-	30, // 50: craq.v1.StorageService.UpdateChainPeers:input_type -> craq.v1.UpdateChainPeersCommand
-	31, // 51: craq.v1.StorageService.ResumeRecoveredReplica:input_type -> craq.v1.ResumeRecoveredReplicaCommand
-	32, // 52: craq.v1.StorageService.RecoverReplica:input_type -> craq.v1.RecoverReplicaCommand
-	33, // 53: craq.v1.StorageService.DropRecoveredReplica:input_type -> craq.v1.DropRecoveredReplicaCommand
-	40, // 54: craq.v1.StorageService.ForwardWrite:input_type -> craq.v1.ForwardWriteRequest
-	41, // 55: craq.v1.StorageService.CommitWrite:input_type -> craq.v1.CommitWriteRequest
-	44, // 56: craq.v1.StorageService.Replicate:input_type -> craq.v1.ReplicationFrame
-	45, // 57: craq.v1.StorageService.FetchSnapshot:input_type -> craq.v1.FetchSnapshotRequest
-	47, // 58: craq.v1.StorageService.FetchCommittedSequence:input_type -> craq.v1.FetchCommittedSequenceRequest
-	14, // 59: craq.v1.CoordinatorService.Bootstrap:output_type -> craq.v1.ServerState
-	14, // 60: craq.v1.CoordinatorService.RegisterNode:output_type -> craq.v1.ServerState
-	14, // 61: craq.v1.CoordinatorService.AddNode:output_type -> craq.v1.ServerState
-	14, // 62: craq.v1.CoordinatorService.BeginDrainNode:output_type -> craq.v1.ServerState
-	14, // 63: craq.v1.CoordinatorService.MarkNodeDead:output_type -> craq.v1.ServerState
-	18, // 64: craq.v1.CoordinatorService.RoutingSnapshot:output_type -> craq.v1.RoutingSnapshotResponse
-	14, // 65: craq.v1.CoordinatorService.ReportReplicaReady:output_type -> craq.v1.ServerState
-	14, // 66: craq.v1.CoordinatorService.ReportReplicaRemoved:output_type -> craq.v1.ServerState
-	3,  // 67: craq.v1.CoordinatorService.ReportNodeHeartbeat:output_type -> craq.v1.Empty
-	3,  // 68: craq.v1.CoordinatorService.ReportNodeRecovered:output_type -> craq.v1.Empty
-	14, // 69: craq.v1.CoordinatorService.EvaluateLiveness:output_type -> craq.v1.ServerState
-	38, // 70: craq.v1.StorageService.Get:output_type -> craq.v1.ReadResult
-	37, // 71: craq.v1.StorageService.Put:output_type -> craq.v1.CommitResult
-	37, // 72: craq.v1.StorageService.Delete:output_type -> craq.v1.CommitResult
-	3,  // 73: craq.v1.StorageService.AddReplicaAsTail:output_type -> craq.v1.Empty
-	3,  // 74: craq.v1.StorageService.ActivateReplica:output_type -> craq.v1.Empty
-	3,  // 75: craq.v1.StorageService.MarkReplicaLeaving:output_type -> craq.v1.Empty
-	3,  // 76: craq.v1.StorageService.RemoveReplica:output_type -> craq.v1.Empty
-	3,  // 77: craq.v1.StorageService.UpdateChainPeers:output_type -> craq.v1.Empty
-	3,  // 78: craq.v1.StorageService.ResumeRecoveredReplica:output_type -> craq.v1.Empty
-	3,  // 79: craq.v1.StorageService.RecoverReplica:output_type -> craq.v1.Empty
-	3,  // 80: craq.v1.StorageService.DropRecoveredReplica:output_type -> craq.v1.Empty
-	3,  // 81: craq.v1.StorageService.ForwardWrite:output_type -> craq.v1.Empty
-	3,  // 82: craq.v1.StorageService.CommitWrite:output_type -> craq.v1.Empty
-	44, // 83: craq.v1.StorageService.Replicate:output_type -> craq.v1.ReplicationFrame
-	46, // 84: craq.v1.StorageService.FetchSnapshot:output_type -> craq.v1.SnapshotEntry
-	48, // 85: craq.v1.StorageService.FetchCommittedSequence:output_type -> craq.v1.FetchCommittedSequenceResponse
-	59, // [59:86] is the sub-list for method output_type
-	32, // [32:59] is the sub-list for method input_type
-	32, // [32:32] is the sub-list for extension type_name
-	32, // [32:32] is the sub-list for extension extendee
-	0,  // [0:32] is the sub-list for field type_name
+	43, // 28: craq.v1.ReplicationFrame.ack:type_name -> craq.v1.ReplicationAck
+	44, // 29: craq.v1.ReplicationFrame.slot_credit:type_name -> craq.v1.ReplicationSlotCredit
+	42, // 30: craq.v1.ReplicationFrame.commit_advance:type_name -> craq.v1.CommitAdvanceRequest
+	4,  // 31: craq.v1.SnapshotEntry.metadata:type_name -> craq.v1.ObjectMetadata
+	4,  // 32: craq.v1.ConditionFailedDetail.current_metadata:type_name -> craq.v1.ObjectMetadata
+	11, // 33: craq.v1.CoordinatorService.Bootstrap:input_type -> craq.v1.BootstrapRequest
+	13, // 34: craq.v1.CoordinatorService.RegisterNode:input_type -> craq.v1.RegisterNodeRequest
+	12, // 35: craq.v1.CoordinatorService.AddNode:input_type -> craq.v1.MembershipMutationRequest
+	12, // 36: craq.v1.CoordinatorService.BeginDrainNode:input_type -> craq.v1.MembershipMutationRequest
+	12, // 37: craq.v1.CoordinatorService.MarkNodeDead:input_type -> craq.v1.MembershipMutationRequest
+	15, // 38: craq.v1.CoordinatorService.RoutingSnapshot:input_type -> craq.v1.RoutingSnapshotRequest
+	19, // 39: craq.v1.CoordinatorService.ReportReplicaReady:input_type -> craq.v1.ReplicaReadyReport
+	20, // 40: craq.v1.CoordinatorService.ReportReplicaRemoved:input_type -> craq.v1.ReplicaRemovedReport
+	21, // 41: craq.v1.CoordinatorService.ReportNodeHeartbeat:input_type -> craq.v1.NodeStatus
+	25, // 42: craq.v1.CoordinatorService.ReportNodeRecovered:input_type -> craq.v1.NodeRecoveryReport
+	3,  // 43: craq.v1.CoordinatorService.EvaluateLiveness:input_type -> craq.v1.Empty
+	34, // 44: craq.v1.StorageService.Get:input_type -> craq.v1.ClientGetRequest
+	35, // 45: craq.v1.StorageService.Put:input_type -> craq.v1.ClientPutRequest
+	36, // 46: craq.v1.StorageService.Delete:input_type -> craq.v1.ClientDeleteRequest
+	26, // 47: craq.v1.StorageService.AddReplicaAsTail:input_type -> craq.v1.AddReplicaAsTailCommand
+	27, // 48: craq.v1.StorageService.ActivateReplica:input_type -> craq.v1.ActivateReplicaCommand
+	28, // 49: craq.v1.StorageService.MarkReplicaLeaving:input_type -> craq.v1.MarkReplicaLeavingCommand
+	29, // 50: craq.v1.StorageService.RemoveReplica:input_type -> craq.v1.RemoveReplicaCommand
+	30, // 51: craq.v1.StorageService.UpdateChainPeers:input_type -> craq.v1.UpdateChainPeersCommand
+	31, // 52: craq.v1.StorageService.ResumeRecoveredReplica:input_type -> craq.v1.ResumeRecoveredReplicaCommand
+	32, // 53: craq.v1.StorageService.RecoverReplica:input_type -> craq.v1.RecoverReplicaCommand
+	33, // 54: craq.v1.StorageService.DropRecoveredReplica:input_type -> craq.v1.DropRecoveredReplicaCommand
+	40, // 55: craq.v1.StorageService.ForwardWrite:input_type -> craq.v1.ForwardWriteRequest
+	41, // 56: craq.v1.StorageService.CommitWrite:input_type -> craq.v1.CommitWriteRequest
+	42, // 57: craq.v1.StorageService.CommitAdvance:input_type -> craq.v1.CommitAdvanceRequest
+	45, // 58: craq.v1.StorageService.Replicate:input_type -> craq.v1.ReplicationFrame
+	46, // 59: craq.v1.StorageService.FetchSnapshot:input_type -> craq.v1.FetchSnapshotRequest
+	48, // 60: craq.v1.StorageService.FetchCommittedSequence:input_type -> craq.v1.FetchCommittedSequenceRequest
+	14, // 61: craq.v1.CoordinatorService.Bootstrap:output_type -> craq.v1.ServerState
+	14, // 62: craq.v1.CoordinatorService.RegisterNode:output_type -> craq.v1.ServerState
+	14, // 63: craq.v1.CoordinatorService.AddNode:output_type -> craq.v1.ServerState
+	14, // 64: craq.v1.CoordinatorService.BeginDrainNode:output_type -> craq.v1.ServerState
+	14, // 65: craq.v1.CoordinatorService.MarkNodeDead:output_type -> craq.v1.ServerState
+	18, // 66: craq.v1.CoordinatorService.RoutingSnapshot:output_type -> craq.v1.RoutingSnapshotResponse
+	14, // 67: craq.v1.CoordinatorService.ReportReplicaReady:output_type -> craq.v1.ServerState
+	14, // 68: craq.v1.CoordinatorService.ReportReplicaRemoved:output_type -> craq.v1.ServerState
+	3,  // 69: craq.v1.CoordinatorService.ReportNodeHeartbeat:output_type -> craq.v1.Empty
+	3,  // 70: craq.v1.CoordinatorService.ReportNodeRecovered:output_type -> craq.v1.Empty
+	14, // 71: craq.v1.CoordinatorService.EvaluateLiveness:output_type -> craq.v1.ServerState
+	38, // 72: craq.v1.StorageService.Get:output_type -> craq.v1.ReadResult
+	37, // 73: craq.v1.StorageService.Put:output_type -> craq.v1.CommitResult
+	37, // 74: craq.v1.StorageService.Delete:output_type -> craq.v1.CommitResult
+	3,  // 75: craq.v1.StorageService.AddReplicaAsTail:output_type -> craq.v1.Empty
+	3,  // 76: craq.v1.StorageService.ActivateReplica:output_type -> craq.v1.Empty
+	3,  // 77: craq.v1.StorageService.MarkReplicaLeaving:output_type -> craq.v1.Empty
+	3,  // 78: craq.v1.StorageService.RemoveReplica:output_type -> craq.v1.Empty
+	3,  // 79: craq.v1.StorageService.UpdateChainPeers:output_type -> craq.v1.Empty
+	3,  // 80: craq.v1.StorageService.ResumeRecoveredReplica:output_type -> craq.v1.Empty
+	3,  // 81: craq.v1.StorageService.RecoverReplica:output_type -> craq.v1.Empty
+	3,  // 82: craq.v1.StorageService.DropRecoveredReplica:output_type -> craq.v1.Empty
+	3,  // 83: craq.v1.StorageService.ForwardWrite:output_type -> craq.v1.Empty
+	3,  // 84: craq.v1.StorageService.CommitWrite:output_type -> craq.v1.Empty
+	3,  // 85: craq.v1.StorageService.CommitAdvance:output_type -> craq.v1.Empty
+	45, // 86: craq.v1.StorageService.Replicate:output_type -> craq.v1.ReplicationFrame
+	47, // 87: craq.v1.StorageService.FetchSnapshot:output_type -> craq.v1.SnapshotEntry
+	49, // 88: craq.v1.StorageService.FetchCommittedSequence:output_type -> craq.v1.FetchCommittedSequenceResponse
+	61, // [61:89] is the sub-list for method output_type
+	33, // [33:61] is the sub-list for method input_type
+	33, // [33:33] is the sub-list for extension type_name
+	33, // [33:33] is the sub-list for extension extendee
+	0,  // [0:33] is the sub-list for field type_name
 }
 
 func init() { file_craq_v1_transport_proto_init() }
@@ -3961,11 +4061,12 @@ func file_craq_v1_transport_proto_init() {
 	if File_craq_v1_transport_proto != nil {
 		return
 	}
-	file_craq_v1_transport_proto_msgTypes[41].OneofWrappers = []any{
+	file_craq_v1_transport_proto_msgTypes[42].OneofWrappers = []any{
 		(*ReplicationFrame_ForwardWrite)(nil),
 		(*ReplicationFrame_CommitWrite)(nil),
 		(*ReplicationFrame_Ack)(nil),
 		(*ReplicationFrame_SlotCredit)(nil),
+		(*ReplicationFrame_CommitAdvance)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -3973,7 +4074,7 @@ func file_craq_v1_transport_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_craq_v1_transport_proto_rawDesc), len(file_craq_v1_transport_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   53,
+			NumMessages:   54,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

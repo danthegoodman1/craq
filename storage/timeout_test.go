@@ -268,6 +268,10 @@ func (t *blockingWriteTransport) CommitWrite(context.Context, string, CommitWrit
 	return nil
 }
 
+func (t *blockingWriteTransport) CommitAdvance(context.Context, string, CommitAdvanceRequest) error {
+	return nil
+}
+
 func (t *blockingWriteTransport) AwaitWriteCommit(ctx context.Context, check func() bool) error {
 	if check() {
 		return nil
@@ -335,6 +339,14 @@ func (t *asyncWriteTransport) CommitWrite(ctx context.Context, toNodeID string, 
 		return ErrSnapshotSourceUnavailable
 	}
 	return node.HandleCommitWrite(ctx, req)
+}
+
+func (t *asyncWriteTransport) CommitAdvance(ctx context.Context, toNodeID string, req CommitAdvanceRequest) error {
+	node, ok := t.nodes[toNodeID]
+	if !ok {
+		return ErrSnapshotSourceUnavailable
+	}
+	return node.HandleCommitAdvance(ctx, req)
 }
 
 func (t *asyncWriteTransport) DeliverNextForward(ctx context.Context) error {

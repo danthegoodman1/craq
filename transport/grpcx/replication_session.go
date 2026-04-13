@@ -267,6 +267,36 @@ func (p replicationCommitPayload) sequence() uint64 {
 	return p.req.Sequence
 }
 
+type replicationCommitAdvancePayload struct {
+	req storage.CommitAdvanceRequest
+}
+
+func (p replicationCommitAdvancePayload) toFrame(requestID uint64) *grpcproto.ReplicationFrame {
+	return &grpcproto.ReplicationFrame{
+		RequestId: requestID,
+		Payload: &grpcproto.ReplicationFrame_CommitAdvance{
+			CommitAdvance: &grpcproto.CommitAdvanceRequest{
+				Slot:             int32(p.req.Slot),
+				CommittedThrough: p.req.CommittedThrough,
+				FromNodeId:       p.req.FromNodeID,
+				ChainVersion:     p.req.ChainVersion,
+			},
+		},
+	}
+}
+
+func (replicationCommitAdvancePayload) kind() string {
+	return "commit_advance"
+}
+
+func (p replicationCommitAdvancePayload) slot() int {
+	return p.req.Slot
+}
+
+func (p replicationCommitAdvancePayload) sequence() uint64 {
+	return p.req.CommittedThrough
+}
+
 func (s *replicationPeerSession) debugStateFor(kind string, slot int) *replicationSlotState {
 	key := replicationSlotKindKey{kind: kind, slot: slot}
 	state, ok := s.diag[key]
@@ -386,8 +416,8 @@ func (s *replicationPeerSession) recordCanceledBacklog(req *outboundReplicationR
 func (s *replicationPeerSession) slotSnapshots(slot int) []storage.ReplicationSessionSlotSnapshot {
 	s.diagMu.Lock()
 	defer s.diagMu.Unlock()
-	out := make([]storage.ReplicationSessionSlotSnapshot, 0, 2)
-	for _, kind := range []string{"forward", "commit"} {
+	out := make([]storage.ReplicationSessionSlotSnapshot, 0, 3)
+	for _, kind := range []string{"forward", "commit", "commit_advance"} {
 		state, ok := s.diag[replicationSlotKindKey{kind: kind, slot: slot}]
 		if !ok {
 			continue
@@ -594,6 +624,8 @@ func (s *replicationPeerSession) run() {
 			switch payload.SlotCredit.GetKind() {
 			case grpcproto.ReplicationCreditKind_REPLICATION_CREDIT_KIND_COMMIT:
 				kind = "commit"
+			case grpcproto.ReplicationCreditKind_REPLICATION_CREDIT_KIND_COMMIT_ADVANCE:
+				kind = "commit_advance"
 			case grpcproto.ReplicationCreditKind_REPLICATION_CREDIT_KIND_FORWARD:
 				kind = "forward"
 			}

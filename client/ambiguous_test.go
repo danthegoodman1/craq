@@ -215,6 +215,7 @@ func newAmbiguousRouterHarness(t *testing.T, blockAwait bool) *ambiguousRouterHa
 type replicationTestNode interface {
 	HandleForwardWrite(ctx context.Context, req storage.ForwardWriteRequest) error
 	HandleCommitWrite(ctx context.Context, req storage.CommitWriteRequest) error
+	HandleCommitAdvance(ctx context.Context, req storage.CommitAdvanceRequest) error
 }
 
 type capturedForward struct {
@@ -304,6 +305,16 @@ func (t *manualAmbiguousReplicationTransport) CommitWrite(ctx context.Context, t
 		return fmt.Errorf("%w: node %q", storage.ErrSnapshotSourceUnavailable, toNodeID)
 	}
 	return node.HandleCommitWrite(ctx, req)
+}
+
+func (t *manualAmbiguousReplicationTransport) CommitAdvance(ctx context.Context, toNodeID string, req storage.CommitAdvanceRequest) error {
+	t.mu.Lock()
+	node, ok := t.nodes[toNodeID]
+	t.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("%w: node %q", storage.ErrSnapshotSourceUnavailable, toNodeID)
+	}
+	return node.HandleCommitAdvance(ctx, req)
 }
 
 func (t *manualAmbiguousReplicationTransport) AwaitWriteCommit(ctx context.Context, check func() bool) error {

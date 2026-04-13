@@ -302,18 +302,23 @@ func writeTraceCommitAcceptReceivedStage(role ReplicaRole) string {
 }
 
 type pipelineMetrics struct {
-	commitFlushDuration *prometheus.HistogramVec
-	commitOwnerCallback *prometheus.HistogramVec
-	commitBatchOps      prometheus.Histogram
-	commitBatchSlots    prometheus.Histogram
-	commitBatchBytes    prometheus.Histogram
-	confirmBatchCount   prometheus.Histogram
-	coalescedConfirms   prometheus.Counter
-	journalPendingItems *prometheus.GaugeVec
-	journalPendingSlots *prometheus.GaugeVec
-	journalPendingConfs *prometheus.GaugeVec
-	sessionQueueWait    *prometheus.HistogramVec
-	sessionQueueDepth   *prometheus.GaugeVec
+	commitFlushDuration    *prometheus.HistogramVec
+	commitOwnerCallback    *prometheus.HistogramVec
+	commitBatchOps         prometheus.Histogram
+	commitBatchSlots       prometheus.Histogram
+	commitBatchBytes       prometheus.Histogram
+	confirmBatchCount      prometheus.Histogram
+	coalescedConfirms      prometheus.Counter
+	journalFlushStage      *prometheus.HistogramVec
+	journalFlushBatchOps   *prometheus.HistogramVec
+	journalFlushBatchBytes *prometheus.HistogramVec
+	journalFlushBatchSlots *prometheus.HistogramVec
+	journalFlushRecords    *prometheus.CounterVec
+	journalPendingItems    *prometheus.GaugeVec
+	journalPendingSlots    *prometheus.GaugeVec
+	journalPendingConfs    *prometheus.GaugeVec
+	sessionQueueWait       *prometheus.HistogramVec
+	sessionQueueDepth      *prometheus.GaugeVec
 }
 
 func newPipelineMetrics(registry *prometheus.Registry) *pipelineMetrics {
@@ -355,6 +360,30 @@ func newPipelineMetrics(registry *prometheus.Registry) *pipelineMetrics {
 			Name: "craq_storage_confirm_coalesced_total",
 			Help: "Upstream confirm intents merged into an existing pending confirm item.",
 		}),
+		journalFlushStage: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "craq_storage_journal_flush_stage_seconds",
+			Help:    "Breakdown of journal append batches by flush sub-stage.",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"stage", "shard", "result", "experiment"}),
+		journalFlushBatchOps: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "craq_storage_journal_flush_batch_ops",
+			Help:    "Operations appended in a journal flush batch.",
+			Buckets: []float64{1, 2, 4, 8, 16, 32, 64, 128},
+		}, []string{"shard", "experiment"}),
+		journalFlushBatchBytes: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "craq_storage_journal_flush_batch_bytes",
+			Help:    "Encoded bytes appended in a journal flush batch.",
+			Buckets: []float64{256, 512, 1024, 2048, 4096, 8192, 16384, 65536, 262144, 1048576},
+		}, []string{"shard", "experiment"}),
+		journalFlushBatchSlots: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "craq_storage_journal_flush_batch_slots",
+			Help:    "Unique slots touched by a journal flush batch.",
+			Buckets: []float64{1, 2, 4, 8, 16, 32, 64},
+		}, []string{"shard", "experiment"}),
+		journalFlushRecords: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "craq_storage_journal_flush_records_total",
+			Help: "Journal records appended by type.",
+		}, []string{"type", "shard", "experiment"}),
 		journalPendingItems: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "craq_storage_journal_pending_commit_items",
 			Help: "Current pending commit items per journal shard.",
@@ -385,6 +414,11 @@ func newPipelineMetrics(registry *prometheus.Registry) *pipelineMetrics {
 		m.commitBatchBytes,
 		m.confirmBatchCount,
 		m.coalescedConfirms,
+		m.journalFlushStage,
+		m.journalFlushBatchOps,
+		m.journalFlushBatchBytes,
+		m.journalFlushBatchSlots,
+		m.journalFlushRecords,
 		m.journalPendingItems,
 		m.journalPendingSlots,
 		m.journalPendingConfs,
@@ -448,6 +482,46 @@ func (n *Node) observeJournalCoalescedConfirm(count int) {
 		return
 	}
 	n.pipelineMetrics.coalescedConfirms.Add(float64(count))
+}
+
+func (n *Node) observeJournalFlushBreakdown(shard int, report journalAppendReport, result string) {
+	if n == nil || n.pipelineMetrics == nil {
+		return
+	}
+	if result == "" {
+		result = writeStageResultSuccess
+	}
+	experiment := string(NormalizeJournalExperiment(report.Experiment))
+	if experiment == "" {
+		experiment = string(defaultJournalExperiment)
+	}
+	shardLabel := strconv.Itoa(shard)
+	for stage, dur := range map[string]time.Duration{
+		"encode": report.Encode,
+		"write":  report.Write,
+		"sync":   report.Sync,
+		"total":  report.Total,
+	} {
+		if dur <= 0 {
+			continue
+		}
+		n.pipelineMetrics.journalFlushStage.WithLabelValues(stage, shardLabel, result, experiment).Observe(dur.Seconds())
+	}
+	if report.BatchOps > 0 {
+		n.pipelineMetrics.journalFlushBatchOps.WithLabelValues(shardLabel, experiment).Observe(float64(report.BatchOps))
+	}
+	if report.BatchBytes > 0 {
+		n.pipelineMetrics.journalFlushBatchBytes.WithLabelValues(shardLabel, experiment).Observe(float64(report.BatchBytes))
+	}
+	if report.Slots > 0 {
+		n.pipelineMetrics.journalFlushBatchSlots.WithLabelValues(shardLabel, experiment).Observe(float64(report.Slots))
+	}
+	for recordType, count := range report.Records {
+		if count <= 0 {
+			continue
+		}
+		n.pipelineMetrics.journalFlushRecords.WithLabelValues(string(recordType), shardLabel, experiment).Add(float64(count))
+	}
 }
 
 func (n *Node) observeJournalShardPending(shard int, commitItems int, commitSlots int, confirmItems int) {

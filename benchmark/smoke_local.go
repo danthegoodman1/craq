@@ -235,6 +235,7 @@ func runLocalSmoke(ctx context.Context, runDir string, state RunState, manifest 
 			JournalBatchDelayHigh:      state.Profile.Storage.JournalBatchDelayHigh,
 			JournalBatchDepthThreshold: state.Profile.Storage.JournalBatchDepthThreshold,
 			JournalBatchMaxOps:         state.Profile.Storage.JournalBatchMaxOps,
+			JournalExperiment:          state.Profile.Storage.JournalExperiment,
 		}
 		if err := SaveJSON(filepath.Join(runDir, "rendered", "local", "storage-"+nodeID+".json"), cfg); err != nil {
 			return LocalSmokeReport{}, err

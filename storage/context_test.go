@@ -34,6 +34,7 @@ func TestMarkReplicaLeavingHonorsContextDuringPersist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenNode returned error: %v", err)
 	}
+	t.Cleanup(func() { _ = node.Close() })
 	mustActivateReplica(t, node, 1, ReplicaAssignment{Slot: 1, ChainVersion: 1, Role: ReplicaRoleSingle})
 
 	local.blockUpsert = true
@@ -59,6 +60,7 @@ func TestUpdateChainPeersHonorsContextDuringPersist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenNode returned error: %v", err)
 	}
+	t.Cleanup(func() { _ = node.Close() })
 	mustActivateReplica(t, node, 1, ReplicaAssignment{Slot: 1, ChainVersion: 1, Role: ReplicaRoleSingle})
 
 	local.blockUpsert = true
@@ -90,6 +92,7 @@ func TestHandleClientPutSingleReplicaReturnsAmbiguousOnPersistCancellation(t *te
 	if err != nil {
 		t.Fatalf("OpenNode returned error: %v", err)
 	}
+	t.Cleanup(func() { _ = node.Close() })
 	mustActivateReplica(t, node, 4, ReplicaAssignment{Slot: 4, ChainVersion: 1, Role: ReplicaRoleSingle})
 
 	local.blockUpsert = true
@@ -118,7 +121,7 @@ func TestHandleClientPutSingleReplicaReturnsAmbiguousOnPersistCancellation(t *te
 	waitForCommittedSnapshotValues(t, node, 4, map[string]string{"k": "v"})
 }
 
-func TestTailHandleForwardWriteHonorsContextDuringCommitPersist(t *testing.T) {
+func TestTailHandleForwardWriteDecouplesFromCanceledPersistContext(t *testing.T) {
 	ctx := context.Background()
 	local := &blockingLocalStateStore{inner: NewInMemoryLocalStateStore()}
 	repl := NewInMemoryReplicationTransport()
@@ -126,6 +129,7 @@ func TestTailHandleForwardWriteHonorsContextDuringCommitPersist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenNode returned error: %v", err)
 	}
+	t.Cleanup(func() { _ = node.Close() })
 	repl.RegisterNode("tail", node)
 	mustActivateReplica(t, node, 6, ReplicaAssignment{
 		Slot:         6,
@@ -146,11 +150,8 @@ func TestTailHandleForwardWriteHonorsContextDuringCommitPersist(t *testing.T) {
 		FromNodeID:   "head",
 		ChainVersion: 1,
 	})
-	if err == nil {
-		t.Fatal("HandleForwardWrite unexpectedly succeeded")
-	}
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("error = %v, want context canceled", err)
+	if err != nil {
+		t.Fatalf("HandleForwardWrite returned error: %v", err)
 	}
 	waitForCommittedSnapshotValues(t, node, 6, map[string]string{"k": "v"})
 }
@@ -162,6 +163,7 @@ func TestHandleCommitWriteHonorsContextDuringCommitPersist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenNode returned error: %v", err)
 	}
+	t.Cleanup(func() { _ = node.Close() })
 	mustActivateReplica(t, node, 7, ReplicaAssignment{
 		Slot:         7,
 		ChainVersion: 1,

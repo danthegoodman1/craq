@@ -1,4 +1,4 @@
-name: local-put-scaling-ramdisk
+name: local-put-scaling-ramdisk-candidate-b
 gcp:
   project: CHANGEME_LOCAL_ONLY_PROFILE_DO_NOT_RUN
   region: us-central1
@@ -14,11 +14,10 @@ local:
   ramdisk_size_mib: 8192
 storage:
   journal_shards: 16
-  journal_batch_delay_low: 50us
-  journal_batch_delay_high: 250us
-  journal_batch_depth_threshold: 8
-  journal_batch_max_ops: 64
-  journal_experiment: baseline_json_sync
+  journal_batch_delay_low: 25us
+  journal_batch_delay_high: 75us
+  journal_batch_depth_threshold: 4
+  journal_batch_max_ops: 32
 cluster:
   slot_count: 1024
   replication_factor: 3

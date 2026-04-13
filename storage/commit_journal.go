@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -20,6 +21,7 @@ const (
 	defaultJournalBatchLowDepthLimit = 8
 	defaultJournalBatchMaxOps        = 64
 	defaultJournalBatchMaxBytes      = 1 << 20
+	defaultJournalPriorityWatermarks = 8
 	defaultMaterializeBatchMaxOps    = 128
 	defaultMaterializeBatchDelay     = 250 * time.Microsecond
 	defaultMaterializeRetryDelay     = 5 * time.Millisecond
@@ -32,6 +34,7 @@ type journalConfig struct {
 	batchDelayHigh      time.Duration
 	batchDepthThreshold int
 	batchMaxOps         int
+	experiment          JournalExperiment
 }
 
 func resolvedJournalConfig(cfg Config) journalConfig {
@@ -41,6 +44,7 @@ func resolvedJournalConfig(cfg Config) journalConfig {
 		batchDelayHigh:      cfg.JournalBatchDelayHigh,
 		batchDepthThreshold: cfg.JournalBatchDepthThreshold,
 		batchMaxOps:         cfg.JournalBatchMaxOps,
+		experiment:          NormalizeJournalExperiment(cfg.JournalExperiment),
 	}
 	if journal.shardCount <= 0 {
 		journal.shardCount = defaultJournalShardCount
@@ -60,11 +64,14 @@ func resolvedJournalConfig(cfg Config) journalConfig {
 	if journal.batchDelayLow > journal.batchDelayHigh {
 		journal.batchDelayLow = journal.batchDelayHigh
 	}
+	if journal.experiment == "" {
+		journal.experiment = defaultJournalExperiment
+	}
 	return journal
 }
 
 type CommitJournalStore interface {
-	AppendBatch(records []journalRecord) error
+	AppendBatch(records []journalRecord) (journalAppendReport, error)
 	Replay(apply func(journalRecord) error) error
 	Close() error
 }
@@ -79,11 +86,20 @@ type commitJournalShardProvider interface {
 	CommitJournalShard(nodeID string, shard int) (commitJournalStore, error)
 }
 
+type commitJournalProviderWithOptions interface {
+	CommitJournalWithOptions(nodeID string, opts CommitJournalOpenOptions) (commitJournalStore, error)
+}
+
+type commitJournalShardProviderWithOptions interface {
+	CommitJournalShardWithOptions(nodeID string, shard int, opts CommitJournalOpenOptions) (commitJournalStore, error)
+}
+
 type journalRecordType string
 
 const (
 	journalRecordTypePrepare         journalRecordType = "prepare"
 	journalRecordTypeCommitWatermark journalRecordType = "commit_watermark"
+	journalRecordTypeHeadCommitRange journalRecordType = "head_commit_range"
 	journalRecordTypeUpstreamConfirm journalRecordType = "upstream_confirm"
 	journalRecordTypeLegacyCommit    journalRecordType = "commit"
 )
@@ -129,6 +145,15 @@ func journalRecordFromCommitWatermark(assignment ReplicaAssignment, sequence uin
 	}
 }
 
+func journalRecordFromHeadCommitRange(assignment ReplicaAssignment, sequence uint64) journalRecord {
+	return journalRecord{
+		Type:         journalRecordTypeHeadCommitRange,
+		Slot:         assignment.Slot,
+		ChainVersion: assignment.ChainVersion,
+		Sequence:     sequence,
+	}
+}
+
 func journalRecordFromUpstreamConfirm(assignment ReplicaAssignment, sequence uint64) journalRecord {
 	return journalRecord{
 		Type:         journalRecordTypeUpstreamConfirm,
@@ -163,57 +188,300 @@ func cloneJournalRecord(record journalRecord) journalRecord {
 	}
 }
 
-type fileCommitJournal struct {
-	path string
-	file *os.File
-	mu   sync.Mutex
+type journalAppendReport struct {
+	Experiment JournalExperiment
+	BatchOps   int
+	BatchBytes int
+	Slots      int
+	Records    map[journalRecordType]int
+	Encode     time.Duration
+	Write      time.Duration
+	Sync       time.Duration
+	Total      time.Duration
 }
 
-func openFileCommitJournal(path string) (*fileCommitJournal, error) {
+type fileCommitJournal struct {
+	path       string
+	file       *os.File
+	segmentDir string
+	segmentSeq int
+	segmentCap int64
+	mu         sync.Mutex
+	opts       CommitJournalOpenOptions
+}
+
+const binarySegmentSizeBytes = 8 << 20
+
+func openFileCommitJournal(path string, opts CommitJournalOpenOptions) (*fileCommitJournal, error) {
 	if path == "" {
 		return nil, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("mkdir commit journal dir: %w", err)
+	opts.Experiment = NormalizeJournalExperiment(opts.Experiment)
+	if opts.Experiment == "" {
+		opts.Experiment = defaultJournalExperiment
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("open commit journal: %w", err)
+	journal := &fileCommitJournal{
+		path:       path,
+		opts:       opts,
+		segmentCap: binarySegmentSizeBytes,
 	}
-	return &fileCommitJournal{path: path, file: file}, nil
+	switch opts.Experiment {
+	case JournalExperimentBinarySegmentSync:
+		journal.segmentDir = path + ".segments"
+		if err := os.MkdirAll(journal.segmentDir, 0o755); err != nil {
+			return nil, fmt.Errorf("mkdir commit journal segment dir: %w", err)
+		}
+		file, seq, err := openLatestSegmentFile(journal.segmentDir)
+		if err != nil {
+			return nil, err
+		}
+		journal.file = file
+		journal.segmentSeq = seq
+	default:
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return nil, fmt.Errorf("mkdir commit journal dir: %w", err)
+		}
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+		if err != nil {
+			return nil, fmt.Errorf("open commit journal: %w", err)
+		}
+		journal.file = file
+	}
+	return journal, nil
 }
 
 func OpenFileCommitJournalForLocalState(path string) (CommitJournalStore, error) {
-	return openFileCommitJournal(path)
+	return openFileCommitJournal(path, CommitJournalOpenOptions{})
 }
 
-func (j *fileCommitJournal) AppendBatch(records []journalRecord) error {
+func OpenFileCommitJournalForLocalStateWithOptions(path string, opts CommitJournalOpenOptions) (CommitJournalStore, error) {
+	return openFileCommitJournal(path, opts)
+}
+
+func (j *fileCommitJournal) AppendBatch(records []journalRecord) (journalAppendReport, error) {
 	if j == nil || j.file == nil || len(records) == 0 {
-		return nil
+		return journalAppendReport{}, nil
 	}
+	report := journalAppendReport{
+		Experiment: j.opts.Experiment,
+		Records:    countJournalRecordTypes(records),
+		BatchOps:   len(records),
+		Slots:      countJournalRecordSlots(records),
+	}
+	totalStarted := time.Now()
+	encodeStarted := time.Now()
+	payload, err := j.encodeRecords(records)
+	report.Encode = time.Since(encodeStarted)
+	if err != nil {
+		return report, err
+	}
+	report.BatchBytes = len(payload)
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	writeStarted := time.Now()
+	if err := j.appendPayload(payload); err != nil {
+		return report, err
+	}
+	report.Write = time.Since(writeStarted)
+	if j.opts.Experiment != JournalExperimentNoSyncBound {
+		syncStarted := time.Now()
+		if err := j.file.Sync(); err != nil {
+			return report, fmt.Errorf("sync commit journal: %w", err)
+		}
+		report.Sync = time.Since(syncStarted)
+	}
+	report.Total = time.Since(totalStarted)
+	return report, nil
+}
+
+func countJournalRecordTypes(records []journalRecord) map[journalRecordType]int {
+	out := make(map[journalRecordType]int, len(records))
+	for _, record := range records {
+		out[record.recordType()]++
+	}
+	return out
+}
+
+func countJournalRecordSlots(records []journalRecord) int {
+	if len(records) == 0 {
+		return 0
+	}
+	seen := make(map[int]struct{}, len(records))
+	for _, record := range records {
+		seen[record.Slot] = struct{}{}
+	}
+	return len(seen)
+}
+
+func (j *fileCommitJournal) encodeRecords(records []journalRecord) ([]byte, error) {
+	switch j.opts.Experiment {
+	case JournalExperimentBinarySync, JournalExperimentBinarySegmentSync:
+		return encodeBinaryJournalRecords(records)
+	default:
+		return encodeJSONJournalRecords(records)
+	}
+}
+
+func encodeJSONJournalRecords(records []journalRecord) ([]byte, error) {
 	var buf bytes.Buffer
 	for _, record := range records {
 		payload, err := json.Marshal(record)
 		if err != nil {
-			return fmt.Errorf("marshal journal record: %w", err)
+			return nil, fmt.Errorf("marshal journal record: %w", err)
 		}
 		if len(payload) > int(^uint32(0)) {
-			return fmt.Errorf("%w: journal record too large", ErrInvalidConfig)
+			return nil, fmt.Errorf("%w: journal record too large", ErrInvalidConfig)
 		}
 		var lenBuf [4]byte
 		binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(payload)))
 		buf.Write(lenBuf[:])
 		buf.Write(payload)
 	}
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	if _, err := j.file.Write(buf.Bytes()); err != nil {
+	return buf.Bytes(), nil
+}
+
+const binaryJournalHeaderSize = 68
+
+func encodeBinaryJournalRecords(records []journalRecord) ([]byte, error) {
+	var buf bytes.Buffer
+	for _, record := range records {
+		keyBytes := []byte(record.Key)
+		valueBytes := []byte(record.Value)
+		if len(keyBytes) > int(^uint32(0)) || len(valueBytes) > int(^uint32(0)) {
+			return nil, fmt.Errorf("%w: journal record payload too large", ErrInvalidConfig)
+		}
+		header := make([]byte, binaryJournalHeaderSize)
+		header[0] = encodeJournalRecordType(record.recordType())
+		header[1] = encodeOperationKind(record.Kind)
+		binary.LittleEndian.PutUint64(header[4:12], uint64(record.Slot))
+		binary.LittleEndian.PutUint64(header[12:20], record.ChainVersion)
+		binary.LittleEndian.PutUint64(header[20:28], record.Sequence)
+		binary.LittleEndian.PutUint64(header[28:36], record.Metadata.Version)
+		binary.LittleEndian.PutUint64(header[36:44], uint64(record.Metadata.CreatedAt.UTC().UnixNano()))
+		binary.LittleEndian.PutUint64(header[44:52], uint64(record.Metadata.UpdatedAt.UTC().UnixNano()))
+		binary.LittleEndian.PutUint64(header[52:60], record.UpstreamConfirmedSequence)
+		binary.LittleEndian.PutUint32(header[60:64], uint32(len(keyBytes)))
+		binary.LittleEndian.PutUint32(header[64:68], uint32(len(valueBytes)))
+		buf.Write(header)
+		buf.Write(keyBytes)
+		buf.Write(valueBytes)
+	}
+	return buf.Bytes(), nil
+}
+
+func encodeJournalRecordType(recordType journalRecordType) byte {
+	switch recordType {
+	case journalRecordTypePrepare:
+		return 1
+	case journalRecordTypeCommitWatermark:
+		return 2
+	case journalRecordTypeHeadCommitRange:
+		return 3
+	case journalRecordTypeUpstreamConfirm:
+		return 4
+	default:
+		return 0
+	}
+}
+
+func decodeJournalRecordType(code byte) journalRecordType {
+	switch code {
+	case 1:
+		return journalRecordTypePrepare
+	case 2:
+		return journalRecordTypeCommitWatermark
+	case 3:
+		return journalRecordTypeHeadCommitRange
+	case 4:
+		return journalRecordTypeUpstreamConfirm
+	default:
+		return journalRecordTypeLegacyCommit
+	}
+}
+
+func encodeOperationKind(kind OperationKind) byte {
+	switch kind {
+	case OperationKindPut:
+		return 1
+	case OperationKindDelete:
+		return 2
+	default:
+		return 0
+	}
+}
+
+func decodeOperationKind(code byte) OperationKind {
+	switch code {
+	case 1:
+		return OperationKindPut
+	case 2:
+		return OperationKindDelete
+	default:
+		return ""
+	}
+}
+
+func (j *fileCommitJournal) appendPayload(payload []byte) error {
+	switch j.opts.Experiment {
+	case JournalExperimentBinarySegmentSync:
+		if err := j.rotateSegmentIfNeeded(int64(len(payload))); err != nil {
+			return err
+		}
+	}
+	if _, err := j.file.Write(payload); err != nil {
 		return fmt.Errorf("write commit journal: %w", err)
 	}
-	if err := j.file.Sync(); err != nil {
-		return fmt.Errorf("sync commit journal: %w", err)
-	}
 	return nil
+}
+
+func (j *fileCommitJournal) rotateSegmentIfNeeded(payloadBytes int64) error {
+	if j == nil || j.file == nil || j.segmentDir == "" {
+		return nil
+	}
+	info, err := j.file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat commit journal segment: %w", err)
+	}
+	if info.Size()+payloadBytes <= j.segmentCap {
+		return nil
+	}
+	if err := j.file.Close(); err != nil {
+		return fmt.Errorf("close commit journal segment: %w", err)
+	}
+	j.segmentSeq++
+	path := filepath.Join(j.segmentDir, fmt.Sprintf("%08d.log", j.segmentSeq))
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("open commit journal segment: %w", err)
+	}
+	j.file = file
+	return nil
+}
+
+func openLatestSegmentFile(dir string) (*os.File, int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read commit journal segment dir: %w", err)
+	}
+	latest := 0
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".log" {
+			continue
+		}
+		var seq int
+		if _, err := fmt.Sscanf(entry.Name(), "%08d.log", &seq); err == nil && seq > latest {
+			latest = seq
+		}
+	}
+	if latest == 0 {
+		latest = 1
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%08d.log", latest))
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, 0, fmt.Errorf("open commit journal segment: %w", err)
+	}
+	return file, latest, nil
 }
 
 func (j *fileCommitJournal) Replay(apply func(journalRecord) error) error {
@@ -222,6 +490,23 @@ func (j *fileCommitJournal) Replay(apply func(journalRecord) error) error {
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	switch j.opts.Experiment {
+	case JournalExperimentBinarySync, JournalExperimentBinarySegmentSync:
+		if err := j.replayBinary(apply); err != nil {
+			return err
+		}
+	default:
+		if err := j.replayJSON(apply); err != nil {
+			return err
+		}
+	}
+	if _, err := j.file.Seek(0, io.SeekEnd); err != nil {
+		return fmt.Errorf("seek commit journal end: %w", err)
+	}
+	return nil
+}
+
+func (j *fileCommitJournal) replayJSON(apply func(journalRecord) error) error {
 	if _, err := j.file.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("seek commit journal start: %w", err)
 	}
@@ -264,10 +549,91 @@ func (j *fileCommitJournal) Replay(apply func(journalRecord) error) error {
 			return err
 		}
 	}
-	if _, err := j.file.Seek(0, io.SeekEnd); err != nil {
-		return fmt.Errorf("seek commit journal end: %w", err)
-	}
 	return nil
+}
+
+func (j *fileCommitJournal) replayBinary(apply func(journalRecord) error) error {
+	if j.segmentDir != "" {
+		entries, err := os.ReadDir(j.segmentDir)
+		if err != nil {
+			return fmt.Errorf("read commit journal segment dir: %w", err)
+		}
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			if entry.IsDir() || filepath.Ext(entry.Name()) != ".log" {
+				continue
+			}
+			names = append(names, entry.Name())
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if err := replayBinaryJournalFile(filepath.Join(j.segmentDir, name), apply); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return replayBinaryJournalReader(j.file, apply)
+}
+
+func replayBinaryJournalFile(path string, apply func(journalRecord) error) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open commit journal segment replay file: %w", err)
+	}
+	defer file.Close()
+	return replayBinaryJournalReader(file, apply)
+}
+
+func replayBinaryJournalReader(reader io.ReadSeeker, apply func(journalRecord) error) error {
+	if _, err := reader.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek commit journal start: %w", err)
+	}
+	header := make([]byte, binaryJournalHeaderSize)
+	for {
+		if _, err := io.ReadFull(reader, header); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil
+			}
+			return fmt.Errorf("read binary commit journal header: %w", err)
+		}
+		keyLen := binary.LittleEndian.Uint32(header[60:64])
+		valueLen := binary.LittleEndian.Uint32(header[64:68])
+		key := make([]byte, keyLen)
+		if _, err := io.ReadFull(reader, key); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil
+			}
+			return fmt.Errorf("read binary commit journal key: %w", err)
+		}
+		value := make([]byte, valueLen)
+		if _, err := io.ReadFull(reader, value); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil
+			}
+			return fmt.Errorf("read binary commit journal value: %w", err)
+		}
+		record := journalRecord{
+			Type:                      decodeJournalRecordType(header[0]),
+			Kind:                      decodeOperationKind(header[1]),
+			Slot:                      int(binary.LittleEndian.Uint64(header[4:12])),
+			ChainVersion:              binary.LittleEndian.Uint64(header[12:20]),
+			Sequence:                  binary.LittleEndian.Uint64(header[20:28]),
+			Metadata:                  ObjectMetadata{Version: binary.LittleEndian.Uint64(header[28:36]), CreatedAt: time.Unix(0, int64(binary.LittleEndian.Uint64(header[36:44]))).UTC(), UpdatedAt: time.Unix(0, int64(binary.LittleEndian.Uint64(header[44:52]))).UTC()},
+			UpstreamConfirmedSequence: binary.LittleEndian.Uint64(header[52:60]),
+			Key:                       string(key),
+			Value:                     string(value),
+		}
+		if record.Type == journalRecordTypeLegacyCommit {
+			record.Type = ""
+		}
+		if err := apply(record); err != nil {
+			return err
+		}
+	}
 }
 
 func (j *fileCommitJournal) Close() error {
@@ -286,16 +652,22 @@ func newInMemoryCommitJournal() *inMemoryCommitJournal {
 	return &inMemoryCommitJournal{}
 }
 
-func (j *inMemoryCommitJournal) AppendBatch(records []journalRecord) error {
+func (j *inMemoryCommitJournal) AppendBatch(records []journalRecord) (journalAppendReport, error) {
 	if j == nil || len(records) == 0 {
-		return nil
+		return journalAppendReport{}, nil
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	for _, record := range records {
 		j.records = append(j.records, cloneJournalRecord(record))
 	}
-	return nil
+	return journalAppendReport{
+		Experiment: defaultJournalExperiment,
+		BatchOps:   len(records),
+		BatchBytes: 0,
+		Slots:      countJournalRecordSlots(records),
+		Records:    countJournalRecordTypes(records),
+	}, nil
 }
 
 func (j *inMemoryCommitJournal) Replay(apply func(journalRecord) error) error {
@@ -332,6 +704,7 @@ type journalWatermarkIntent struct {
 	ctx        context.Context
 	assignment ReplicaAssignment
 	sequence   uint64
+	recordType journalRecordType
 	owner      *slotOwner
 	onComplete journalCompletionHandler
 	queuedAt   time.Time
@@ -352,6 +725,7 @@ type journalBatchItem struct {
 }
 
 type journalWatermarkKey struct {
+	recordType   journalRecordType
 	slot         int
 	chainVersion uint64
 }
@@ -359,6 +733,7 @@ type journalWatermarkKey struct {
 type pendingJournalWatermark struct {
 	assignment ReplicaAssignment
 	sequence   uint64
+	recordType journalRecordType
 	intents    []*journalWatermarkIntent
 }
 
@@ -562,6 +937,30 @@ func (e *commitJournalEngine) submitCommitWatermark(
 		ctx:        ctx,
 		assignment: cloneAssignment(assignment),
 		sequence:   sequence,
+		recordType: journalRecordTypeCommitWatermark,
+		owner:      owner,
+		onComplete: onComplete,
+		queuedAt:   time.Now(),
+	}
+	return shard.enqueueCommitWatermark(intent)
+}
+
+func (e *commitJournalEngine) submitHeadCommitRange(
+	ctx context.Context,
+	owner *slotOwner,
+	assignment ReplicaAssignment,
+	sequence uint64,
+	onComplete journalCompletionHandler,
+) error {
+	shard := e.shardForSlot(assignment.Slot)
+	if shard == nil {
+		return fmt.Errorf("%w: commit journal unavailable", ErrInvalidConfig)
+	}
+	intent := &journalWatermarkIntent{
+		ctx:        ctx,
+		assignment: cloneAssignment(assignment),
+		sequence:   sequence,
+		recordType: journalRecordTypeHeadCommitRange,
 		owner:      owner,
 		onComplete: onComplete,
 		queuedAt:   time.Now(),
@@ -760,12 +1159,13 @@ func (s *commitJournalShard) run() {
 	}
 
 	enqueuePendingWatermark := func(intent *journalWatermarkIntent) {
-		key := journalWatermarkKey{slot: intent.assignment.Slot, chainVersion: intent.assignment.ChainVersion}
+		key := journalWatermarkKey{recordType: intent.recordType, slot: intent.assignment.Slot, chainVersion: intent.assignment.ChainVersion}
 		entry, ok := pendingWatermarks[key]
 		if !ok {
 			pendingWatermarks[key] = &pendingJournalWatermark{
 				assignment: cloneAssignment(intent.assignment),
 				sequence:   intent.sequence,
+				recordType: intent.recordType,
 				intents:    []*journalWatermarkIntent{intent},
 			}
 			pendingWatermarkSeq = append(pendingWatermarkSeq, key)
@@ -802,22 +1202,27 @@ func (s *commitJournalShard) run() {
 		updatePending()
 	}
 
-	popPrepareBatch := func() ([]journalBatchItem, int, int, int) {
-		if pendingPrepareN == 0 || len(pendingPrepareSeq) == 0 {
+	popPrepareBatch := func(
+		pendingMap map[int][]*journalPrepareIntent,
+		pendingSeq *[]int,
+		pendingN *int,
+		pendingBytes *int,
+	) ([]journalBatchItem, int, int, int) {
+		if *pendingN == 0 || len(*pendingSeq) == 0 {
 			return nil, 0, 0, 0
 		}
-		items := make([]journalBatchItem, 0, min(pendingPrepareN, s.engine.config.batchMaxOps))
+		items := make([]journalBatchItem, 0, min(*pendingN, s.engine.config.batchMaxOps))
 		batchBytes := 0
 		prepareCount := 0
 		seenSlots := map[int]struct{}{}
-		order := pendingPrepareSeq
+		order := *pendingSeq
 		for len(order) > 0 && prepareCount < s.engine.config.batchMaxOps && batchBytes < defaultJournalBatchMaxBytes {
 			nextOrder := make([]int, 0, len(order))
 			madeProgress := false
 			for idx, slot := range order {
-				queue := pendingPrepareMap[slot]
+				queue := pendingMap[slot]
 				if len(queue) == 0 {
-					delete(pendingPrepareMap, slot)
+					delete(pendingMap, slot)
 					continue
 				}
 				intent := queue[0]
@@ -826,34 +1231,34 @@ func (s *commitJournalShard) run() {
 					nextOrder = append(nextOrder, slot)
 					nextOrder = append(nextOrder, order[idx+1:]...)
 					order = nextOrder
-					pendingPrepareSeq = order
+					*pendingSeq = order
 					updatePending()
 					return items, batchBytes, prepareCount, len(seenSlots)
 				}
 				queue = queue[1:]
-				pendingPrepareN--
-				pendingPrepareBytes -= intentBytes
+				*pendingN = *pendingN - 1
+				*pendingBytes -= intentBytes
 				items = append(items, journalBatchItem{prepare: intent})
 				batchBytes += intentBytes
 				prepareCount++
 				seenSlots[slot] = struct{}{}
 				madeProgress = true
 				if len(queue) > 0 {
-					pendingPrepareMap[slot] = queue
+					pendingMap[slot] = queue
 					nextOrder = append(nextOrder, slot)
 				} else {
-					delete(pendingPrepareMap, slot)
+					delete(pendingMap, slot)
 				}
 				if prepareCount >= s.engine.config.batchMaxOps || batchBytes >= defaultJournalBatchMaxBytes {
 					nextOrder = append(nextOrder, order[idx+1:]...)
 					order = nextOrder
-					pendingPrepareSeq = order
+					*pendingSeq = order
 					updatePending()
 					return items, batchBytes, prepareCount, len(seenSlots)
 				}
 			}
 			order = nextOrder
-			pendingPrepareSeq = order
+			*pendingSeq = order
 			if !madeProgress {
 				break
 			}
@@ -886,6 +1291,45 @@ func (s *commitJournalShard) run() {
 				nextOrder = append(nextOrder, pendingWatermarkSeq[idx+1:]...)
 				break
 			}
+		}
+		pendingWatermarkSeq = nextOrder
+		updatePending()
+		return items, count
+	}
+
+	popPriorityHeadRangeBatch := func(remainingOps int, remainingBytes int) ([]journalBatchItem, int) {
+		if remainingOps <= 0 || remainingBytes <= 0 || len(pendingWatermarkSeq) == 0 {
+			return nil, 0
+		}
+		limitOps := remainingOps
+		if limitOps > defaultJournalPriorityWatermarks {
+			limitOps = defaultJournalPriorityWatermarks
+		}
+		if limitOps <= 0 {
+			return nil, 0
+		}
+		items := make([]journalBatchItem, 0, min(len(pendingWatermarkSeq), limitOps))
+		count := 0
+		nextOrder := make([]journalWatermarkKey, 0, len(pendingWatermarkSeq))
+		for _, key := range pendingWatermarkSeq {
+			entry := pendingWatermarks[key]
+			if entry == nil {
+				continue
+			}
+			if key.recordType != journalRecordTypeHeadCommitRange {
+				nextOrder = append(nextOrder, key)
+				continue
+			}
+			if count >= limitOps || (count+1)*64 > remainingBytes {
+				nextOrder = append(nextOrder, key)
+				continue
+			}
+			items = append(items, journalBatchItem{watermark: entry})
+			delete(pendingWatermarks, key)
+			count++
+		}
+		if count == 0 {
+			return nil, 0
 		}
 		pendingWatermarkSeq = nextOrder
 		updatePending()
@@ -929,9 +1373,22 @@ func (s *commitJournalShard) run() {
 			return
 		}
 		stopTimer()
-		items, prepareBytes, prepareCount, slotsTouched := popPrepareBatch()
-		remainingOps := s.engine.config.batchMaxOps - prepareCount
-		remainingBytes := defaultJournalBatchMaxBytes - prepareBytes
+		items := make([]journalBatchItem, 0, s.engine.config.batchMaxOps)
+		remainingOps := s.engine.config.batchMaxOps
+		remainingBytes := defaultJournalBatchMaxBytes
+		priorityWatermarkItems, priorityWatermarkCount := popPriorityHeadRangeBatch(remainingOps, remainingBytes)
+		items = append(items, priorityWatermarkItems...)
+		remainingOps -= priorityWatermarkCount
+		remainingBytes -= priorityWatermarkCount * 64
+		prepareItems, prepareBytes, prepareCount, slotsTouched := popPrepareBatch(
+			pendingPrepareMap,
+			&pendingPrepareSeq,
+			&pendingPrepareN,
+			&pendingPrepareBytes,
+		)
+		items = append(items, prepareItems...)
+		remainingOps -= prepareCount
+		remainingBytes -= prepareBytes
 		watermarkItems, watermarkCount := popWatermarkBatch(remainingOps, remainingBytes, prepareCount == 0 || remainingOps > 0)
 		items = append(items, watermarkItems...)
 		remainingOps -= watermarkCount
@@ -974,7 +1431,12 @@ func (s *commitJournalShard) run() {
 				if canceled == len(entry.intents) {
 					continue
 				}
-				records = append(records, journalRecordFromCommitWatermark(entry.assignment, entry.sequence))
+				switch entry.recordType {
+				case journalRecordTypeHeadCommitRange:
+					records = append(records, journalRecordFromHeadCommitRange(entry.assignment, entry.sequence))
+				default:
+					records = append(records, journalRecordFromCommitWatermark(entry.assignment, entry.sequence))
+				}
 			case item.confirmBatch != nil:
 				entry := item.confirmBatch
 				if len(entry.intents) == 0 {
@@ -1014,9 +1476,13 @@ func (s *commitJournalShard) run() {
 			s.engine.node.observeJournalConfirmBatchCount(confirmCount)
 		}
 		flushStarted := time.Now()
-		appendErr := s.journal.AppendBatch(records)
+		appendReport, appendErr := s.journal.AppendBatch(records)
 		flushDuration := time.Since(flushStarted)
 		completedAt := time.Now()
+		if appendReport.Total <= 0 {
+			appendReport.Total = flushDuration
+		}
+		s.engine.node.observeJournalFlushBreakdown(s.index, appendReport, writeStageResult(appendErr))
 		if appendErr != nil {
 			for _, item := range items {
 				switch {
@@ -1456,9 +1922,27 @@ func cloneDurableCommits(commits []DurableCommit) []DurableCommit {
 	return cloned
 }
 
-func openNodeCommitJournals(local LocalStateStore, nodeID string, shardCount int) ([]commitJournalStore, error) {
+func openNodeCommitJournals(local LocalStateStore, nodeID string, cfg journalConfig) ([]commitJournalStore, error) {
+	shardCount := cfg.shardCount
 	if shardCount <= 0 {
 		shardCount = defaultJournalShardCount
+	}
+	opts := CommitJournalOpenOptions{Experiment: cfg.experiment}
+	if provider, ok := local.(commitJournalShardProviderWithOptions); ok {
+		journals := make([]commitJournalStore, 0, shardCount)
+		for shard := 0; shard < shardCount; shard++ {
+			journal, err := provider.CommitJournalShardWithOptions(nodeID, shard, opts)
+			if err != nil {
+				for _, existing := range journals {
+					if existing != nil {
+						_ = existing.Close()
+					}
+				}
+				return nil, err
+			}
+			journals = append(journals, journal)
+		}
+		return journals, nil
 	}
 	if provider, ok := local.(commitJournalShardProvider); ok {
 		journals := make([]commitJournalStore, 0, shardCount)
@@ -1475,6 +1959,13 @@ func openNodeCommitJournals(local LocalStateStore, nodeID string, shardCount int
 			journals = append(journals, journal)
 		}
 		return journals, nil
+	}
+	if provider, ok := local.(commitJournalProviderWithOptions); ok {
+		journal, err := provider.CommitJournalWithOptions(nodeID, opts)
+		if err != nil {
+			return nil, err
+		}
+		return []commitJournalStore{journal}, nil
 	}
 	if provider, ok := local.(commitJournalProvider); ok {
 		journal, err := provider.CommitJournal(nodeID)
@@ -1522,7 +2013,7 @@ func recoverJournaledReplicaState(journals []commitJournalStore, records map[int
 				if nextSequence := entry.Sequence + 1; record.nextSequence < nextSequence {
 					record.nextSequence = nextSequence
 				}
-			case journalRecordTypeCommitWatermark:
+			case journalRecordTypeCommitWatermark, journalRecordTypeHeadCommitRange:
 				if entry.Sequence > record.highestCommittedSequence {
 					record.highestCommittedSequence = entry.Sequence
 					record.localDataPresent = true
@@ -1552,6 +2043,15 @@ func recoverJournaledReplicaState(journals []commitJournalStore, records map[int
 	}
 	backlog := make([]DurableCommit, 0)
 	for slot, record := range records {
+		if record.assignment.Peers.SuccessorNodeID == "" {
+			for sequence := record.highestCommittedSequence + 1; ; sequence++ {
+				if _, ok := record.preparedEntries[sequence]; !ok {
+					break
+				}
+				record.highestCommittedSequence = sequence
+				record.localDataPresent = true
+			}
+		}
 		for sequence := record.materializedCommittedSequence + 1; sequence <= record.highestCommittedSequence; sequence++ {
 			operation, ok := record.preparedEntries[sequence]
 			if !ok {

@@ -17,6 +17,7 @@ storage:
   journal_batch_delay_high: 250us
   journal_batch_depth_threshold: 8
   journal_batch_max_ops: 64
+  journal_experiment: baseline_json_sync
 cluster:
   slot_count: 1024
   replication_factor: 3

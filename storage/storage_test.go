@@ -1099,5 +1099,8 @@ func mustNewNode(t *testing.T, ctx context.Context, cfg Config, backend Backend,
 	if err != nil {
 		t.Fatalf("NewNode returned error: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = node.Close()
+	})
 	return node
 }

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/danthegoodman1/craq/storage"
 	"gopkg.in/yaml.v3"
 )
 
@@ -69,6 +70,7 @@ type StorageProfile struct {
 	JournalBatchDelayHigh      time.Duration `yaml:"journal_batch_delay_high" json:"journal_batch_delay_high"`
 	JournalBatchDepthThreshold int           `yaml:"journal_batch_depth_threshold" json:"journal_batch_depth_threshold"`
 	JournalBatchMaxOps         int           `yaml:"journal_batch_max_ops" json:"journal_batch_max_ops"`
+	JournalExperiment          string        `yaml:"journal_experiment,omitempty" json:"journal_experiment,omitempty"`
 }
 
 type WorkloadProfile struct {
@@ -200,6 +202,9 @@ func (p *Profile) ApplyDefaults() {
 	if p.Storage.JournalBatchMaxOps == 0 {
 		p.Storage.JournalBatchMaxOps = 64
 	}
+	if strings.TrimSpace(p.Storage.JournalExperiment) == "" {
+		p.Storage.JournalExperiment = string(storage.JournalExperimentBaselineJSONSync)
+	}
 
 	if p.Workload.Seed == 0 {
 		p.Workload.Seed = 42
@@ -303,6 +308,14 @@ func (p Profile) Validate() error {
 	}
 	if p.Storage.JournalBatchMaxOps <= 0 {
 		return fmt.Errorf("storage.journal_batch_max_ops must be > 0")
+	}
+	if !storage.ValidJournalExperiment(storage.JournalExperiment(p.Storage.JournalExperiment)) {
+		return fmt.Errorf("storage.journal_experiment must be one of %s, %s, %s, or %s",
+			storage.JournalExperimentBaselineJSONSync,
+			storage.JournalExperimentBinarySync,
+			storage.JournalExperimentBinarySegmentSync,
+			storage.JournalExperimentNoSyncBound,
+		)
 	}
 	if p.Cluster.HeartbeatInterval <= 0 || p.Cluster.LivenessInterval <= 0 || p.Cluster.SuspectAfter <= 0 || p.Cluster.DeadAfter <= 0 {
 		return fmt.Errorf("cluster timing values must be > 0")

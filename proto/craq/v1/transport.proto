@@ -258,6 +258,13 @@ message CommitWriteRequest {
   uint64 chain_version = 4;
 }
 
+message CommitAdvanceRequest {
+  int32 slot = 1;
+  uint64 committed_through = 2;
+  string from_node_id = 3;
+  uint64 chain_version = 4;
+}
+
 message ReplicationAck {
   bool success = 1;
   bytes encoded_error = 2;
@@ -267,6 +274,7 @@ enum ReplicationCreditKind {
   REPLICATION_CREDIT_KIND_UNSPECIFIED = 0;
   REPLICATION_CREDIT_KIND_FORWARD = 1;
   REPLICATION_CREDIT_KIND_COMMIT = 2;
+  REPLICATION_CREDIT_KIND_COMMIT_ADVANCE = 3;
 }
 
 message ReplicationSlotCredit {
@@ -282,6 +290,7 @@ message ReplicationFrame {
     CommitWriteRequest commit_write = 3;
     ReplicationAck ack = 4;
     ReplicationSlotCredit slot_credit = 5;
+    CommitAdvanceRequest commit_advance = 6;
   }
 }
 
@@ -381,6 +390,7 @@ service StorageService {
   rpc DropRecoveredReplica(DropRecoveredReplicaCommand) returns (Empty);
   rpc ForwardWrite(ForwardWriteRequest) returns (Empty);
   rpc CommitWrite(CommitWriteRequest) returns (Empty);
+  rpc CommitAdvance(CommitAdvanceRequest) returns (Empty);
   rpc Replicate(stream ReplicationFrame) returns (stream ReplicationFrame);
   rpc FetchSnapshot(FetchSnapshotRequest) returns (stream SnapshotEntry);
   rpc FetchCommittedSequence(FetchCommittedSequenceRequest) returns (FetchCommittedSequenceResponse);

@@ -471,6 +471,7 @@ func installRemoteConfigs(ctx context.Context, state RunState, manifestPath stri
 			JournalBatchDelayHigh:      state.Profile.Storage.JournalBatchDelayHigh,
 			JournalBatchDepthThreshold: state.Profile.Storage.JournalBatchDepthThreshold,
 			JournalBatchMaxOps:         state.Profile.Storage.JournalBatchMaxOps,
+			JournalExperiment:          state.Profile.Storage.JournalExperiment,
 		}
 		configs["storage-"+nodeID+".json"] = mustJSON(cfg)
 	}

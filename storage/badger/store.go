@@ -127,9 +127,17 @@ func (l *LocalStore) CommitJournal(nodeID string) (storage.CommitJournalStore, e
 	return l.CommitJournalShard(nodeID, 0)
 }
 
+func (l *LocalStore) CommitJournalWithOptions(nodeID string, opts storage.CommitJournalOpenOptions) (storage.CommitJournalStore, error) {
+	return l.CommitJournalShardWithOptions(nodeID, 0, opts)
+}
+
 func (l *LocalStore) CommitJournalShard(nodeID string, shard int) (storage.CommitJournalStore, error) {
+	return l.CommitJournalShardWithOptions(nodeID, shard, storage.CommitJournalOpenOptions{})
+}
+
+func (l *LocalStore) CommitJournalShardWithOptions(nodeID string, shard int, opts storage.CommitJournalOpenOptions) (storage.CommitJournalStore, error) {
 	journalPath := filepath.Join(l.owner.path, fmt.Sprintf("commit-journal-%s-%02d.log", nodeID, shard))
-	journal, err := storage.OpenFileCommitJournalForLocalState(journalPath)
+	journal, err := storage.OpenFileCommitJournalForLocalStateWithOptions(journalPath, opts)
 	if err != nil {
 		return nil, err
 	}

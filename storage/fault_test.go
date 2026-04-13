@@ -82,7 +82,7 @@ func runQueuedReplicaFaultHistory(t *testing.T) queuedReplicaFaultHistory {
 			duplicatedForward = true
 			dup := cloneQueuedReplicationMessage(msg)
 			transport.queue = append([]QueuedReplicationMessage{dup}, transport.queue...)
-		case msg.Commit != nil && msg.ToNodeID == "head" && !duplicatedCommit:
+		case (msg.Commit != nil || msg.Advance != nil) && msg.ToNodeID == "head" && !duplicatedCommit:
 			duplicatedCommit = true
 			dup := cloneQueuedReplicationMessage(msg)
 			transport.queue = append(transport.queue, dup)

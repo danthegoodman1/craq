@@ -246,6 +246,22 @@ func (n *Node) submitCommitWatermark(
 	return nil
 }
 
+func (n *Node) submitHeadCommitRange(
+	ctx context.Context,
+	owner *slotOwner,
+	assignment ReplicaAssignment,
+	sequence uint64,
+	onComplete journalCompletionHandler,
+) error {
+	if n.commitJournal == nil {
+		return fmt.Errorf("%w: commit journal unavailable", ErrInvalidConfig)
+	}
+	if err := n.commitJournal.submitHeadCommitRange(ctx, owner, assignment, sequence, onComplete); err != nil {
+		return fmt.Errorf("err in n.commitJournal.submitHeadCommitRange: %w", err)
+	}
+	return nil
+}
+
 func (n *Node) submitUpstreamConfirmedSequence(
 	ctx context.Context,
 	owner *slotOwner,

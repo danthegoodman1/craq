@@ -514,6 +514,7 @@ const (
 	StorageService_DropRecoveredReplica_FullMethodName   = "/craq.v1.StorageService/DropRecoveredReplica"
 	StorageService_ForwardWrite_FullMethodName           = "/craq.v1.StorageService/ForwardWrite"
 	StorageService_CommitWrite_FullMethodName            = "/craq.v1.StorageService/CommitWrite"
+	StorageService_CommitAdvance_FullMethodName          = "/craq.v1.StorageService/CommitAdvance"
 	StorageService_Replicate_FullMethodName              = "/craq.v1.StorageService/Replicate"
 	StorageService_FetchSnapshot_FullMethodName          = "/craq.v1.StorageService/FetchSnapshot"
 	StorageService_FetchCommittedSequence_FullMethodName = "/craq.v1.StorageService/FetchCommittedSequence"
@@ -536,6 +537,7 @@ type StorageServiceClient interface {
 	DropRecoveredReplica(ctx context.Context, in *DropRecoveredReplicaCommand, opts ...grpc.CallOption) (*Empty, error)
 	ForwardWrite(ctx context.Context, in *ForwardWriteRequest, opts ...grpc.CallOption) (*Empty, error)
 	CommitWrite(ctx context.Context, in *CommitWriteRequest, opts ...grpc.CallOption) (*Empty, error)
+	CommitAdvance(ctx context.Context, in *CommitAdvanceRequest, opts ...grpc.CallOption) (*Empty, error)
 	Replicate(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ReplicationFrame, ReplicationFrame], error)
 	FetchSnapshot(ctx context.Context, in *FetchSnapshotRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SnapshotEntry], error)
 	FetchCommittedSequence(ctx context.Context, in *FetchCommittedSequenceRequest, opts ...grpc.CallOption) (*FetchCommittedSequenceResponse, error)
@@ -679,6 +681,16 @@ func (c *storageServiceClient) CommitWrite(ctx context.Context, in *CommitWriteR
 	return out, nil
 }
 
+func (c *storageServiceClient) CommitAdvance(ctx context.Context, in *CommitAdvanceRequest, opts ...grpc.CallOption) (*Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Empty)
+	err := c.cc.Invoke(ctx, StorageService_CommitAdvance_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *storageServiceClient) Replicate(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ReplicationFrame, ReplicationFrame], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &StorageService_ServiceDesc.Streams[0], StorageService_Replicate_FullMethodName, cOpts...)
@@ -738,6 +750,7 @@ type StorageServiceServer interface {
 	DropRecoveredReplica(context.Context, *DropRecoveredReplicaCommand) (*Empty, error)
 	ForwardWrite(context.Context, *ForwardWriteRequest) (*Empty, error)
 	CommitWrite(context.Context, *CommitWriteRequest) (*Empty, error)
+	CommitAdvance(context.Context, *CommitAdvanceRequest) (*Empty, error)
 	Replicate(grpc.BidiStreamingServer[ReplicationFrame, ReplicationFrame]) error
 	FetchSnapshot(*FetchSnapshotRequest, grpc.ServerStreamingServer[SnapshotEntry]) error
 	FetchCommittedSequence(context.Context, *FetchCommittedSequenceRequest) (*FetchCommittedSequenceResponse, error)
@@ -789,6 +802,9 @@ func (UnimplementedStorageServiceServer) ForwardWrite(context.Context, *ForwardW
 }
 func (UnimplementedStorageServiceServer) CommitWrite(context.Context, *CommitWriteRequest) (*Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method CommitWrite not implemented")
+}
+func (UnimplementedStorageServiceServer) CommitAdvance(context.Context, *CommitAdvanceRequest) (*Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method CommitAdvance not implemented")
 }
 func (UnimplementedStorageServiceServer) Replicate(grpc.BidiStreamingServer[ReplicationFrame, ReplicationFrame]) error {
 	return status.Error(codes.Unimplemented, "method Replicate not implemented")
@@ -1054,6 +1070,24 @@ func _StorageService_CommitWrite_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _StorageService_CommitAdvance_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CommitAdvanceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StorageServiceServer).CommitAdvance(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StorageService_CommitAdvance_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StorageServiceServer).CommitAdvance(ctx, req.(*CommitAdvanceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _StorageService_Replicate_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(StorageServiceServer).Replicate(&grpc.GenericServerStream[ReplicationFrame, ReplicationFrame]{ServerStream: stream})
 }
@@ -1148,6 +1182,10 @@ var StorageService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CommitWrite",
 			Handler:    _StorageService_CommitWrite_Handler,
+		},
+		{
+			MethodName: "CommitAdvance",
+			Handler:    _StorageService_CommitAdvance_Handler,
 		},
 		{
 			MethodName: "FetchCommittedSequence",

@@ -162,6 +162,49 @@ type WritePipelineBrief struct {
 	SessionQueueWaitMeanMillis float64 `json:"session_queue_wait_mean_ms"`
 }
 
+type JournalFlushBreakdownReport struct {
+	RunID       string                          `json:"run_id"`
+	GeneratedAt time.Time                       `json:"generated_at"`
+	Scenarios   []ScenarioJournalFlushBreakdown `json:"scenarios"`
+}
+
+type ScenarioJournalFlushBreakdown struct {
+	Scenario      string                      `json:"scenario"`
+	Experiment    string                      `json:"experiment"`
+	Stages        []JournalFlushStageSummary  `json:"stages"`
+	BatchMetrics  []JournalBatchMetricSummary `json:"batch_metrics,omitempty"`
+	RecordMix     []JournalRecordMixSummary   `json:"record_mix,omitempty"`
+	SyncByShard   []JournalShardStageSummary  `json:"sync_by_shard,omitempty"`
+	DominantStage DominantStageSummary        `json:"dominant_stage"`
+}
+
+type JournalFlushStageSummary struct {
+	Stage        string  `json:"stage"`
+	Count        uint64  `json:"count"`
+	SumSeconds   float64 `json:"sum_seconds"`
+	MeanMillis   float64 `json:"mean_ms"`
+	SharePercent float64 `json:"share_percent"`
+}
+
+type JournalBatchMetricSummary struct {
+	Name  string  `json:"name"`
+	Count uint64  `json:"count"`
+	Mean  float64 `json:"mean"`
+}
+
+type JournalRecordMixSummary struct {
+	RecordType   string  `json:"record_type"`
+	Count        float64 `json:"count"`
+	SharePercent float64 `json:"share_percent"`
+}
+
+type JournalShardStageSummary struct {
+	Shard      string  `json:"shard"`
+	Count      uint64  `json:"count"`
+	SumSeconds float64 `json:"sum_seconds"`
+	MeanMillis float64 `json:"mean_ms"`
+}
+
 type StageDuration struct {
 	Count      int     `json:"count"`
 	MeanMillis float64 `json:"mean_ms"`
@@ -252,6 +295,11 @@ func AnalyzeRun(runDir string) (AnalysisSummary, error) {
 			return AnalysisSummary{}, err
 		}
 	}
+	if journalFlush, err := buildJournalFlushBreakdown(runDir, report, state.Profile.Storage.JournalExperiment); err == nil {
+		if err := SaveJSON(filepath.Join(analysisDir, "journal_flush_breakdown.json"), journalFlush); err != nil {
+			return AnalysisSummary{}, err
+		}
+	}
 	if timeoutRoots, err := buildTimeoutRootCauseSummary(runDir, report); err == nil {
 		for _, root := range timeoutRoots.Roots {
 			summary.TimeoutRoots = append(summary.TimeoutRoots, TimeoutRootCauseBrief{
@@ -333,6 +381,11 @@ type labeledHistogram struct {
 }
 
 type labeledGauge struct {
+	Labels map[string]string
+	Value  float64
+}
+
+type labeledCounter struct {
 	Labels map[string]string
 	Value  float64
 }
@@ -619,6 +672,35 @@ func parseGaugeFamily(path string, familyName string) ([]labeledGauge, error) {
 	return out, nil
 }
 
+func parseCounterFamily(path string, familyName string) ([]labeledCounter, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	parser := expfmt.TextParser{}
+	families, err := parser.TextToMetricFamilies(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("parse prometheus metrics %q: %w", path, err)
+	}
+	family, ok := families[familyName]
+	if !ok {
+		return nil, nil
+	}
+	out := make([]labeledCounter, 0, len(family.GetMetric()))
+	for _, metric := range family.GetMetric() {
+		counter := metric.GetCounter()
+		if counter == nil {
+			continue
+		}
+		labels := map[string]string{}
+		for _, label := range metric.GetLabel() {
+			labels[label.GetName()] = label.GetValue()
+		}
+		out = append(out, labeledCounter{Labels: labels, Value: counter.GetValue()})
+	}
+	return out, nil
+}
+
 func diffWriteStageBudgets(start map[writeStageMetricKey]histogramCountSum, end map[writeStageMetricKey]histogramCountSum) []WriteStageBudgetPart {
 	keys := make([]writeStageMetricKey, 0, len(end))
 	for key := range end {
@@ -758,6 +840,381 @@ func diffGRPCMethodBudgets(start map[string]histogramCountSum, end map[string]hi
 			SumSeconds: delta.Sum,
 			MeanMillis: meanMillis,
 		})
+	}
+	return out
+}
+
+type journalStageMetricKey struct {
+	Stage      string
+	Shard      string
+	Result     string
+	Experiment string
+}
+
+type journalBatchMetricKey struct {
+	Shard      string
+	Experiment string
+}
+
+type journalRecordMetricKey struct {
+	RecordType string
+	Shard      string
+	Experiment string
+}
+
+func buildJournalFlushBreakdown(runDir string, report LoadGenReport, defaultExperiment string) (JournalFlushBreakdownReport, error) {
+	metricRoot := filepath.Join(runDir, "artifacts", "client", "metric-snapshots")
+	if _, err := os.Stat(metricRoot); err != nil {
+		return JournalFlushBreakdownReport{}, err
+	}
+	reportOut := JournalFlushBreakdownReport{
+		RunID:       report.RunID,
+		GeneratedAt: time.Now().UTC(),
+	}
+	for _, scenario := range report.Scenarios {
+		putSummary, ok := scenarioOperationSummary(scenario, "put")
+		if !ok || putSummary.TotalOps == 0 {
+			continue
+		}
+		startName := sanitizeScenarioName(scenario.Name) + "-start"
+		endName := sanitizeScenarioName(scenario.Name) + "-end"
+		stageStart, err := loadJournalStageSnapshot(metricRoot, startName)
+		if err != nil {
+			return JournalFlushBreakdownReport{}, err
+		}
+		stageEnd, err := loadJournalStageSnapshot(metricRoot, endName)
+		if err != nil {
+			return JournalFlushBreakdownReport{}, err
+		}
+		batchOpsStart, err := loadJournalBatchSnapshot(metricRoot, startName, "craq_storage_journal_flush_batch_ops")
+		if err != nil {
+			return JournalFlushBreakdownReport{}, err
+		}
+		batchOpsEnd, err := loadJournalBatchSnapshot(metricRoot, endName, "craq_storage_journal_flush_batch_ops")
+		if err != nil {
+			return JournalFlushBreakdownReport{}, err
+		}
+		batchBytesStart, err := loadJournalBatchSnapshot(metricRoot, startName, "craq_storage_journal_flush_batch_bytes")
+		if err != nil {
+			return JournalFlushBreakdownReport{}, err
+		}
+		batchBytesEnd, err := loadJournalBatchSnapshot(metricRoot, endName, "craq_storage_journal_flush_batch_bytes")
+		if err != nil {
+			return JournalFlushBreakdownReport{}, err
+		}
+		batchSlotsStart, err := loadJournalBatchSnapshot(metricRoot, startName, "craq_storage_journal_flush_batch_slots")
+		if err != nil {
+			return JournalFlushBreakdownReport{}, err
+		}
+		batchSlotsEnd, err := loadJournalBatchSnapshot(metricRoot, endName, "craq_storage_journal_flush_batch_slots")
+		if err != nil {
+			return JournalFlushBreakdownReport{}, err
+		}
+		recordStart, err := loadJournalRecordSnapshot(metricRoot, startName)
+		if err != nil {
+			return JournalFlushBreakdownReport{}, err
+		}
+		recordEnd, err := loadJournalRecordSnapshot(metricRoot, endName)
+		if err != nil {
+			return JournalFlushBreakdownReport{}, err
+		}
+
+		stages, dominant := summarizeJournalStages(stageStart, stageEnd)
+		experiment := inferJournalExperiment(defaultExperiment, stageStart, stageEnd, batchOpsEnd, recordEnd)
+		reportOut.Scenarios = append(reportOut.Scenarios, ScenarioJournalFlushBreakdown{
+			Scenario:      scenario.Name,
+			Experiment:    experiment,
+			Stages:        stages,
+			BatchMetrics:  summarizeJournalBatchMetrics(batchOpsStart, batchOpsEnd, batchBytesStart, batchBytesEnd, batchSlotsStart, batchSlotsEnd, experiment),
+			RecordMix:     summarizeJournalRecordMix(recordStart, recordEnd, experiment),
+			SyncByShard:   summarizeJournalSyncByShard(stageStart, stageEnd, experiment),
+			DominantStage: dominant,
+		})
+	}
+	return reportOut, nil
+}
+
+func loadJournalStageSnapshot(metricRoot string, snapshotName string) (map[journalStageMetricKey]histogramCountSum, error) {
+	paths, err := snapshotTargetPaths(metricRoot, snapshotName, "storage-")
+	if err != nil {
+		return nil, err
+	}
+	out := map[journalStageMetricKey]histogramCountSum{}
+	for _, path := range paths {
+		series, err := parseHistogramFamily(path, "craq_storage_journal_flush_stage_seconds")
+		if err != nil {
+			return nil, err
+		}
+		for _, sample := range series {
+			key := journalStageMetricKey{
+				Stage:      sample.Labels["stage"],
+				Shard:      sample.Labels["shard"],
+				Result:     sample.Labels["result"],
+				Experiment: sample.Labels["experiment"],
+			}
+			current := out[key]
+			current.Count += sample.Sample.Count
+			current.Sum += sample.Sample.Sum
+			out[key] = current
+		}
+	}
+	return out, nil
+}
+
+func loadJournalBatchSnapshot(metricRoot string, snapshotName string, family string) (map[journalBatchMetricKey]histogramCountSum, error) {
+	paths, err := snapshotTargetPaths(metricRoot, snapshotName, "storage-")
+	if err != nil {
+		return nil, err
+	}
+	out := map[journalBatchMetricKey]histogramCountSum{}
+	for _, path := range paths {
+		series, err := parseHistogramFamily(path, family)
+		if err != nil {
+			return nil, err
+		}
+		for _, sample := range series {
+			key := journalBatchMetricKey{
+				Shard:      sample.Labels["shard"],
+				Experiment: sample.Labels["experiment"],
+			}
+			current := out[key]
+			current.Count += sample.Sample.Count
+			current.Sum += sample.Sample.Sum
+			out[key] = current
+		}
+	}
+	return out, nil
+}
+
+func loadJournalRecordSnapshot(metricRoot string, snapshotName string) (map[journalRecordMetricKey]float64, error) {
+	paths, err := snapshotTargetPaths(metricRoot, snapshotName, "storage-")
+	if err != nil {
+		return nil, err
+	}
+	out := map[journalRecordMetricKey]float64{}
+	for _, path := range paths {
+		series, err := parseCounterFamily(path, "craq_storage_journal_flush_records_total")
+		if err != nil {
+			return nil, err
+		}
+		for _, sample := range series {
+			key := journalRecordMetricKey{
+				RecordType: sample.Labels["type"],
+				Shard:      sample.Labels["shard"],
+				Experiment: sample.Labels["experiment"],
+			}
+			out[key] += sample.Value
+		}
+	}
+	return out, nil
+}
+
+func inferJournalExperiment(
+	defaultExperiment string,
+	stageStart map[journalStageMetricKey]histogramCountSum,
+	stageEnd map[journalStageMetricKey]histogramCountSum,
+	batchEnd map[journalBatchMetricKey]histogramCountSum,
+	recordEnd map[journalRecordMetricKey]float64,
+) string {
+	for key := range stageEnd {
+		if key.Experiment != "" {
+			return key.Experiment
+		}
+	}
+	for key := range stageStart {
+		if key.Experiment != "" {
+			return key.Experiment
+		}
+	}
+	for key := range batchEnd {
+		if key.Experiment != "" {
+			return key.Experiment
+		}
+	}
+	for key := range recordEnd {
+		if key.Experiment != "" {
+			return key.Experiment
+		}
+	}
+	if strings.TrimSpace(defaultExperiment) == "" {
+		return "baseline_json_sync"
+	}
+	return defaultExperiment
+}
+
+func summarizeJournalStages(start, end map[journalStageMetricKey]histogramCountSum) ([]JournalFlushStageSummary, DominantStageSummary) {
+	aggregated := map[string]histogramCountSum{}
+	for key, sample := range end {
+		if key.Result != "success" {
+			continue
+		}
+		delta := diffHistogramCountSum(start[key], sample)
+		if delta.Count == 0 && delta.Sum == 0 {
+			continue
+		}
+		current := aggregated[key.Stage]
+		current.Count += delta.Count
+		current.Sum += delta.Sum
+		aggregated[key.Stage] = current
+	}
+	stageNames := make([]string, 0, len(aggregated))
+	totalSum := 0.0
+	for stage, sample := range aggregated {
+		stageNames = append(stageNames, stage)
+		totalSum += sample.Sum
+	}
+	sort.Slice(stageNames, func(i, j int) bool {
+		left := aggregated[stageNames[i]]
+		right := aggregated[stageNames[j]]
+		if left.Sum == right.Sum {
+			return stageNames[i] < stageNames[j]
+		}
+		return left.Sum > right.Sum
+	})
+	stages := make([]JournalFlushStageSummary, 0, len(stageNames))
+	for _, stage := range stageNames {
+		sample := aggregated[stage]
+		meanMillis := 0.0
+		if sample.Count > 0 {
+			meanMillis = (sample.Sum / float64(sample.Count)) * 1000
+		}
+		share := 0.0
+		if totalSum > 0 {
+			share = (sample.Sum / totalSum) * 100
+		}
+		stages = append(stages, JournalFlushStageSummary{
+			Stage:        stage,
+			Count:        sample.Count,
+			SumSeconds:   sample.Sum,
+			MeanMillis:   meanMillis,
+			SharePercent: share,
+		})
+	}
+	if len(stages) == 0 {
+		return nil, DominantStageSummary{}
+	}
+	dominant := DominantStageSummary{
+		Stage:        stages[0].Stage,
+		Count:        stages[0].Count,
+		SumSeconds:   stages[0].SumSeconds,
+		MeanMillis:   stages[0].MeanMillis,
+		SharePercent: stages[0].SharePercent,
+	}
+	nextSum := 0.0
+	if len(stages) > 1 {
+		nextSum = stages[1].SumSeconds
+	}
+	dominant.ClearlyDominant = dominant.SharePercent >= 35 && (nextSum == 0 || dominant.SumSeconds >= nextSum*1.5)
+	return stages, dominant
+}
+
+func summarizeJournalBatchMetrics(
+	batchOpsStart map[journalBatchMetricKey]histogramCountSum,
+	batchOpsEnd map[journalBatchMetricKey]histogramCountSum,
+	batchBytesStart map[journalBatchMetricKey]histogramCountSum,
+	batchBytesEnd map[journalBatchMetricKey]histogramCountSum,
+	batchSlotsStart map[journalBatchMetricKey]histogramCountSum,
+	batchSlotsEnd map[journalBatchMetricKey]histogramCountSum,
+	experiment string,
+) []JournalBatchMetricSummary {
+	return []JournalBatchMetricSummary{
+		buildJournalBatchMetric("batch_ops", batchOpsStart, batchOpsEnd, experiment),
+		buildJournalBatchMetric("batch_bytes", batchBytesStart, batchBytesEnd, experiment),
+		buildJournalBatchMetric("batch_slots", batchSlotsStart, batchSlotsEnd, experiment),
+	}
+}
+
+func buildJournalBatchMetric(
+	name string,
+	start map[journalBatchMetricKey]histogramCountSum,
+	end map[journalBatchMetricKey]histogramCountSum,
+	experiment string,
+) JournalBatchMetricSummary {
+	total := histogramCountSum{}
+	for key, sample := range end {
+		if experiment != "" && key.Experiment != "" && key.Experiment != experiment {
+			continue
+		}
+		delta := diffHistogramCountSum(start[key], sample)
+		total.Count += delta.Count
+		total.Sum += delta.Sum
+	}
+	summary := JournalBatchMetricSummary{Name: name, Count: total.Count}
+	if total.Count > 0 {
+		summary.Mean = total.Sum / float64(total.Count)
+	}
+	return summary
+}
+
+func summarizeJournalRecordMix(start, end map[journalRecordMetricKey]float64, experiment string) []JournalRecordMixSummary {
+	aggregated := map[string]float64{}
+	total := 0.0
+	for key, endValue := range end {
+		if experiment != "" && key.Experiment != "" && key.Experiment != experiment {
+			continue
+		}
+		delta := endValue - start[key]
+		if delta <= 0 {
+			continue
+		}
+		aggregated[key.RecordType] += delta
+		total += delta
+	}
+	recordTypes := make([]string, 0, len(aggregated))
+	for recordType := range aggregated {
+		recordTypes = append(recordTypes, recordType)
+	}
+	sort.Slice(recordTypes, func(i, j int) bool {
+		if aggregated[recordTypes[i]] == aggregated[recordTypes[j]] {
+			return recordTypes[i] < recordTypes[j]
+		}
+		return aggregated[recordTypes[i]] > aggregated[recordTypes[j]]
+	})
+	out := make([]JournalRecordMixSummary, 0, len(recordTypes))
+	for _, recordType := range recordTypes {
+		share := 0.0
+		if total > 0 {
+			share = (aggregated[recordType] / total) * 100
+		}
+		out = append(out, JournalRecordMixSummary{
+			RecordType:   recordType,
+			Count:        aggregated[recordType],
+			SharePercent: share,
+		})
+	}
+	return out
+}
+
+func summarizeJournalSyncByShard(start, end map[journalStageMetricKey]histogramCountSum, experiment string) []JournalShardStageSummary {
+	shards := make([]string, 0)
+	seen := map[string]struct{}{}
+	for key := range end {
+		if key.Stage != "sync" || key.Result != "success" {
+			continue
+		}
+		if experiment != "" && key.Experiment != "" && key.Experiment != experiment {
+			continue
+		}
+		if _, ok := seen[key.Shard]; ok {
+			continue
+		}
+		seen[key.Shard] = struct{}{}
+		shards = append(shards, key.Shard)
+	}
+	sort.Strings(shards)
+	out := make([]JournalShardStageSummary, 0, len(shards))
+	for _, shard := range shards {
+		key := journalStageMetricKey{Stage: "sync", Shard: shard, Result: "success", Experiment: experiment}
+		delta := diffHistogramCountSum(start[key], end[key])
+		summary := JournalShardStageSummary{
+			Shard:      shard,
+			Count:      delta.Count,
+			SumSeconds: delta.Sum,
+		}
+		if delta.Count > 0 {
+			summary.MeanMillis = (delta.Sum / float64(delta.Count)) * 1000
+		}
+		out = append(out, summary)
 	}
 	return out
 }

@@ -459,6 +459,10 @@ func (s *InMemoryLocalStateStore) CommitJournal(nodeID string) (CommitJournalSto
 	return s.CommitJournalShard(nodeID, 0)
 }
 
+func (s *InMemoryLocalStateStore) CommitJournalWithOptions(nodeID string, _ CommitJournalOpenOptions) (CommitJournalStore, error) {
+	return s.CommitJournal(nodeID)
+}
+
 func (s *InMemoryLocalStateStore) CommitJournalShard(nodeID string, shard int) (CommitJournalStore, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -469,6 +473,10 @@ func (s *InMemoryLocalStateStore) CommitJournalShard(nodeID string, shard int) (
 	journal := newInMemoryCommitJournal()
 	s.journals[key] = journal
 	return journal, nil
+}
+
+func (s *InMemoryLocalStateStore) CommitJournalShardWithOptions(nodeID string, shard int, _ CommitJournalOpenOptions) (CommitJournalStore, error) {
+	return s.CommitJournalShard(nodeID, shard)
 }
 
 type InMemoryReplicationTransport struct {
@@ -561,9 +569,21 @@ func (t *InMemoryReplicationTransport) CommitWrite(ctx context.Context, toNodeID
 	return nil
 }
 
+func (t *InMemoryReplicationTransport) CommitAdvance(ctx context.Context, toNodeID string, req CommitAdvanceRequest) error {
+	node, ok := t.nodes[toNodeID]
+	if !ok {
+		return fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, toNodeID)
+	}
+	if err := node.HandleCommitAdvance(ctx, req); err != nil {
+		return fmt.Errorf("err in node.HandleCommitAdvance: %w", err)
+	}
+	return nil
+}
+
 type replicationHandler interface {
 	HandleForwardWrite(ctx context.Context, req ForwardWriteRequest) error
 	HandleCommitWrite(ctx context.Context, req CommitWriteRequest) error
+	HandleCommitAdvance(ctx context.Context, req CommitAdvanceRequest) error
 }
 
 type replicationSnapshotHandler interface {
@@ -576,6 +596,7 @@ type QueuedReplicationMessage struct {
 	ToNodeID string
 	Forward  *ForwardWriteRequest
 	Commit   *CommitWriteRequest
+	Advance  *CommitAdvanceRequest
 }
 
 type QueuedInMemoryReplicationTransport struct {
@@ -713,6 +734,24 @@ func (t *QueuedInMemoryReplicationTransport) CommitWrite(_ context.Context, toNo
 	t.queue = append(t.queue, QueuedReplicationMessage{
 		ToNodeID: toNodeID,
 		Commit:   &cloned,
+	})
+	return nil
+}
+
+func (t *QueuedInMemoryReplicationTransport) CommitAdvance(_ context.Context, toNodeID string, req CommitAdvanceRequest) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.nodes[toNodeID]; !ok {
+		return fmt.Errorf("%w: node %q", ErrSnapshotSourceUnavailable, toNodeID)
+	}
+	if t.dropNextWrite {
+		t.dropNextWrite = false
+		return nil
+	}
+	cloned := req
+	t.queue = append(t.queue, QueuedReplicationMessage{
+		ToNodeID: toNodeID,
+		Advance:  &cloned,
 	})
 	return nil
 }
@@ -885,6 +924,10 @@ func (t *QueuedInMemoryReplicationTransport) DeliverAt(ctx context.Context, inde
 		if err := node.HandleCommitWrite(ctx, *msg.Commit); err != nil {
 			return fmt.Errorf("err in node.HandleCommitWrite: %w", err)
 		}
+	case msg.Advance != nil:
+		if err := node.HandleCommitAdvance(ctx, *msg.Advance); err != nil {
+			return fmt.Errorf("err in node.HandleCommitAdvance: %w", err)
+		}
 	}
 	return nil
 }
@@ -917,6 +960,10 @@ func cloneQueuedReplicationMessage(msg QueuedReplicationMessage) QueuedReplicati
 	if msg.Commit != nil {
 		req := cloneCommitRequest(*msg.Commit)
 		cloned.Commit = &req
+	}
+	if msg.Advance != nil {
+		req := cloneCommitAdvanceRequest(*msg.Advance)
+		cloned.Advance = &req
 	}
 	return cloned
 }

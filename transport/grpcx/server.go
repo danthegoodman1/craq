@@ -505,6 +505,23 @@ func (s *StorageGRPCServer) CommitWrite(ctx context.Context, req *grpcproto.Comm
 	return &grpcproto.Empty{}, nil
 }
 
+func (s *StorageGRPCServer) CommitAdvance(ctx context.Context, req *grpcproto.CommitAdvanceRequest) (*grpcproto.Empty, error) {
+	if s.authorizer != nil {
+		if err := s.authorizer.requireStorageIdentityMatch(ctx, req.FromNodeId); err != nil {
+			return nil, encodeError(err)
+		}
+	}
+	if err := s.node.HandleCommitAdvance(ctx, storage.CommitAdvanceRequest{
+		Slot:             int(req.Slot),
+		CommittedThrough: req.CommittedThrough,
+		FromNodeID:       req.FromNodeId,
+		ChainVersion:     req.ChainVersion,
+	}); err != nil {
+		return nil, encodeError(err)
+	}
+	return &grpcproto.Empty{}, nil
+}
+
 func (s *StorageGRPCServer) Replicate(stream grpcproto.StorageService_ReplicateServer) error {
 	var sendMu sync.Mutex
 	var workers sync.WaitGroup
@@ -548,10 +565,14 @@ func (s *StorageGRPCServer) Replicate(stream grpcproto.StorageService_ReplicateS
 		for _, creditKind := range []grpcproto.ReplicationCreditKind{
 			grpcproto.ReplicationCreditKind_REPLICATION_CREDIT_KIND_FORWARD,
 			grpcproto.ReplicationCreditKind_REPLICATION_CREDIT_KIND_COMMIT,
+			grpcproto.ReplicationCreditKind_REPLICATION_CREDIT_KIND_COMMIT_ADVANCE,
 		} {
 			kindLabel := "forward"
 			if creditKind == grpcproto.ReplicationCreditKind_REPLICATION_CREDIT_KIND_COMMIT {
 				kindLabel = "commit"
+			}
+			if creditKind == grpcproto.ReplicationCreditKind_REPLICATION_CREDIT_KIND_COMMIT_ADVANCE {
+				kindLabel = "commit_advance"
 			}
 			if err := sendFrame(&grpcproto.ReplicationFrame{
 				Payload: &grpcproto.ReplicationFrame_SlotCredit{
@@ -612,6 +633,21 @@ func (s *StorageGRPCServer) Replicate(stream grpcproto.StorageService_ReplicateS
 				FromNodeID:   req.FromNodeId,
 				ChainVersion: req.ChainVersion,
 			})
+		case *grpcproto.ReplicationFrame_CommitAdvance:
+			req := payload.CommitAdvance
+			slot = int(req.Slot)
+			if s.authorizer != nil {
+				if authErr := s.authorizer.requireStorageIdentityMatch(stream.Context(), req.FromNodeId); authErr != nil {
+					handleErr = authErr
+					break
+				}
+			}
+			handleErr = s.node.AcceptCommitAdvance(stream.Context(), storage.CommitAdvanceRequest{
+				Slot:             int(req.Slot),
+				CommittedThrough: req.CommittedThrough,
+				FromNodeID:       req.FromNodeId,
+				ChainVersion:     req.ChainVersion,
+			})
 		default:
 			handleErr = status.Error(codes.InvalidArgument, "replication frame payload required")
 		}
@@ -646,6 +682,8 @@ func (s *StorageGRPCServer) Replicate(stream grpcproto.StorageService_ReplicateS
 			slot = int(payload.ForwardWrite.Operation.Slot)
 		case *grpcproto.ReplicationFrame_CommitWrite:
 			slot = int(payload.CommitWrite.Slot)
+		case *grpcproto.ReplicationFrame_CommitAdvance:
+			slot = int(payload.CommitAdvance.Slot)
 		}
 		if slot < 0 {
 			workers.Add(1)

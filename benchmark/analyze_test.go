@@ -179,6 +179,9 @@ func TestAnalyzeRunGeneratesSummaryAndHTML(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(runDir, "analysis", "write_pipeline_summary.json")); err != nil {
 		t.Fatalf("write_pipeline_summary.json stat error: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(runDir, "analysis", "journal_flush_breakdown.json")); err != nil {
+		t.Fatalf("journal_flush_breakdown.json stat error: %v", err)
+	}
 	if summary.StorageFloor.Aggregates["badger_sync_put_256b"].CurrentPathP50Millis == 0 {
 		t.Fatalf("storage floor summary missing badger_sync_put_256b aggregate: %#v", summary.StorageFloor.Aggregates)
 	}
@@ -229,10 +232,39 @@ func writeMetricSnapshot(t *testing.T, path string, headCount uint64, headSum fl
 		Name: "craq_grpc_request_duration_seconds",
 		Help: "grpc metrics",
 	}, []string{"component", "method"})
-	registry.MustRegister(stageHist, grpcHist)
+	journalStageHist := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "craq_storage_journal_flush_stage_seconds",
+		Help: "journal flush stage metrics",
+	}, []string{"stage", "shard", "result", "experiment"})
+	journalBatchOps := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "craq_storage_journal_flush_batch_ops",
+		Help: "journal flush batch ops",
+	}, []string{"shard", "experiment"})
+	journalBatchBytes := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "craq_storage_journal_flush_batch_bytes",
+		Help: "journal flush batch bytes",
+	}, []string{"shard", "experiment"})
+	journalBatchSlots := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "craq_storage_journal_flush_batch_slots",
+		Help: "journal flush batch slots",
+	}, []string{"shard", "experiment"})
+	journalRecords := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "craq_storage_journal_flush_records_total",
+		Help: "journal flush records",
+	}, []string{"type", "shard", "experiment"})
+	registry.MustRegister(stageHist, grpcHist, journalStageHist, journalBatchOps, journalBatchBytes, journalBatchSlots, journalRecords)
 	observeHistogram(stageHist.WithLabelValues("head_get_committed", "head", "success"), headCount, headSum)
 	observeHistogram(stageHist.WithLabelValues("head_wait_for_commit_watermark", "head", "success"), waitCount, waitSum)
 	observeHistogram(grpcHist.WithLabelValues("storage", "/craq.v1.StorageService/Put"), putCount, putSum)
+	observeHistogram(journalStageHist.WithLabelValues("encode", "0", "success", "baseline_json_sync"), waitCount, waitSum/4)
+	observeHistogram(journalStageHist.WithLabelValues("write", "0", "success", "baseline_json_sync"), waitCount, waitSum/4)
+	observeHistogram(journalStageHist.WithLabelValues("sync", "0", "success", "baseline_json_sync"), waitCount, waitSum/2)
+	observeHistogram(journalStageHist.WithLabelValues("total", "0", "success", "baseline_json_sync"), waitCount, waitSum)
+	observeHistogram(journalBatchOps.WithLabelValues("0", "baseline_json_sync"), waitCount, float64(waitCount)*8)
+	observeHistogram(journalBatchBytes.WithLabelValues("0", "baseline_json_sync"), waitCount, float64(waitCount)*2048)
+	observeHistogram(journalBatchSlots.WithLabelValues("0", "baseline_json_sync"), waitCount, float64(waitCount))
+	journalRecords.WithLabelValues("prepare", "0", "baseline_json_sync").Add(float64(waitCount))
+	journalRecords.WithLabelValues("head_commit_range", "0", "baseline_json_sync").Add(float64(waitCount))
 	return writeRegistryMetrics(path, registry)
 }
 

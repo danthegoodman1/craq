@@ -17,6 +17,9 @@ func mustOpenNode(t *testing.T, ctx context.Context, cfg Config, backend Backend
 	if err != nil {
 		t.Fatalf("OpenNode returned error: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = node.Close()
+	})
 	return node
 }
 

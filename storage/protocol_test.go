@@ -54,6 +54,56 @@ func TestInMemoryBackendStagesThenCommitsSequences(t *testing.T) {
 	}
 }
 
+func TestHeadAckWaitsForMiddleDurablePrepareFlush(t *testing.T) {
+	ctx := context.Background()
+	transport := NewInMemoryReplicationTransport()
+	headBackend := NewInMemoryBackend()
+	midBackend := NewInMemoryBackend()
+	tailBackend := NewInMemoryBackend()
+
+	head := mustNewNode(t, ctx, Config{NodeID: "head"}, headBackend, NewInMemoryCoordinatorClient(), transport)
+	mid := mustNewNode(t, ctx, Config{
+		NodeID:                "mid",
+		JournalBatchDelayLow:  500 * time.Millisecond,
+		JournalBatchDelayHigh: 500 * time.Millisecond,
+	}, midBackend, NewInMemoryCoordinatorClient(), transport)
+	tail := mustNewNode(t, ctx, Config{NodeID: "tail"}, tailBackend, NewInMemoryCoordinatorClient(), transport)
+
+	for nodeID, backend := range map[string]*InMemoryBackend{
+		"head": headBackend,
+		"mid":  midBackend,
+		"tail": tailBackend,
+	} {
+		transport.Register(nodeID, backend)
+	}
+	for nodeID, node := range map[string]*Node{
+		"head": head,
+		"mid":  mid,
+		"tail": tail,
+	} {
+		transport.RegisterNode(nodeID, node)
+	}
+
+	setupChainOnExistingNodes(t, map[string]*Node{
+		"head": head,
+		"mid":  mid,
+		"tail": tail,
+	}, 17, []string{"head", "mid", "tail"})
+
+	started := time.Now()
+	result, err := head.SubmitPut(ctx, 17, "alpha", "one")
+	if err != nil {
+		t.Fatalf("SubmitPut returned error: %v", err)
+	}
+	assertAppliedCommitResult(t, result, 17, 1)
+	if elapsed := time.Since(started); elapsed < 400*time.Millisecond {
+		t.Fatalf("SubmitPut took %v, want >= 400ms while middle durable prepare delay is 500ms", elapsed)
+	}
+	if got := mid.durablePreparedSequence(17); got < 1 {
+		t.Fatalf("middle durable prepared sequence immediately after ack = %d, want >= 1", got)
+	}
+}
+
 func TestSingleReplicaSubmitPutAndDeleteCommitImmediately(t *testing.T) {
 	ctx := context.Background()
 	transport := NewInMemoryReplicationTransport()
@@ -116,7 +166,7 @@ func TestQueuedTransportWaitsForExplicitCommitAndPreservesStaging(t *testing.T) 
 		switch {
 		case msg.Forward != nil:
 			delivered = append(delivered, "forward:"+msg.ToNodeID)
-		case msg.Commit != nil:
+		case msg.Commit != nil || msg.Advance != nil:
 			delivered = append(delivered, "commit:"+msg.ToNodeID)
 		}
 		if len(delivered) != 1 {
@@ -165,6 +215,13 @@ func TestQueuedTransportDuplicateMessagesStillConverge(t *testing.T) {
 			transport.queue = append([]QueuedReplicationMessage{{
 				ToNodeID: msg.ToNodeID,
 				Commit:   &cloned,
+			}}, transport.queue...)
+		case msg.Advance != nil && msg.ToNodeID == "head" && !duplicatedCommit:
+			duplicatedCommit = true
+			cloned := cloneCommitAdvanceRequest(*msg.Advance)
+			transport.queue = append([]QueuedReplicationMessage{{
+				ToNodeID: msg.ToNodeID,
+				Advance:  &cloned,
 			}}, transport.queue...)
 		}
 	})
@@ -607,6 +664,8 @@ func TestWriteValidationAndDownstreamFailure(t *testing.T) {
 			FromNodeID:   "client",
 			ChainVersion: 4,
 		}
+		record.preparedEntries[1] = op
+		record.highestPreparedDurable = 1
 		record.pendingWrites[1] = pendingWrite{}
 		record.nextSequence = 2
 		mustMutateSlotRecord(t, node, 6, func(replicaRecord) replicaRecord {
@@ -835,6 +894,7 @@ type scriptedTransport struct {
 	commitErr  error
 	forwards   []ForwardWriteRequest
 	commits    []CommitWriteRequest
+	advances   []CommitAdvanceRequest
 }
 
 func (t *scriptedTransport) FetchSnapshot(_ context.Context, _ string, _ int) (Snapshot, uint64, error) {
@@ -859,6 +919,17 @@ func (t *scriptedTransport) ForwardWrite(_ context.Context, _ string, req Forwar
 func (t *scriptedTransport) CommitWrite(_ context.Context, _ string, req CommitWriteRequest) error {
 	t.mu.Lock()
 	t.commits = append(t.commits, req)
+	err := t.commitErr
+	t.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (t *scriptedTransport) CommitAdvance(_ context.Context, _ string, req CommitAdvanceRequest) error {
+	t.mu.Lock()
+	t.advances = append(t.advances, req)
 	err := t.commitErr
 	t.mu.Unlock()
 	if err != nil {

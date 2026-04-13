@@ -99,6 +99,9 @@ func TestLoadLocalPutScalingProfileDefaultsAndValidate(t *testing.T) {
 	if got, want := profile.Storage.JournalBatchMaxOps, 64; got != want {
 		t.Fatalf("JournalBatchMaxOps = %d, want %d", got, want)
 	}
+	if got, want := profile.Storage.JournalExperiment, "baseline_json_sync"; got != want {
+		t.Fatalf("JournalExperiment = %q, want %q", got, want)
+	}
 	if got, want := profile.Local.StorageLayout, "repo_disk"; got != want {
 		t.Fatalf("Local.StorageLayout = %q, want %q", got, want)
 	}

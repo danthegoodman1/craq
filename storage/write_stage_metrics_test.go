@@ -121,10 +121,10 @@ func TestThreeReplicaWriteStageMetricsRecordOncePerLogicalWrite(t *testing.T) {
 	assertWriteStageCountAtLeast(t, headRegistry, string(writeStageHeadWaitForCommitWatermark), string(ReplicaRoleHead), writeStageResultSuccess, 1)
 	assertWriteStageCount(t, midRegistry, string(writeStageHeadForwardRPC), string(ReplicaRoleMiddle), writeStageResultSuccess, 1)
 	assertWriteStageCountAtLeast(t, midRegistry, string(writeStagePrepareFlush), string(ReplicaRoleMiddle), writeStageResultSuccess, 1)
-	assertWriteStageCountAtLeast(t, midRegistry, string(writeStageCommitWatermarkFlush), string(ReplicaRoleMiddle), writeStageResultSuccess, 1)
+	assertWriteStageCount(t, midRegistry, string(writeStageCommitWatermarkFlush), string(ReplicaRoleMiddle), writeStageResultSuccess, 0)
 	assertWriteStageCountAtLeast(t, midRegistry, string(writeStageCommitTokenQueueWait), string(ReplicaRoleMiddle), writeStageResultSuccess, 1)
 	assertWriteStageCountAtLeast(t, tailRegistry, string(writeStagePrepareFlush), string(ReplicaRoleTail), writeStageResultSuccess, 1)
-	assertWriteStageCountAtLeast(t, tailRegistry, string(writeStageCommitWatermarkFlush), string(ReplicaRoleTail), writeStageResultSuccess, 1)
+	assertWriteStageCount(t, tailRegistry, string(writeStageCommitWatermarkFlush), string(ReplicaRoleTail), writeStageResultSuccess, 0)
 	assertWriteStageCountAtLeast(t, tailRegistry, string(writeStageCommitTokenQueueWait), string(ReplicaRoleTail), writeStageResultSuccess, 1)
 
 	before := histogramCountValue(t, headRegistry, "craq_storage_write_stage_seconds", map[string]string{
@@ -174,7 +174,6 @@ func TestWriteStageMetricsRecordCommitWaitErrors(t *testing.T) {
 		}
 	}
 
-	assertWriteStageCount(t, registry, string(writeStageHeadForwardRPC), string(ReplicaRoleHead), writeStageResultSuccess, 1)
 	assertWriteStageCount(t, registry, string(writeStageHeadWaitForCommitWatermark), string(ReplicaRoleHead), writeStageResultSuccess, 0)
 	assertWriteStageCount(t, registry, string(writeStageHeadWaitForCommitWatermark), string(ReplicaRoleHead), writeStageResultError, 1)
 }

@@ -50,6 +50,7 @@ type StorageProcessConfig struct {
 	JournalBatchDelayHigh      time.Duration `json:"journal_batch_delay_high"`
 	JournalBatchDepthThreshold int           `json:"journal_batch_depth_threshold"`
 	JournalBatchMaxOps         int           `json:"journal_batch_max_ops"`
+	JournalExperiment          string        `json:"journal_experiment,omitempty"`
 }
 
 func RunCoordinatorProcess(ctx context.Context, cfg CoordinatorProcessConfig) error {
@@ -202,6 +203,7 @@ func RunStorageProcess(ctx context.Context, cfg StorageProcessConfig) error {
 			JournalBatchDelayHigh:          cfg.JournalBatchDelayHigh,
 			JournalBatchDepthThreshold:     cfg.JournalBatchDepthThreshold,
 			JournalBatchMaxOps:             cfg.JournalBatchMaxOps,
+			JournalExperiment:              storage.JournalExperiment(cfg.JournalExperiment),
 		},
 		store.Backend(),
 		store.LocalStateStore(),

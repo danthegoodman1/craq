@@ -92,4 +92,7 @@ artifacts:
 	if _, err := os.Stat(filepath.Join(runDir, "analysis", "write_pipeline_summary.json")); err != nil {
 		t.Fatalf("write_pipeline_summary.json stat returned error: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(runDir, "analysis", "journal_flush_breakdown.json")); err != nil {
+		t.Fatalf("journal_flush_breakdown.json stat returned error: %v", err)
+	}
 }

@@ -493,10 +493,16 @@ func deliverQueuedCommit(
 ) error {
 	t.Helper()
 	return deliverQueuedMessage(t, ctx, repl, func(msg QueuedReplicationMessage) bool {
-		return msg.ToNodeID == toNodeID &&
-			msg.Commit != nil &&
-			msg.Commit.Slot == slot &&
-			msg.Commit.Sequence == sequence
+		if msg.ToNodeID != toNodeID {
+			return false
+		}
+		if msg.Commit != nil {
+			return msg.Commit.Slot == slot && msg.Commit.Sequence == sequence
+		}
+		if msg.Advance != nil {
+			return msg.Advance.Slot == slot && msg.Advance.CommittedThrough >= sequence
+		}
+		return false
 	})
 }
 

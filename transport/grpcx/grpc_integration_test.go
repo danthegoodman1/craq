@@ -1168,6 +1168,10 @@ func (t *blockingTransport) CommitWrite(context.Context, string, storage.CommitW
 	return nil
 }
 
+func (t *blockingTransport) CommitAdvance(context.Context, string, storage.CommitAdvanceRequest) error {
+	return nil
+}
+
 func (t *blockingTransport) AwaitWriteCommit(ctx context.Context, check func() bool) error {
 	if check() {
 		return nil
